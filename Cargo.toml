@@ -1,0 +1,14 @@
+[package]
+name = "floki"
+version = "0.1.0"
+authors = ["arthurprs <arthurprs@gmail.com>"]
+
+[dependencies]
+log = "0.3.1"
+env_logger = "0.3.0"
+mio = "0.3.5"
+toml = "0.1.20"
+threadpool = "0.1.4"
+nix = "0.3.5"
+time = "0.1.25"
+num_cpus = "0.2.6"
