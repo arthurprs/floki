@@ -6,9 +6,15 @@ authors = ["arthurprs <arthurprs@gmail.com>"]
 [dependencies]
 log = "0.3.1"
 env_logger = "0.3.0"
+fern = "0.3.5"
 mio = "0.3.5"
 toml = "0.1.20"
 threadpool = "0.1.4"
-nix = "0.3.5"
+nix = "=0.3.6"
 time = "0.1.25"
 num_cpus = "0.2.6"
+serde = "0.4.0"
+serde_macros = "0.4.0"
+
+[dependencies.linked-hash-map]
+git="https://github.com/arthurprs/linked-hash-map.git"

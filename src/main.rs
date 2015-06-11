@@ -5,15 +5,21 @@
 #![feature(test)]
 #![feature(path_ext)]
 
+#![feature(custom_derive, plugin)]
+#![plugin(serde_macros)]
+
 #[cfg(test)] extern crate test;
 extern crate env_logger;
 #[macro_use] extern crate log;
+extern crate fern;
 extern crate nix;
+extern crate mio;
+extern crate num_cpus;
 extern crate threadpool;
 extern crate time;
 extern crate toml;
-extern crate mio;
-extern crate num_cpus;
+extern crate serde;
+extern crate linked_hash_map;
 
 mod config;
 mod queue;
@@ -25,6 +31,23 @@ use queue::*;
 use server::*;
 
 
+fn configure_log() {
+	let logger_config = fern::DispatchConfig {
+	    format: Box::new(|msg: &str, level: &log::LogLevel, location: &log::LogLocation| {
+	        format!("[{}]{}:{}: {}",
+	        	time::now().strftime("%H:%M:%S.%f").unwrap(),
+	        	level,
+	        	location.module_path(),
+	        	msg)
+	    }),
+	    output: vec![fern::OutputConfig::stderr()],
+	    level: log::LogLevelFilter::Trace,
+	};
+
+	fern::init_global_logger(logger_config, log::LogLevelFilter::Debug).unwrap();
+}
+
+
 fn gen_message(id: u64) -> Message<'static> {
 	Message {
 		id: id,
@@ -34,21 +57,11 @@ fn gen_message(id: u64) -> Message<'static> {
 
 fn main() {
 	env_logger::init().unwrap();
+	// configure_log();
     info!("starting up");
     let server_config = ServerConfig::read();
-    let mut queue_configs = server_config.read_queue_configs();
-    let mut q = Queue::new(
-    	queue_configs.pop().unwrap_or_else(|| server_config.new_queue_config("test"))
-	);
-	let message = gen_message(0);
-	for _ in (0..100_000) {
-		let r = q.put(&message);
-		assert!(r.is_some());
-		{
-			let m = q.get();
-			assert!(m.is_some());
-		}
-		let m = q.get();
-		assert!(m.is_none());
-	}
+    // let mut queue_configs = server_config.read_queue_configs();
+    let (mut server_handler, mut ev_loop) = Server::new(server_config);
+    info!("starting event loop");
+    ev_loop.run(&mut server_handler).unwrap();
 }
