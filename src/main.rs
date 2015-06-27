@@ -4,6 +4,7 @@
 #![allow(raw_pointer_derive)]
 #![feature(test)]
 #![feature(path_ext)]
+#![feature(hashmap_hasher)]
 
 #![feature(custom_derive, plugin)]
 #![plugin(serde_macros)]
@@ -20,6 +21,7 @@ extern crate time;
 extern crate toml;
 extern crate serde;
 extern crate linked_hash_map;
+extern crate fnv;
 
 mod config;
 mod queue;
@@ -55,6 +57,7 @@ fn gen_message(id: u64) -> Message<'static> {
 	}
 }
 
+#[cfg(not(test))]
 fn main() {
 	env_logger::init().unwrap();
 	// configure_log();

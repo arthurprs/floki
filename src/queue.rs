@@ -6,18 +6,20 @@ use std::fs::{File, OpenOptions};
 use std::os::unix::io::AsRawFd;
 use std::cell::UnsafeCell;
 use std::sync::{Arc, Mutex, RwLock};
-use std::sync::atomic::{AtomicIsize, Ordering};
-use std::collections::{VecDeque, HashMap, BTreeMap};
+use std::collections::HashMap;
 use std::collections::hash_map::Entry;
-use nix::c_void;    
-use nix::sys::mman;
+use std::collections::hash_state::DefaultState;
 use std::ptr;
 use std::fs;
 use std::mem::{self, size_of};
 use std::slice;
 use std::rc::Rc;
 use std::path::{PathBuf, Path};
+use nix::c_void;
+use nix::sys::mman;
 use linked_hash_map::LinkedHashMap;
+use time::precise_time_s;
+use fnv::FnvHasher;
 
 use config::*;
 
@@ -27,7 +29,7 @@ pub struct Message<'a> {
     pub body: &'a[u8]
 }
 
-#[repr(C)]
+#[repr(packed)]
 struct MessageHeader {
     id: u64,
     len: u32,
@@ -58,7 +60,7 @@ struct QueueBackend {
 pub struct Channel {
     tail: u64,
     message_count: u64,
-    in_flight: LinkedHashMap<u64, u32>
+    in_flight: LinkedHashMap<u64, u32, DefaultState<FnvHasher>>
 }
 
 #[derive(Debug)]
@@ -68,7 +70,8 @@ pub struct Queue {
     backend_wlock: Mutex<()>,
     backend_rlock: RwLock<()>,
     backend: QueueBackend,
-    channels: RwLock<HashMap<String, Mutex<Channel>>>
+    channels: RwLock<HashMap<String, Mutex<Channel>, DefaultState<FnvHasher>>>,
+    clock: u32
 }
 
 #[derive(Clone)]
@@ -213,10 +216,13 @@ impl QueueBackend {
     }
 
     fn gen_file_path(&self, file_num: usize) -> PathBuf {
-        let file_name = format!("data{:8}.bin", file_num);
+        let file_name = format!("data{:08}.bin", file_num);
         self.config.data_directory.join(file_name)
     }
 
+    /// this relies on Box beeing at the same place even if this vector is reallocated
+    /// also, this don't do any ref count, so one must make sure the mmap is alive while there
+    /// are messages pointing to this QueueFile
     fn get_queue_file(&self, index: usize) -> Option<&QueueFile> {
         let files = self.files.read().unwrap();
         match files.get(index) {
@@ -310,16 +316,21 @@ impl Queue {
 
     pub fn new(config: QueueConfig) -> Queue {
         let rc_config = Rc::new(config);
-        Queue {
+        let mut queue = Queue {
             config: rc_config.clone(),
             backend_wlock: Mutex::new(()),
             backend_rlock: RwLock::new(()),
             backend: QueueBackend::new(rc_config.clone()),
-            channels: RwLock::new(HashMap::new()),
-        }
+            channels: RwLock::new(Default::default()),
+            clock: 0,
+        };
+        queue.tick();
+        queue
     }
 
-    pub fn create_channel(&mut self, channel_name: String) -> bool {
+    pub fn create_channel<S>(&mut self, channel_name: S) -> bool
+            where String: From<S> {
+        let channel_name: String = channel_name.into();
         let mut locked_channel = self.channels.write().unwrap();
         if let Entry::Vacant(vacant_entry) = locked_channel.entry(channel_name) {
             vacant_entry.insert(
@@ -327,7 +338,7 @@ impl Queue {
                     Channel {
                         tail: 0,
                         message_count: 0,
-                        in_flight: LinkedHashMap::new()
+                        in_flight: Default::default()
                     }
                 )
             );
@@ -337,12 +348,24 @@ impl Queue {
         }
     }
 
-    /// read access is suposed to be thread-safe, even while writing
+    /// get access is suposed to be thread-safe, even while writing
     pub fn get(&mut self, channel_name: &str) -> Option<Message> {
         let _ = self.backend_rlock.read().unwrap();
         let locked_channels = self.channels.read().unwrap();
         if let Some(channel) = locked_channels.get(channel_name) {
             let mut locked_channel = channel.lock().unwrap();
+
+            // check in flight queue for timeouts
+            if let Some((&id, &until)) = locked_channel.in_flight.front() {
+                if until > self.clock {
+                    // double get bellow, not ideal
+                    let new_until = locked_channel.in_flight.get_refresh(&id).unwrap();
+                    *new_until = self.clock + self.config.time_to_live;
+                    return Some(self.backend.get(id).unwrap().1)
+                }
+            }
+
+            // fetch from the backend
             if let Some((new_tail, message)) = self.backend.get(locked_channel.tail) {
                 locked_channel.tail = new_tail;
                 return Some(message)
@@ -356,7 +379,8 @@ impl Queue {
         let _ = self.backend_wlock.lock().unwrap();
         self.backend.put(message)
     }
-    
+
+    /// delete access is suposed to be thread-safe, even while writing
     pub fn delete(&mut self, channel_name: &str, id: u64) -> Option<bool> {
         let _ = self.backend_rlock.read().unwrap();
         let locked_channels = self.channels.read().unwrap();
@@ -377,6 +401,10 @@ impl Queue {
         // add gc code here
     }
 
+    pub fn tick(&mut self) {
+        self.clock = precise_time_s() as u32;
+    }
+
     #[allow(mutable_transmutes)]
     pub fn as_mut(&self) -> &mut Self {
         unsafe { mem::transmute(self) }
@@ -387,14 +415,13 @@ impl Queue {
 mod tests {
     use super::*;
     use config::*;
+    use std::thread;
     use test;
 
     fn get_queue() -> Queue {
         let server_config = ServerConfig::read();
-        let mut queue_configs = server_config.read_queue_configs();
-        Queue::new(
-            queue_configs.pop().unwrap_or_else(|| server_config.new_queue_config("test"))
-        )
+        let thread = thread::current();
+        Queue::new(server_config.new_queue_config(thread.name().unwrap()))
     }
 
     fn gen_message(id: u64) -> Message<'static> {
@@ -418,11 +445,34 @@ mod tests {
     fn test_put_get() {
         let mut q = get_queue();
         let message = gen_message(0);
+        assert!(q.create_channel("test"));
         for i in (0..100_000) {
             assert!(q.put(&message).is_some());
-            let m = q.get();
+            let m = q.get("test");
             assert!(m.is_some());
         }
+    }
+
+    #[test]
+    fn test_create_channel() {
+        let mut q = get_queue();
+        let message = gen_message(0);
+        assert!(q.get("test").is_none());
+        assert!(q.put(&message).is_some());
+        assert!(q.create_channel("test") == true);
+        assert!(q.create_channel("test") == false);
+        assert!(q.get("test").is_some());
+    }
+
+    #[test]
+    fn test_channel_in_flight() {
+        let mut q = get_queue();
+        let message = gen_message(0);
+        assert!(q.get("test").is_none());
+        assert!(q.put(&message).is_some());
+        assert!(q.create_channel("test") == true);
+        assert!(q.create_channel("test") == false);
+        assert!(q.get("test").is_some());
     }
 
     #[bench]
@@ -441,10 +491,11 @@ mod tests {
     fn put_get_like_crazy(b: &mut test::Bencher) {
         let mut q = get_queue();
         let m = &gen_message(0);
+        q.create_channel("test");
         b.bytes = m.body.len() as u64;
         b.iter(|| {
             let p = q.put(m);
-            let r = q.get();
+            let r = q.get("test");
             p.unwrap() == r.unwrap().id
         });
     }

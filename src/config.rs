@@ -16,6 +16,7 @@ pub struct QueueConfig {
     pub name: String,
     pub data_directory: PathBuf,
     pub segment_size: u64,
+    pub time_to_live: u32,
 }
 
 impl ServerConfig {
@@ -37,7 +38,7 @@ impl ServerConfig {
             data_directory: data_directory.into(),
             port: port,
             bind_address: bind_address.into(),
-            segment_size: segment_size_mb as u64 * 1024 * 1024
+            segment_size: segment_size_mb as u64 * 1024 * 1024,
         }
     }
 
@@ -67,11 +68,14 @@ impl ServerConfig {
 impl QueueConfig {
     fn new(server_config: &ServerConfig, name: String) -> QueueConfig {
         let data_directory = server_config.data_directory.join(&name);
-        fs::create_dir_all(&data_directory).unwrap();
+        if ! Path::new(&data_directory).is_dir() {
+            fs::create_dir_all(&data_directory).unwrap();
+        }
         QueueConfig {
             name: name,
             data_directory: data_directory,
-            segment_size: server_config.segment_size
+            segment_size: server_config.segment_size,
+            time_to_live: 30
         }
     }
 

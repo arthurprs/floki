@@ -113,7 +113,7 @@ impl Dispatcher {
 		let queue = queue_opt.unwrap_or_else(|| self.state.write().unwrap().get_or_create_queue(queue_name));
 		if let Some(channel_name) = channel_name_opt {
 			info!("creating queue {:?} channel {:?}", queue_name, channel_name);
-			queue.as_mut().create_channel(channel_name.into());
+			queue.as_mut().create_channel(channel_name);
 		} else {
 			debug!("inserting into {:?} {:?}", key_str_slice, value_slice);
 			let id = queue.as_mut().put(&Message{id:0, body: value_slice}).unwrap();

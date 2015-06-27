@@ -15,6 +15,7 @@ time = "0.1.25"
 num_cpus = "0.2.6"
 serde = "0.4.0"
 serde_macros = "0.4.0"
+fnv = "1.0.0"
 
 [dependencies.linked-hash-map]
 git="https://github.com/arthurprs/linked-hash-map.git"
