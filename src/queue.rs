@@ -356,11 +356,12 @@ impl Queue {
             let mut locked_channel = channel.lock().unwrap();
 
             // check in flight queue for timeouts
-            if let Some((&id, &until)) = locked_channel.in_flight.front() {
-                if until > self.clock {
-                    // double get bellow, not ideal
-                    let new_until = locked_channel.in_flight.get_refresh(&id).unwrap();
-                    *new_until = self.clock + self.config.time_to_live;
+            if let Some((&id, &expires)) = locked_channel.in_flight.front() {
+                if self.clock >= expires {
+                    // FIXME: double get bellow, not ideal
+                    let new_expires = locked_channel.in_flight.get_refresh(&id).unwrap();
+                    *new_expires = self.clock + self.config.time_to_live;
+                    trace!("[{}] msg {} expired and will be sent again", self.config.name, id);
                     return Some(self.backend.get(id).unwrap().1)
                 }
             }
@@ -368,9 +369,12 @@ impl Queue {
             // fetch from the backend
             if let Some((new_tail, message)) = self.backend.get(locked_channel.tail) {
                 locked_channel.tail = new_tail;
+                locked_channel.in_flight.insert(message.id, self.clock + self.config.time_to_live);
+                trace!("[{}] fetched msg {} from backend", self.config.name, message.id);
                 return Some(message)
             }
         }
+        trace!("[{}] no messages available", self.config.name);
         None
     }
 
@@ -392,6 +396,7 @@ impl Queue {
     }
 
     pub fn purge(&mut self) {
+        info!("[{}] purging", self.config.name);
         let _ = self.backend_rlock.write().unwrap();
         let _ = self.backend_wlock.lock().unwrap();
         self.backend.purge();
@@ -403,6 +408,7 @@ impl Queue {
 
     pub fn tick(&mut self) {
         self.clock = precise_time_s() as u32;
+        debug!("[{}] tick to {}", self.config.name, self.clock);
     }
 
     #[allow(mutable_transmutes)]
@@ -421,7 +427,10 @@ mod tests {
     fn get_queue() -> Queue {
         let server_config = ServerConfig::read();
         let thread = thread::current();
-        Queue::new(server_config.new_queue_config(thread.name().unwrap()))
+        let mut queue_config = server_config.new_queue_config(
+            thread.name().unwrap().split("::").last().unwrap());
+        queue_config.time_to_live = 1;
+        Queue::new(queue_config)
     }
 
     fn gen_message(id: u64) -> Message<'static> {
@@ -465,13 +474,30 @@ mod tests {
     }
 
     #[test]
-    fn test_channel_in_flight() {
+    fn test_in_flight() {
         let mut q = get_queue();
         let message = gen_message(0);
         assert!(q.get("test").is_none());
         assert!(q.put(&message).is_some());
         assert!(q.create_channel("test") == true);
         assert!(q.create_channel("test") == false);
+        assert!(q.get("test").is_some());
+        assert!(q.get("test").is_none());
+        // TODO: check in flight count
+    }
+
+    #[test]
+    fn test_in_flight_timeout() {
+        // use env_logger;
+        // env_logger::init().unwrap();
+        let mut q = get_queue();
+        let message = gen_message(0);
+        assert!(q.create_channel("test") == true);
+        assert!(q.put(&message).is_some());
+        assert!(q.get("test").is_some());
+        assert!(q.get("test").is_none());
+        thread::sleep_ms(1001);
+        q.tick();
         assert!(q.get("test").is_some());
     }
 
