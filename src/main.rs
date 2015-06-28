@@ -27,9 +27,11 @@ mod config;
 mod queue;
 mod server;
 mod protocol;
+mod queue_backend;
 
 use config::*;
 use queue::*;
+use queue_backend::Message;
 use server::*;
 
 

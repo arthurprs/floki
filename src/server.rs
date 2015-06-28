@@ -1,16 +1,18 @@
 use std::str::{self, FromStr};
 use std::net::{SocketAddr, lookup_host, SocketAddrV4};
-use std::io::{Error, ErrorKind, Read, Write};
+use std::io::{Read, Write};
 use std::mem;
 use std::sync::{Arc, RwLock};
 use std::collections::HashMap;
 use mio::tcp::{TcpStream, TcpListener};
 use mio::util::{Slab};
-use mio::{Buf, MutBuf, Token, EventLoop, EventLoopConfig, Interest, PollOpt, ReadHint, Timeout, Handler, Sender};
+use mio::{Buf, MutBuf, Token, EventLoop, Interest, PollOpt, ReadHint, Timeout, Handler, Sender};
 use threadpool::ThreadPool;
 use num_cpus::get as get_num_cpus;
 use serde::json;
+
 use queue::*;
+use queue_backend::Message;
 use config::*;
 use protocol::*;
 
