@@ -162,6 +162,7 @@ impl Queue {
 mod tests {
     use super::*;
     use config::*;
+    use queue_backend::Message;
     use std::thread;
     use test;
 
@@ -185,7 +186,7 @@ mod tests {
 
 
     #[test]
-    fn _logger() {
+    fn _logger_flight() {
         use env_logger;
         env_logger::init();
     }

@@ -9,6 +9,7 @@ use std::sync::RwLock;
 use std::rc::Rc;
 use std::slice;
 use std::mem::{self, size_of};
+use std::collections::VecMap;
 
 use config::*;
 
@@ -43,7 +44,7 @@ pub struct QueueFile {
 #[derive(Debug)]
 pub struct QueueBackend {
     config: Rc<QueueConfig>,
-    files: RwLock<Vec<Option<Box<QueueFile>>>>,
+    files: RwLock<VecMap<Box<QueueFile>>>,
     head: u64,
     tail: u64
 }
@@ -68,7 +69,7 @@ impl QueueFile {
         Self::new(config, file, base_path, file_num)
     }
 
-    fn open<P>(config: &QueueConfig, file_num: usize) -> QueueFile {
+    fn open(config: &QueueConfig, file_num: usize) -> QueueFile {
         let base_path = Self::base_file_path(config, file_num);
         let data_path = base_path.with_extension("data");
         let file = OpenOptions::new()
@@ -154,7 +155,7 @@ impl QueueFile {
                 self.file_mmap.offset(self.offset as isize + size_of::<MessageHeader>() as isize),
                 message.body.len());
         }
-        
+
         self.offset += message_total_len;
         self.dirty_bytes += message_total_len;
         self.dirty_messages += 1;
@@ -174,7 +175,7 @@ impl QueueFile {
                 let mut contents = String::new();
                 let _ = file.read_to_string(&mut contents);
                 match contents.parse::<usize>() {
-                    Ok(checkpoint) =>  {
+                    Ok(checkpoint) => {
                         info!("[{:?}] checkpoint loaded with offset {}",
                             self.base_path, checkpoint);
                         self.offset = checkpoint;
@@ -193,7 +194,7 @@ impl QueueFile {
             }
         }
 
-        // TODO: read forward checkin the message hashes 
+        // TODO: read forward checking the message hashes
     }
 
     fn checkpoint(&mut self) {
@@ -201,22 +202,24 @@ impl QueueFile {
         let offset = self.offset;
         self.sync(true);
 
-        // this file size is always smaller than the sector size, so this is ok
-        let path = self.base_path.with_extension("checkpoint");
-        match OpenOptions::new().write(true).create(true).open(path) {
-            Ok(mut file) => {
+        let tmp_path = self.base_path.with_extension("checkpoint.tmp");
+        let result = File::create(&tmp_path)
+            .and_then(|mut file| {
                 write!(file, "{}", offset);
-                file.sync_data().unwrap();
-                info!("[{:?}] checkpoint written with offset {}",
-                    self.base_path, self.offset);
-            }
-            Err(error) => {
-                warn!("[{:?}] error writing checkpoint information: {}",
-                    self.base_path, error);
-                return;
-            }
-        }
+                file.sync_data()
+            }).and_then(|_| {
+                let final_path = self.base_path.with_extension("checkpoint");
+                fs::rename(tmp_path, final_path)
+            });
 
+        match result {
+            Ok(_) =>
+                info!("[{:?}] checkpointed: {}",
+                    self.base_path, offset),
+            Err(error) =>
+                warn!("[{:?}] error writing checkpoint information: {}",
+                    self.base_path, error)
+        }
     }
 }
 
@@ -230,9 +233,34 @@ impl QueueBackend {
     pub fn new(config: Rc<QueueConfig>) -> QueueBackend {
         QueueBackend {
             config: config,
-            files: RwLock::new(Vec::new()),
+            files: RwLock::new(VecMap::new()),
             head: 0,
             tail: 0
+        }
+    }
+
+    fn recover(&mut self) {
+        let result = fs::read_dir(&self.config.data_directory).map(|dir| {
+            let file_nums = dir.filter_map(|entry_opt| {
+                entry_opt.ok().and_then(|entry| {
+                    let entry_path = entry.path();
+                    match (entry_path.file_stem(), entry_path.extension()) {
+                        (Some(stem), Some(ext)) if ext == "data" => {
+                            stem.to_str().and_then(|s| s.parse::<usize>().ok())
+                        }
+                        _ => None
+                    }
+                })
+            });
+            let mut locked_files = self.files.write().unwrap();
+            for file_num in file_nums {
+                let queue_file = Box::new(QueueFile::open(&self.config, file_num));
+                locked_files.insert(file_num, queue_file);
+            }
+        });
+
+        if let Err(error) = result {
+            warn!("[{}] error while recovering queue: {}", self.config.name, error);
         }
     }
 
@@ -241,8 +269,8 @@ impl QueueBackend {
     /// are messages pointing to this QueueFile
     fn get_queue_file(&self, index: usize) -> Option<&QueueFile> {
         let files = self.files.read().unwrap();
-        match files.get(index) {
-            Some(&Some(ref file_box_ref)) => unsafe {
+        match files.get(&index) {
+            Some(ref file_box_ref) => unsafe {
                 let file_box_ptr: *const *const QueueFile = mem::transmute(file_box_ref);
                 Some(mem::transmute(*file_box_ptr))
             },
@@ -281,7 +309,8 @@ impl QueueBackend {
             let mut queue_file = Box::new(QueueFile::create(
                 &self.config, head_file));
             let q_file_ptr = (&mut *queue_file) as *mut QueueFile;
-            self.files.write().unwrap().push(Some(queue_file));
+            self.files.write().unwrap().insert(head_file, queue_file);
+            info!("[{}] created file num {}", self.config.name, head_file);
             unsafe { mem::transmute(q_file_ptr) }
         };
 

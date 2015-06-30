@@ -5,6 +5,7 @@
 #![feature(test)]
 #![feature(path_ext)]
 #![feature(hashmap_hasher)]
+#![feature(vecmap)]
 
 #![feature(custom_derive, plugin)]
 #![plugin(serde_macros)]
