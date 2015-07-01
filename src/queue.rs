@@ -122,6 +122,7 @@ impl Queue {
     /// all calls are serialized internally
     pub fn put(&mut self, message: &Message) -> Option<u64> {
         let _ = self.backend_wlock.lock().unwrap();
+        trace!("[{}] putting message", self.config.name);
         self.backend.put(message)
     }
 

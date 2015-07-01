@@ -58,7 +58,7 @@ impl QueueFile {
     fn create(config: &QueueConfig, file_num: usize) -> QueueFile {
         let base_path = Self::base_file_path(config, file_num);
         let data_path = base_path.with_extension("bin");
-        debug!("[{}] opening data file {:?}", config.name, data_path);
+        debug!("[{}] creating data file {:?}", config.name, data_path);
         let file = OpenOptions::new()
                 .read(true)
                 .write(true)
@@ -72,6 +72,7 @@ impl QueueFile {
     fn open(config: &QueueConfig, file_num: usize) -> QueueFile {
         let base_path = Self::base_file_path(config, file_num);
         let data_path = base_path.with_extension("data");
+        debug!("[{}] opening data file {:?}", config.name, data_path);
         let file = OpenOptions::new()
                 .read(true)
                 .write(true)
@@ -270,9 +271,8 @@ impl QueueBackend {
     fn get_queue_file(&self, index: usize) -> Option<&QueueFile> {
         let files = self.files.read().unwrap();
         match files.get(&index) {
-            Some(ref file_box_ref) => unsafe {
-                let file_box_ptr: *const *const QueueFile = mem::transmute(file_box_ref);
-                Some(mem::transmute(*file_box_ptr))
+            Some(file_box_ref) => unsafe {
+                Some(mem::transmute(&(**file_box_ref)))
             },
             _ => None
         }
@@ -309,8 +309,7 @@ impl QueueBackend {
             let mut queue_file = Box::new(QueueFile::create(
                 &self.config, head_file));
             let q_file_ptr = (&mut *queue_file) as *mut QueueFile;
-            self.files.write().unwrap().insert(head_file, queue_file);
-            info!("[{}] created file num {}", self.config.name, head_file);
+            assert!(self.files.write().unwrap().insert(head_file, queue_file).is_none());
             unsafe { mem::transmute(q_file_ptr) }
         };
 
