@@ -10,6 +10,7 @@ use std::rc::Rc;
 use std::slice;
 use std::mem::{self, size_of};
 use std::collections::VecMap;
+use rustc_serialize::json;
 
 use config::*;
 
@@ -21,24 +22,31 @@ pub struct Message<'a> {
 
 #[repr(packed)]
 struct MessageHeader {
+    // TODO: needs a hash
     id: u64,
     len: u32,
 }
 
+#[derive(Debug, Eq, PartialEq, RustcDecodable, RustcEncodable)]
+struct QueueFileState {
+    offset: usize,
+    closed: bool
+}
+
 #[derive(Debug)]
 pub struct QueueFile {
-    file: File,
     base_path: PathBuf,
+    // TODO: move mmaped file abstraction
+    file: File,
     file_size: usize,
     file_mmap: *mut u8,
     file_num: usize,
+    // dirty_bytes: usize,
+    // dirty_messages: usize,
     start_id: u64,
-    // usize to allow atomic reads on 32bit platforms
-    // FIXME: must make sure these don't cross cache lines
     offset: usize,
-    dirty_bytes: usize,
-    dirty_messages: usize,
     closed: bool,
+    checkpoint_closed: bool
 }
 
 #[derive(Debug)]
@@ -49,6 +57,9 @@ pub struct QueueBackend {
     tail: u64
 }
 
+const DATA_EXTENSION: &'static str = "data";
+const CHECKPOINT_EXTENSION: &'static str = "checkpoint";
+const TMP_CHECKPOINT_EXTENSION: &'static str = "checkpoint.tmp";
 
 impl QueueFile {
     fn base_file_path(config: &QueueConfig, file_num: usize) -> PathBuf {
@@ -57,7 +68,7 @@ impl QueueFile {
 
     fn create(config: &QueueConfig, file_num: usize) -> QueueFile {
         let base_path = Self::base_file_path(config, file_num);
-        let data_path = base_path.with_extension("bin");
+        let data_path = base_path.with_extension(DATA_EXTENSION);
         debug!("[{}] creating data file {:?}", config.name, data_path);
         let file = OpenOptions::new()
                 .read(true)
@@ -71,7 +82,7 @@ impl QueueFile {
 
     fn open(config: &QueueConfig, file_num: usize) -> QueueFile {
         let base_path = Self::base_file_path(config, file_num);
-        let data_path = base_path.with_extension("data");
+        let data_path = base_path.with_extension(DATA_EXTENSION);
         debug!("[{}] opening data file {:?}", config.name, data_path);
         let file = OpenOptions::new()
                 .read(true)
@@ -83,25 +94,26 @@ impl QueueFile {
     }
 
     fn new(config: &QueueConfig, file: File, base_path: PathBuf, file_num: usize) -> QueueFile {
-        let file_len = file.metadata().unwrap().len();
-        assert_eq!(file_len, config.segment_size);
+        let file_size = file.metadata().unwrap().len();
+        assert_eq!(file_size, config.segment_size);
 
         let file_mmap = mman::mmap(
-            ptr::null_mut(), file_len,
+            ptr::null_mut(), file_size,
             mman::PROT_READ | mman::PROT_WRITE, mman::MAP_SHARED,
             file.as_raw_fd(), 0).unwrap() as *mut u8;
         
         QueueFile {
-            file: file,
             base_path: base_path,
-            file_size: config.segment_size as usize,
+            file: file,
+            file_size: file_size as usize,
             file_mmap: file_mmap,
             file_num: file_num,
             start_id: file_num as u64 * config.segment_size,
+            // dirty_messages: 0,
+            // dirty_bytes: 0,
             offset: 0,
-            dirty_messages: 0,
-            dirty_bytes: 0,
             closed: false,
+            checkpoint_closed: false,
         }
     }
     
@@ -158,8 +170,8 @@ impl QueueFile {
         }
 
         self.offset += message_total_len;
-        self.dirty_bytes += message_total_len;
-        self.dirty_messages += 1;
+        // self.dirty_bytes += message_total_len;
+        // self.dirty_messages += 1;
 
         Some(header.id)
     }
@@ -170,19 +182,16 @@ impl QueueFile {
     }
 
     fn recover(&mut self) {
-        let path = self.base_path.with_extension("checkpoint");
-        match File::open(path) {
+        let path = self.base_path.with_extension(CHECKPOINT_EXTENSION);
+        let state: QueueFileState = match File::open(path) {
             Ok(mut file) => {
                 let mut contents = String::new();
                 let _ = file.read_to_string(&mut contents);
-                match contents.parse::<usize>() {
-                    Ok(checkpoint) => {
-                        info!("[{:?}] checkpoint loaded with offset {}",
-                            self.base_path, checkpoint);
-                        self.offset = checkpoint;
-                    }
+                let state_result = json::decode(&contents);
+                match state_result {
+                    Ok(state) => state,
                     Err(error) => {
-                        warn!("[{:?}] error parsing checkpoint information: {}",
+                        error!("[{:?}] error parsing checkpoint information: {}",
                             self.base_path, error);
                         return;
                     }
@@ -193,33 +202,45 @@ impl QueueFile {
                     self.base_path, error);
                 return;
             }
-        }
+        };
+
+        info!("[{:?}] checkpoint loaded: {:?}", self.base_path, state);
+        self.offset = state.offset;
+        self.closed = state.closed;
+        self.checkpoint_closed = state.closed;
 
         // TODO: read forward checking the message hashes
     }
 
     fn checkpoint(&mut self) {
         // FIXME: reset and log stats
-        let offset = self.offset;
+        let state = QueueFileState {
+            offset: self.offset,
+            closed: self.closed,
+        };
         self.sync(true);
 
-        let tmp_path = self.base_path.with_extension("checkpoint.tmp");
+        let tmp_path = self.base_path.with_extension(TMP_CHECKPOINT_EXTENSION);
         let result = File::create(&tmp_path)
             .and_then(|mut file| {
-                write!(file, "{}", offset);
+                write!(file, "{}", json::as_pretty_json(&state));
                 file.sync_data()
             }).and_then(|_| {
-                let final_path = self.base_path.with_extension("checkpoint");
+                let final_path = self.base_path.with_extension(CHECKPOINT_EXTENSION);
                 fs::rename(tmp_path, final_path)
             });
 
         match result {
-            Ok(_) =>
-                info!("[{:?}] checkpointed: {}",
-                    self.base_path, offset),
-            Err(error) =>
+            Ok(_) => {
+                if state.closed {
+                    self.checkpoint_closed = true;
+                }
+                info!("[{:?}] checkpointed: {:?}", self.base_path, state);
+            }
+            Err(error) => {
                 warn!("[{:?}] error writing checkpoint information: {}",
-                    self.base_path, error)
+                    self.base_path, error);
+            }
         }
     }
 }
@@ -231,13 +252,19 @@ impl Drop for QueueFile {
 }
 
 impl QueueBackend {
-    pub fn new(config: Rc<QueueConfig>) -> QueueBackend {
-        QueueBackend {
+    pub fn new(config: Rc<QueueConfig>, recover: bool) -> QueueBackend {
+        let mut backend = QueueBackend {
             config: config,
             files: RwLock::new(VecMap::new()),
             head: 0,
             tail: 0
+        };
+        if recover {
+            backend.recover();
+        } else {
+            backend.purge();
         }
+        backend
     }
 
     fn recover(&mut self) {
@@ -246,22 +273,24 @@ impl QueueBackend {
                 entry_opt.ok().and_then(|entry| {
                     let entry_path = entry.path();
                     match (entry_path.file_stem(), entry_path.extension()) {
-                        (Some(stem), Some(ext)) if ext == "data" => {
-                            stem.to_str().and_then(|s| s.parse::<usize>().ok())
+                        (Some(stem), Some(ext)) if ext == CHECKPOINT_EXTENSION => {
+                            stem.to_str().and_then(|s| s.parse().ok())
                         }
                         _ => None
                     }
                 })
             });
+
             let mut locked_files = self.files.write().unwrap();
             for file_num in file_nums {
+                info!("[{}] recovering file: {}", self.config.name, file_num);
                 let queue_file = Box::new(QueueFile::open(&self.config, file_num));
                 locked_files.insert(file_num, queue_file);
             }
         });
 
         if let Err(error) = result {
-            warn!("[{}] error while recovering queue: {}", self.config.name, error);
+            warn!("[{}] error while recovering: {}", self.config.name, error);
         }
     }
 
@@ -282,7 +311,7 @@ impl QueueBackend {
         unsafe { mem::transmute(self.get_queue_file(index)) }
     }
 
-    fn files_count(&self) -> usize {
+    pub fn files_count(&self) -> usize {
         self.files.read().unwrap().len()
     }
 
@@ -351,5 +380,18 @@ impl QueueBackend {
         fs::create_dir_all(&self.config.data_directory).unwrap();
         self.tail = 0;
         self.head = 0;
+    }
+
+    fn checkpoint(&mut self) {
+        // this blocks the queue in the current form, so it's better not to be pub
+        for (file_num, file) in self.files.write().unwrap().iter_mut() {
+            file.checkpoint();
+        }
+    }
+}
+
+impl Drop for QueueBackend {
+    fn drop(&mut self) {
+        self.checkpoint();
     }
 }

@@ -9,7 +9,7 @@ use mio::util::{Slab};
 use mio::{Buf, MutBuf, Token, EventLoop, Interest, PollOpt, ReadHint, Timeout, Handler, Sender};
 use threadpool::ThreadPool;
 use num_cpus::get as get_num_cpus;
-use serde::json;
+use rustc_serialize::json;
 
 use queue::*;
 use queue_backend::Message;
@@ -68,7 +68,7 @@ impl ServerBackend {
 			return queue.clone()
 		}
 		info!("Creating queue {:?}", name);
-		let queue = ArcQueue::new(Queue::new(self.config.new_queue_config(name)));
+		let queue = ArcQueue::new(Queue::new(self.config.new_queue_config(name), true));
 		trace!("done creating queue {:?}", name);
 		self.queues.insert(name.into(), queue.clone());
 		queue
@@ -80,7 +80,7 @@ impl Dispatcher {
 	fn list_queues(&self) -> String {	
 		let locked_state = self.state.read().unwrap();
 		let queue_names: Vec<_> = locked_state.queues.keys().collect();
-	 	json::to_string(&queue_names).unwrap()
+	 	json::encode(&queue_names).unwrap()
 	}
 
 	fn split_colon(composed: &str) -> (&str, Option<&str>) {

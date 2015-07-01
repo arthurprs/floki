@@ -7,20 +7,16 @@
 #![feature(hashmap_hasher)]
 #![feature(vecmap)]
 
-#![feature(custom_derive, plugin)]
-#![plugin(serde_macros)]
-
 #[cfg(test)] extern crate test;
 extern crate env_logger;
 #[macro_use] extern crate log;
-extern crate fern;
 extern crate nix;
 extern crate mio;
 extern crate num_cpus;
 extern crate threadpool;
 extern crate time;
+extern crate rustc_serialize;
 extern crate toml;
-extern crate serde;
 extern crate linked_hash_map;
 extern crate fnv;
 
@@ -36,29 +32,21 @@ use queue_backend::Message;
 use server::*;
 
 
-fn configure_log() {
-	let logger_config = fern::DispatchConfig {
-	    format: Box::new(|msg: &str, level: &log::LogLevel, location: &log::LogLocation| {
-	        format!("[{}]{}:{}: {}",
-	        	time::now().strftime("%H:%M:%S.%f").unwrap(),
-	        	level,
-	        	location.module_path(),
-	        	msg)
-	    }),
-	    output: vec![fern::OutputConfig::stderr()],
-	    level: log::LogLevelFilter::Trace,
-	};
+// fn configure_log() {
+// 	let logger_config = fern::DispatchConfig {
+// 	    format: Box::new(|msg: &str, level: &log::LogLevel, location: &log::LogLocation| {
+// 	        format!("[{}]{}:{}: {}",
+// 	        	time::now().strftime("%H:%M:%S.%f").unwrap(),
+// 	        	level,
+// 	        	location.module_path(),
+// 	        	msg)
+// 	    }),
+// 	    output: vec![fern::OutputConfig::stderr()],
+// 	    level: log::LogLevelFilter::Trace,
+// 	};
 
-	fern::init_global_logger(logger_config, log::LogLevelFilter::Debug).unwrap();
-}
-
-
-fn gen_message(id: u64) -> Message<'static> {
-	Message {
-		id: id,
-		body: b"333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333"
-	}
-}
+// 	fern::init_global_logger(logger_config, log::LogLevelFilter::Debug).unwrap();
+// }
 
 #[cfg(not(test))]
 fn main() {

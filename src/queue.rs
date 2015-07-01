@@ -55,13 +55,13 @@ impl ArcQueue {
 
 impl Queue {
 
-    pub fn new(config: QueueConfig) -> Queue {
+    pub fn new(config: QueueConfig, recover: bool) -> Queue {
         let rc_config = Rc::new(config);
         let mut queue = Queue {
             config: rc_config.clone(),
             backend_wlock: Mutex::new(()),
             backend_rlock: RwLock::new(()),
-            backend: QueueBackend::new(rc_config.clone()),
+            backend: QueueBackend::new(rc_config.clone(), recover),
             channels: RwLock::new(Default::default()),
             clock: 0,
         };
@@ -167,15 +167,18 @@ mod tests {
     use std::thread;
     use test;
 
-    fn get_queue() -> Queue {
+    fn get_queue_opt(name: &str, recover: bool) -> Queue {
         let server_config = ServerConfig::read();
-        let thread = thread::current();
-        let mut queue_config = server_config.new_queue_config(
-            thread.name().unwrap().split("::").last().unwrap());
+        let mut queue_config = server_config.new_queue_config(name);
         queue_config.time_to_live = 1;
-        let mut queue = Queue::new(queue_config);
-        queue.purge();
+        let mut queue = Queue::new(queue_config, recover);
         queue
+    }
+
+    fn get_queue() -> Queue {
+        let thread = thread::current();
+        let name = thread.name().unwrap().split("::").last().unwrap();
+        get_queue_opt(name, false)
     }
 
     fn gen_message(id: u64) -> Message<'static> {
@@ -185,9 +188,7 @@ mod tests {
         }
     }
 
-
-    #[test]
-    fn _logger_flight() {
+    fn init_logger() {
         use env_logger;
         env_logger::init();
     }
@@ -240,8 +241,6 @@ mod tests {
 
     #[test]
     fn test_in_flight_timeout() {
-        // use env_logger;
-        // env_logger::init().unwrap();
         let mut q = get_queue();
         let message = gen_message(0);
         assert!(q.create_channel("test") == true);
@@ -251,6 +250,33 @@ mod tests {
         thread::sleep_ms(1001);
         q.tick();
         assert!(q.get("test").is_some());
+    }
+
+    #[test]
+    fn test_backend_recover() {
+        init_logger();
+        let mut q = get_queue_opt("test_reopen", false);
+        let message = gen_message(0);
+        let mut put_msg_count = 0;
+        while q.backend.files_count() < 3 {
+            assert!(q.put(&message).is_some());
+            put_msg_count += 1;
+        }
+        drop(q);
+
+        let mut q = get_queue_opt("test_reopen", true);
+        assert!(q.create_channel("test") == true);
+        assert_eq!(q.backend.files_count(), 3);
+        let mut get_msg_count = 0;
+        while let Some(_) = q.get("test") {
+            get_msg_count += 1;
+        }
+        assert_eq!(get_msg_count, put_msg_count);
+    }
+
+    #[test]
+    fn test_queue_recover() {
+        // Add code here
     }
 
     #[bench]
