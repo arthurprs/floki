@@ -1,15 +1,16 @@
-use std::slice;
 use mio::{Buf, MutBuf};
+use std::slice;
 use std::mem::{self, size_of};
 use std::io::Write;
+use std::fmt;
 
 const REQUEST_MAGIC: u8 = 0x80;
 const RESPONSE_MAGIC: u8 = 0x81;
 
 const DATA_TYPE_RAW: u8 = 0x0;
 
-#[derive(Debug, PartialEq, Eq)]
-#[repr(C)]
+#[derive(Debug, PartialEq, Eq, Copy, Clone)]
+#[repr(u8)]
 pub enum OpCode {
     Get = 0x0,
     Set = 0x1,
@@ -39,8 +40,8 @@ impl OpCode {
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
-#[repr(C)]
+#[derive(Debug, PartialEq, Eq, Copy, Clone)]
+#[repr(u16)]
 pub enum Status {
     NoError = 0x0,
     KeyNotFound = 0x1,
@@ -49,7 +50,6 @@ pub enum Status {
     UknownCommand = 0x81
 }
 
-#[derive(Debug)]
 #[repr(packed)]
 pub struct RequestHeader {
     magic: u8,
@@ -63,7 +63,6 @@ pub struct RequestHeader {
     cas: u64
 }
 
-#[derive(Debug)]
 #[repr(packed)]
 pub struct ResponseHeader {
     magic: u8,
@@ -75,6 +74,38 @@ pub struct ResponseHeader {
     total_body_len: u32,
     opaque: u32,
     cas: u64
+}
+
+impl fmt::Debug for RequestHeader {
+    fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
+        fmt.debug_struct("RequestHeader")
+            .field("magic", &self.magic.to_be())
+            .field("opcode", &self.opcode.to_be())
+            .field("key_len", &self.key_len.to_be())
+            .field("extras_len", &self.extras_len.to_be())
+            .field("data_type", &self.data_type.to_be())
+            .field("vbucket_id", &self.vbucket_id.to_be())
+            .field("total_body_len", &self.total_body_len.to_be())
+            .field("opaque", &self.opaque.to_be())
+            .field("cas", &self.cas.to_be())
+            .finish()
+    }
+}
+
+impl fmt::Debug for ResponseHeader {
+    fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
+        fmt.debug_struct("ResponseHeader")
+            .field("magic", &self.magic.to_be())
+            .field("opcode", &self.opcode.to_be())
+            .field("key_len", &self.key_len.to_be())
+            .field("extras_len", &self.extras_len.to_be())
+            .field("data_type", &self.data_type.to_be())
+            .field("status", &self.status.to_be())
+            .field("total_body_len", &self.total_body_len.to_be())
+            .field("opaque", &self.opaque.to_be())
+            .field("cas", &self.cas.to_be())
+            .finish()
+    }
 }
 
 impl RequestHeader {
@@ -183,8 +214,8 @@ impl RequestBuffer {
         }
     }
 
-    pub fn get_opcode(&self) -> OpCode {
-        unsafe { mem::transmute(self.header.opcode as u32) }
+    pub fn opcode(&self) -> OpCode {
+        unsafe { mem::transmute(self.header.opcode) }
     }
 }
 
@@ -244,31 +275,37 @@ impl ResponseBuffer {
         response
     }
 
-    pub fn new_get_response(key_opt: Option<&[u8]>, cas: u64, value: &[u8]) -> ResponseBuffer {
+    pub fn new_get_response(request: &RequestBuffer, cas: u64, value: &[u8]) -> ResponseBuffer {
         let mut response = ResponseBuffer {
             header: unsafe { mem::zeroed() },
             body: Vec::new(),
             bytes_written: 0
         };
         response.header.magic = RESPONSE_MAGIC;
-        response.header.opcode = if key_opt.is_none() { OpCode::Get } else { OpCode::GetK } as u8;
+        response.header.opcode = request.header.opcode;
         response.header.cas = cas;
-        let key_len = key_opt.as_ref().map_or(0, |k| k.len());
-        let total_body_len = 4 + key_len + value.len();
+        let key: &[u8] = if request.opcode().include_key() {
+            request.key_slice()
+        } else {
+            b""
+        };
+        let total_body_len = 4 + key.len() + value.len();
         response.header.set_extras_len(4);
-        response.header.set_key_len(key_len);
+        response.header.set_key_len(key.len());
         response.header.set_total_body_len(total_body_len);
         response.body.reserve_exact(total_body_len);
         response.body.write_all(b"\0\0\0\0").unwrap();
-        if let Some(key) = key_opt {
-            response.body.write_all(key).unwrap();
-        }
+        response.body.write_all(key).unwrap();
         response.body.write_all(value).unwrap();
         response
     }
 
     pub fn is_complete(&self) -> bool {
         self.bytes_written == self.header.get_total_len()
+    }
+
+    pub fn opcode(&self) -> OpCode {
+        unsafe { mem::transmute(self.header.opcode) }
     }
 }
 

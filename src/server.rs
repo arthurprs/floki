@@ -97,8 +97,7 @@ impl Dispatcher {
 		let queue_opt = self.state.read().unwrap().get_queue(queue_name);
 		if let Some(queue) = queue_opt {
 			if let Some(message) = queue.as_mut().get(channel_name) {
-				let key_opt = if opcode.include_key() { Some(key_str_slice.as_bytes()) } else { None };
-				ResponseBuffer::new_get_response(key_opt, message.id, message.body)
+				ResponseBuffer::new_get_response(&self.request, message.id, message.body)
 			} else {
 				debug!("queue {:?} channel {:?} has no messages", queue_name, channel_name);
 				ResponseBuffer::new(opcode, Status::KeyNotFound)
@@ -124,12 +123,12 @@ impl Dispatcher {
 		ResponseBuffer::new_set_response()
 	}
 
-	fn delete(&self, opcode: OpCode, key_str_slice: &str, value_slice: &[u8]) -> ResponseBuffer {
-		let (queue_name, channel_name_opt) = Self::split_colon(key_str_slice);
-		let channel_name = channel_name_opt.unwrap();
+	fn delete(&self, opcode: OpCode, key_str_slice: &str) -> ResponseBuffer {
+		let (queue_name, channel_id_opt) = Self::split_colon(key_str_slice);
+		let (channel_name, id_str_opt) = Self::split_colon(key_str_slice);
+		let id = id_str_opt.unwrap().parse().unwrap();
 		let queue_opt = self.state.read().unwrap().get_queue(queue_name);
 		let queue = queue_opt.unwrap();
-		let id: u64 = str::from_utf8(value_slice).unwrap().parse().unwrap();
 		debug!("deleting message {:?} from {:?}", id, key_str_slice);
 		queue.as_mut().delete(channel_name, id);
 		trace!("deleted message {:?} from {:?}", id, key_str_slice);
@@ -159,8 +158,8 @@ impl Dispatcher {
 			OpCode::Set => {
 				self.put(opcode, key_str_slice, value_slice)
 			}
-			OpCode::Delete if ! value_slice.is_empty() => {
-				self.delete(opcode, key_str_slice, value_slice)
+			OpCode::Delete if value_slice.is_empty() => {
+				self.delete(opcode, key_str_slice)
 			}
 			OpCode::NoOp if value_slice.is_empty() => {
 				ResponseBuffer::new(opcode, Status::NoError)
@@ -290,15 +289,7 @@ impl Server {
         debug!("incomming connection from {:?}", connection_addr);
 
         // Don't buffer output in TCP - kills latency sensitive benchmarks
-        {
-        	use std::os::unix::io::AsRawFd;
-	        use nix::sys::socket;
-	        socket::setsockopt(
-	        	stream.as_raw_fd(), socket::SockLevel::Tcp, socket::sockopt::TcpNoDelay, &true
-	        ).unwrap();
-	    }
-
-        // stream.set_tcp_nodelay(false);
+        stream.set_nodelay(false).unwrap();
 
         let connection = Connection::new(stream);
 
