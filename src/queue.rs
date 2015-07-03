@@ -89,6 +89,11 @@ impl Queue {
         }
     }
 
+    pub fn delete_channel(&mut self, channel_name: &str) -> bool {
+        let mut locked_channel = self.channels.write().unwrap();
+        locked_channel.remove(channel_name).is_some()
+    }
+
     /// get access is suposed to be thread-safe, even while writing
     pub fn get(&mut self, channel_name: &str) -> Option<Message> {
         let _ = self.backend_rlock.read().unwrap();

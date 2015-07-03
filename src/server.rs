@@ -146,14 +146,22 @@ impl Dispatcher {
 				"_delete" => queue.purge(),
 				_ => return Err(Status::InvalidArguments)
 			}
-		} else {
+		} else if let Some(id_str) = id_str_opt {
 			let channel_name = command_name;
-			let id = id_str_opt.unwrap().parse().unwrap();
-			debug!("deleting message {:?} from {:?}", id, key_str_slice);
+			let id = if let Ok(id) = id_str_opt.unwrap().parse() {
+				id
+			} else {
+				return Err(Status::InvalidArguments)
+			};
+			debug!("deleting message {:?} from {:?}", id, command_name);
 			if queue.delete(channel_name, id).is_none() {
 				return Err(Status::KeyNotFound)
 			}
-			trace!("deleted message {:?} from {:?}", id, key_str_slice);
+		} else {
+			debug!("deleting channel {:?}", command_name);
+			if ! queue.delete_channel(command_name) {
+				return Err(Status::KeyNotFound)
+			}
 		}
 		Ok(ResponseBuffer::new(opcode, Status::NoError))
 	}
