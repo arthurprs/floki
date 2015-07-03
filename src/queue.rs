@@ -115,7 +115,6 @@ impl Queue {
                 return Some(message)
             }
         }
-        trace!("[{}] no messages available", self.config.name);
         None
     }
 
@@ -132,6 +131,8 @@ impl Queue {
         let locked_channels = self.channels.read().unwrap();
         if let Some(channel) = locked_channels.get(channel_name) {
             let removed_opt = channel.lock().unwrap().in_flight.remove(&id);
+            trace!("[{}] message {} deleted from channel: {}",
+                self.config.name, id, removed_opt.is_some());
             return Some(removed_opt.is_some())
         }
         None
@@ -142,6 +143,7 @@ impl Queue {
         let _ = self.backend_rlock.write().unwrap();
         let _ = self.backend_wlock.lock().unwrap();
         self.backend.purge();
+        self.channels.write().unwrap().clear();
     }
 
     pub fn maintenance(&mut self) {

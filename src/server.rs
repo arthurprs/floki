@@ -58,6 +58,8 @@ struct Dispatcher {
 	sender: Sender<(Token, NotifyMessage)>
 }
 
+type ResponseResult = Result<ResponseBuffer, Status>;
+
 impl ServerBackend {
 	fn get_queue(&self, name: &str) -> Option<ArcQueue> {
 		self.queues.get(name).map(|q| q.clone())
@@ -91,82 +93,99 @@ impl Dispatcher {
 		}
 	}
 
-	fn get(&self, opcode: OpCode, key_str_slice: &str) -> ResponseBuffer {
+	fn get(&self, opcode: OpCode, key_str_slice: &str) -> ResponseResult {
 		let (queue_name, channel_name_opt) = Self::split_colon(key_str_slice);
 		let channel_name = channel_name_opt.unwrap();
 		let queue_opt = self.state.read().unwrap().get_queue(queue_name);
 		if let Some(queue) = queue_opt {
 			if let Some(message) = queue.as_mut().get(channel_name) {
-				ResponseBuffer::new_get_response(&self.request, message.id, message.body)
+				Ok(ResponseBuffer::new_get_response(&self.request, message.id, message.body))
 			} else {
 				debug!("queue {:?} channel {:?} has no messages", queue_name, channel_name);
-				ResponseBuffer::new(opcode, Status::KeyNotFound)
+				Err(Status::KeyNotFound)
 			}
 		} else {
 			debug!("queue {:?} not found", queue_name);
-			ResponseBuffer::new(opcode, Status::InvalidArguments)
+			Err(Status::InvalidArguments)
 		}
 	}
 
-	fn put(&self, opcode: OpCode, key_str_slice: &str, value_slice: &[u8]) -> ResponseBuffer {
+	fn put(&self, opcode: OpCode, key_str_slice: &str, value_slice: &[u8]) -> ResponseResult {
 		let (queue_name, channel_name_opt) = Self::split_colon(key_str_slice);
 		let queue_opt = self.state.read().unwrap().get_queue(queue_name);
-		let queue = queue_opt.unwrap_or_else(|| self.state.write().unwrap().get_or_create_queue(queue_name));
+		let queue = queue_opt.unwrap_or_else(|| {
+			self.state.write().unwrap().get_or_create_queue(queue_name)
+		});
+		let queue = queue.as_mut();
+
 		if let Some(channel_name) = channel_name_opt {
 			info!("creating queue {:?} channel {:?}", queue_name, channel_name);
-			queue.as_mut().create_channel(channel_name);
+			queue.create_channel(channel_name);
 		} else {
 			debug!("inserting into {:?} {:?}", key_str_slice, value_slice);
-			let id = queue.as_mut().put(&Message{id:0, body: value_slice}).unwrap();
+			let id = queue.put(&Message{id:0, body: value_slice}).unwrap();
 			trace!("inserted message into {:?} with id {:?}", key_str_slice, id);
 		}
-		ResponseBuffer::new_set_response()
+		Ok(ResponseBuffer::new_set_response())
 	}
 
-	fn delete(&self, opcode: OpCode, key_str_slice: &str) -> ResponseBuffer {
-		let (queue_name, channel_id_opt) = Self::split_colon(key_str_slice);
-		let (channel_name, id_str_opt) = Self::split_colon(key_str_slice);
-		let id = id_str_opt.unwrap().parse().unwrap();
+	fn delete(&self, opcode: OpCode, key_str_slice: &str) -> ResponseResult {
+		let (queue_name, _opt) = Self::split_colon(key_str_slice);
 		let queue_opt = self.state.read().unwrap().get_queue(queue_name);
-		let queue = queue_opt.unwrap();
-		debug!("deleting message {:?} from {:?}", id, key_str_slice);
-		queue.as_mut().delete(channel_name, id);
-		trace!("deleted message {:?} from {:?}", id, key_str_slice);
-		ResponseBuffer::new(opcode, Status::NoError)
-	}
+		let queue = if let Some(queue) = queue_opt {
+			queue
+		} else {
+			return Err(Status::KeyNotFound)
+		};
+		let queue = queue.as_mut();
 
-	fn purge(&self, opcode: OpCode) -> ResponseBuffer {
-		ResponseBuffer::new(opcode, Status::NoError)
+		let (command_name, id_str_opt) = Self::split_colon(_opt.unwrap());
+		if command_name.starts_with('_') {
+			match command_name {
+				"_purge" => queue.purge(),
+				"_delete" => queue.purge(),
+				_ => return Err(Status::InvalidArguments)
+			}
+		} else {
+			let channel_name = command_name;
+			let id = id_str_opt.unwrap().parse().unwrap();
+			debug!("deleting message {:?} from {:?}", id, key_str_slice);
+			if queue.delete(channel_name, id).is_none() {
+				return Err(Status::KeyNotFound)
+			}
+			trace!("deleted message {:?} from {:?}", id, key_str_slice);
+		}
+		Ok(ResponseBuffer::new(opcode, Status::NoError))
 	}
 
 	fn dispatch(self) {
-		let opcode = self.request.get_opcode();
-
-		if opcode == OpCode::Stat || opcode == OpCode::Exit {
-			return
-		}
+		let opcode = self.request.opcode();
 
 		let key_str_slice = str::from_utf8(self.request.key_slice()).unwrap();
 		let value_slice = self.request.value_slice();
 
 		debug!("dispatch {:?} {:?} {:?} {:?}", self.token, opcode, key_str_slice, value_slice);
 
-		let response = match opcode {
-			OpCode::Get | OpCode::GetK | OpCode::GetQ | OpCode::GetKQ if value_slice.is_empty() => {
+		let response_result = match opcode {
+			OpCode::Get | OpCode::GetK | OpCode::GetQ | OpCode::GetKQ
+			if value_slice.is_empty() && !key_str_slice.is_empty() => {
 				self.get(opcode, key_str_slice)
 			}
-			OpCode::Set => {
+			OpCode::Set if !key_str_slice.is_empty() => {
 				self.put(opcode, key_str_slice, value_slice)
 			}
-			OpCode::Delete if value_slice.is_empty() => {
+			OpCode::Delete if !key_str_slice.is_empty() && value_slice.is_empty() => {
 				self.delete(opcode, key_str_slice)
 			}
-			OpCode::NoOp if value_slice.is_empty() => {
-				ResponseBuffer::new(opcode, Status::NoError)
+			OpCode::NoOp if key_str_slice.is_empty() && value_slice.is_empty() => {
+				Ok(ResponseBuffer::new(opcode, Status::NoError))
 			}
-			_ => {
-				ResponseBuffer::new(opcode, Status::InvalidArguments)
-			}
+			_ => Err(Status::InvalidArguments)
+		};
+
+		let response = match response_result {
+			Ok(response) => response,
+			Err(status) => ResponseBuffer::new(opcode, status)
 		};
 		let composed_msg = (self.token, NotifyMessage::Response(response));
 		self.sender.send(composed_msg).unwrap();
@@ -232,6 +251,9 @@ impl Connection {
 				debug!("done sending response {:?} to token {:?}", response_buffer, self.token);
 				self.interest = Interest::all() - Interest::writable();
 				event_loop.reregister(&self.stream, self.token, self.interest, PollOpt::level()).unwrap();
+				if response_buffer.opcode() == OpCode::Exit {
+					return false;
+				}
 				break
 			} else {
 				// keep writing
@@ -284,11 +306,12 @@ impl Server {
 		(server_handler, event_loop)
 	}
 
-	fn accept(&mut self, connections: &mut Slab<Connection>, event_loop: &mut EventLoop<ServerHandler>) {
+	fn accept(&mut self, connections: &mut Slab<Connection>, event_loop: &mut EventLoop<ServerHandler>) -> bool {
         let (stream, connection_addr) = self.listener.accept().unwrap();
         debug!("incomming connection from {:?}", connection_addr);
 
         // Don't buffer output in TCP - kills latency sensitive benchmarks
+        // TODO: use TCP_CORK
         stream.set_nodelay(false).unwrap();
 
         let connection = Connection::new(stream);
@@ -303,6 +326,7 @@ impl Server {
             connections[token].interest,
             PollOpt::level()
         ).unwrap();
+        true
 	}
 }
 
@@ -313,23 +337,38 @@ impl Handler for ServerHandler {
 	#[inline]
 	fn readable(&mut self, event_loop: &mut EventLoop<Self>, token: Token, hint: ReadHint) {
 		trace!("readable event for token {:?} hint {:?}", token, hint);
-		match token {
+		let is_ok = match token {
 			SERVER => self.server.accept(&mut self.connections, event_loop),
-			token => if ! self.connections[token].readable(&mut self.server, event_loop, hint) {
-				self.connections.remove(token);
+			token => if let Some(connection) = self.connections.get_mut(token) {
+				connection.readable(&mut self.server, event_loop, hint)
+			} else {
+				trace!("token {:?} not found", token);
+				false
 			}
+		};
+		if !is_ok {
+			trace!("deregistering token {:?}", token);
+			self.connections.remove(token);
 		}
+
 		trace!("done readable event for token {:?}", token);
 	}
 
 	#[inline]
 	fn writable(&mut self, event_loop: &mut EventLoop<Self>, token: Token) {
 		trace!("writable event for token {:?}", token);
-		match token {
+		let is_ok = match token {
 			SERVER => unreachable!(),
-			token => if ! self.connections[token].writable(&mut self.server, event_loop) {
-				self.connections.remove(token);
+			token => if let Some(connection) = self.connections.get_mut(token) {
+				connection.writable(&mut self.server, event_loop)
+			} else {
+				trace!("token {:?} not found", token);
+				false
 			}
+		};
+		if !is_ok {
+			trace!("deregistering token {:?}", token);
+			self.connections.remove(token);
 		}
 		trace!("done writable event for token {:?}", token);
 	}
@@ -337,11 +376,18 @@ impl Handler for ServerHandler {
 	fn notify(&mut self, event_loop: &mut EventLoop<Self>, composed_msg: Self::Message) {
 		let (token, message) = composed_msg;
 		trace!("notify event for token {:?} with {:?}", token, message);
-		match token {
+		let is_ok = match token {
 			SERVER => unreachable!(),
-			token => if ! self.connections[token].notify(&mut self.server, event_loop, message) {
-				self.connections.remove(token);
+			token => if let Some(connection) = self.connections.get_mut(token) {
+				connection.notify(&mut self.server, event_loop, message)
+			} else {
+				trace!("token {:?} not found", token);
+				false
 			}
+		};
+		if !is_ok {
+			trace!("deregistering token {:?}", token);
+			self.connections.remove(token);
 		}
 		trace!("end notify event for token {:?}", token);
 	}
