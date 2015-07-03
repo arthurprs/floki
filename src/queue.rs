@@ -14,10 +14,16 @@ use config::*;
 use queue_backend::*;
 
 #[derive(Debug)]
+struct InFlightState {
+    expiration: u32,
+    retry: u32,
+}
+
+#[derive(Debug)]
 pub struct Channel {
     tail: u64,
     message_count: u64,
-    in_flight: LinkedHashMap<u64, u32, DefaultState<FnvHasher>>
+    in_flight: LinkedHashMap<u64, InFlightState, DefaultState<FnvHasher>>
 }
 
 #[derive(Debug)]
@@ -102,11 +108,12 @@ impl Queue {
             let mut locked_channel = channel.lock().unwrap();
 
             // check in flight queue for timeouts
-            if let Some((&id, &expires)) = locked_channel.in_flight.front() {
-                if self.clock >= expires {
+            if let Some((&id, &InFlightState { expiration, ..} )) = locked_channel.in_flight.front() {
+                if self.clock >= expiration {
                     // FIXME: double get bellow, not ideal
-                    let new_expires = locked_channel.in_flight.get_refresh(&id).unwrap();
-                    *new_expires = self.clock + self.config.time_to_live;
+                    let state = locked_channel.in_flight.get_refresh(&id).unwrap();
+                    state.expiration = self.clock + self.config.time_to_live;
+                    state.retry += 1;
                     trace!("[{}] msg {} expired and will be sent again", self.config.name, id);
                     return Some(self.backend.get(id).unwrap().1)
                 }
@@ -115,7 +122,11 @@ impl Queue {
             // fetch from the backend
             if let Some((new_tail, message)) = self.backend.get(locked_channel.tail) {
                 locked_channel.tail = new_tail;
-                locked_channel.in_flight.insert(message.id, self.clock + self.config.time_to_live);
+                let state = InFlightState {
+                    expiration: self.clock + self.config.time_to_live,
+                    retry: 0
+                };
+                locked_channel.in_flight.insert(message.id, state);
                 trace!("[{}] fetched msg {} from backend", self.config.name, message.id);
                 return Some(message)
             }
