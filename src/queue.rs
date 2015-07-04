@@ -1,4 +1,4 @@
-use std::ops::Deref;
+use std::ops::{Deref, DerefMut};
 use std::sync::{Arc, Mutex, RwLock};
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
@@ -48,8 +48,14 @@ unsafe impl Send for ArcQueue {}
 impl Deref for ArcQueue {
     type Target = Queue;
     fn deref(&self) -> &Self::Target {
-        let &ArcQueue(ref queue) = self;
-        queue
+        &*self.0
+    }
+}
+
+impl DerefMut for ArcQueue {
+    #[allow(mutable_transmutes)]
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        unsafe { mem::transmute(self.deref()) }
     }
 }
 
@@ -169,11 +175,6 @@ impl Queue {
     pub fn tick(&mut self) {
         self.clock = precise_time_s() as u32;
         debug!("[{}] tick to {}", self.config.name, self.clock);
-    }
-
-    #[allow(mutable_transmutes)]
-    pub fn as_mut(&self) -> &mut Self {
-        unsafe { mem::transmute(self) }
     }
 }
 

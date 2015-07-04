@@ -97,8 +97,8 @@ impl Dispatcher {
 		let (queue_name, channel_name_opt) = Self::split_colon(key_str_slice);
 		let channel_name = channel_name_opt.unwrap();
 		let queue_opt = self.state.read().unwrap().get_queue(queue_name);
-		if let Some(queue) = queue_opt {
-			if let Some(message) = queue.as_mut().get(channel_name) {
+		if let Some(mut queue) = queue_opt {
+			if let Some(message) = queue.get(channel_name) {
 				Ok(ResponseBuffer::new_get_response(&self.request, message.id, message.body))
 			} else {
 				debug!("queue {:?} channel {:?} has no messages", queue_name, channel_name);
@@ -113,10 +113,9 @@ impl Dispatcher {
 	fn put(&self, opcode: OpCode, key_str_slice: &str, value_slice: &[u8]) -> ResponseResult {
 		let (queue_name, channel_name_opt) = Self::split_colon(key_str_slice);
 		let queue_opt = self.state.read().unwrap().get_queue(queue_name);
-		let queue = queue_opt.unwrap_or_else(|| {
+		let mut queue = queue_opt.unwrap_or_else(|| {
 			self.state.write().unwrap().get_or_create_queue(queue_name)
 		});
-		let queue = queue.as_mut();
 
 		if let Some(channel_name) = channel_name_opt {
 			info!("creating queue {:?} channel {:?}", queue_name, channel_name);
@@ -132,12 +131,11 @@ impl Dispatcher {
 	fn delete(&self, opcode: OpCode, key_str_slice: &str) -> ResponseResult {
 		let (queue_name, _opt) = Self::split_colon(key_str_slice);
 		let queue_opt = self.state.read().unwrap().get_queue(queue_name);
-		let queue = if let Some(queue) = queue_opt {
+		let mut queue = if let Some(queue) = queue_opt {
 			queue
 		} else {
 			return Err(Status::KeyNotFound)
 		};
-		let queue = queue.as_mut();
 
 		let (command_name, id_str_opt) = Self::split_colon(_opt.unwrap());
 		if command_name.starts_with('_') {
