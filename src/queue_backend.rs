@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::os::unix::io::AsRawFd;
 use nix::c_void;
 use nix::sys::mman;
-use std::sync::RwLock;
+use spin::RwLock;
 use std::rc::Rc;
 use std::slice;
 use std::mem::{self, size_of};
@@ -213,6 +213,10 @@ impl QueueFile {
     }
 
     fn checkpoint(&mut self) {
+        if self.checkpoint_closed {
+            return
+        }
+
         // FIXME: reset and log stats
         let state = QueueFileState {
             offset: self.offset,
@@ -281,7 +285,7 @@ impl QueueBackend {
                 })
             });
 
-            let mut locked_files = self.files.write().unwrap();
+            let mut locked_files = self.files.write();
             for file_num in file_nums {
                 info!("[{}] recovering file: {}", self.config.name, file_num);
                 let queue_file = Box::new(QueueFile::open(&self.config, file_num));
@@ -298,7 +302,7 @@ impl QueueBackend {
     /// also, this doen't do any ref count, so one must make sure the mmap is alive while there
     /// are messages pointing to this QueueFile
     fn get_queue_file(&self, index: usize) -> Option<&QueueFile> {
-        let files = self.files.read().unwrap();
+        let files = self.files.read();
         match files.get(&index) {
             Some(file_box_ref) => unsafe {
                 Some(mem::transmute(&(**file_box_ref)))
@@ -312,7 +316,7 @@ impl QueueBackend {
     }
 
     pub fn files_count(&self) -> usize {
-        self.files.read().unwrap().len()
+        self.files.read().len()
     }
 
     /// Put a message at the end of the Queue, return the message id if succesfull
@@ -338,7 +342,7 @@ impl QueueBackend {
             let mut queue_file = Box::new(QueueFile::create(
                 &self.config, head_file));
             let q_file_ptr = (&mut *queue_file) as *mut QueueFile;
-            assert!(self.files.write().unwrap().insert(head_file, queue_file).is_none());
+            assert!(self.files.write().insert(head_file, queue_file).is_none());
             unsafe { mem::transmute(q_file_ptr) }
         };
 
@@ -375,18 +379,22 @@ impl QueueBackend {
 
     pub fn purge(&mut self) {
         // FIXME: terribly broken as msgs may still be pointing to the QueueFiles
-        self.files.write().unwrap().clear();
+        self.files.write().clear();
         fs::remove_dir_all(&self.config.data_directory).unwrap();
         fs::create_dir_all(&self.config.data_directory).unwrap();
         self.tail = 0;
         self.head = 0;
     }
 
-    fn checkpoint(&mut self) {
-        // this blocks the queue in the current form, so it's better not to be pub
-        for (file_num, file) in self.files.write().unwrap().iter_mut() {
+    pub fn checkpoint(&mut self) {
+        // FIXME: this blocks the queue in the current form
+        for (file_num, file) in self.files.write().iter_mut() {
             file.checkpoint();
         }
+    }
+
+    pub fn gc(&mut self, smallest_tail: u64) {
+        // TODO
     }
 }
 

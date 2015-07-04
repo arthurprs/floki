@@ -14,6 +14,7 @@ nix = "0.3.6"
 time = "0.1.25"
 num_cpus = "0.2.6"
 fnv = "1.0.0"
+spin = "*"
 
 [dependencies.linked-hash-map]
 git="https://github.com/arthurprs/linked-hash-map.git"

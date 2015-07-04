@@ -20,6 +20,7 @@ extern crate rustc_serialize;
 extern crate toml;
 extern crate linked_hash_map;
 extern crate fnv;
+extern crate spin;
 
 mod config;
 mod queue;
