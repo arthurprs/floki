@@ -5,6 +5,7 @@ use std::collections::hash_map::Entry;
 use std::collections::hash_state::DefaultState;
 
 use std::mem;
+use std::cmp;
 use std::rc::Rc;
 use linked_hash_map::LinkedHashMap;
 use time::precise_time_s;
@@ -48,14 +49,15 @@ unsafe impl Send for ArcQueue {}
 impl Deref for ArcQueue {
     type Target = Queue;
     fn deref(&self) -> &Self::Target {
-        &*self.0
+        &self.0
     }
 }
 
 impl DerefMut for ArcQueue {
     #[allow(mutable_transmutes)]
     fn deref_mut(&mut self) -> &mut Self::Target {
-        unsafe { mem::transmute(self.deref()) }
+        let queue: &Self::Target = self;
+        unsafe { mem::transmute(queue) }
     }
 }
 
@@ -126,6 +128,8 @@ impl Queue {
             }
 
             // fetch from the backend
+            // TODO: if we have incremental ids,
+            //       we can add to in_flight and unlock the channel before fetching from backend
             if let Some((new_tail, message)) = self.backend.get(locked_channel.tail) {
                 locked_channel.tail = new_tail;
                 let state = InFlightState {
@@ -149,7 +153,6 @@ impl Queue {
 
     /// delete access is suposed to be thread-safe, even while writing
     pub fn delete(&mut self, channel_name: &str, id: u64) -> Option<bool> {
-        let _ = self.backend_rlock.read().unwrap();
         let locked_channels = self.channels.read().unwrap();
         if let Some(channel) = locked_channels.get(channel_name) {
             let removed_opt = channel.lock().unwrap().in_flight.remove(&id);
@@ -169,11 +172,24 @@ impl Queue {
     }
 
     pub fn maintenance(&mut self) {
-        // add gc code here
+        let smallest_tail = {
+            let locked_channels = self.channels.read().unwrap();
+            locked_channels.values().fold(0, |st, ch| {
+                cmp::min(st, ch.lock().unwrap().tail)
+            })
+        };
+
+        let _ = self.backend_rlock.read();
+        self.backend.gc(smallest_tail);
     }
 
-    pub fn tick(&mut self) {
+    fn tick(&mut self) {
         self.clock = precise_time_s() as u32;
+    }
+
+    pub fn tick_to(&mut self, clock: u32) {
+        // FIXME: must ensure self.clock is within a single cache line
+        self.clock = clock;
         debug!("[{}] tick to {}", self.config.name, self.clock);
     }
 }
