@@ -1,22 +1,46 @@
 use std::ops::{Deref, DerefMut};
 use std::sync::{Arc, Mutex, RwLock};
-use std::collections::HashMap;
+use std::collections::{HashMap, BTreeMap};
 use std::collections::hash_map::Entry;
 use std::collections::hash_state::DefaultState;
-
-use std::io;
-use std::fs;
+use std::io::{self, Read, Write};
+use std::fs::{self, File};
 use std::mem;
 use std::cmp;
 use std::rc::Rc;
 use linked_hash_map::LinkedHashMap;
 use time::precise_time_s;
 use fnv::FnvHasher;
+use rustc_serialize::json;
 
 use config::*;
 use queue_backend::*;
 
-#[derive(Debug)]
+#[derive(Eq, PartialEq, Debug, Copy, Clone, RustcDecodable, RustcEncodable)]
+pub enum QueueState {
+    Ready,
+    Deleting
+}
+
+impl Default for QueueState {
+    fn default() -> Self {
+        QueueState::Ready
+    }
+}
+
+#[derive(Debug, Eq, PartialEq, RustcDecodable, RustcEncodable)]
+struct ChannelCheckpoint {
+    tail: u64,
+    in_flight: Vec<u64>
+}
+
+#[derive(Debug, Default, RustcDecodable, RustcEncodable)]
+struct QueueCheckpoint {
+    state: QueueState,
+    channels: BTreeMap<String, ChannelCheckpoint>,
+}
+
+#[derive(Debug, Default)]
 struct InFlightState {
     expiration: u32,
     retry: u32,
@@ -38,7 +62,8 @@ pub struct Queue {
     backend_rlock: RwLock<()>,
     backend: QueueBackend,
     channels: RwLock<HashMap<String, Mutex<Channel>, DefaultState<FnvHasher>>>,
-    clock: u32
+    clock: u32,
+    state: QueueState,
 }
 
 #[derive(Clone)]
@@ -89,9 +114,18 @@ impl Queue {
             backend: QueueBackend::new(rc_config.clone(), recover),
             channels: RwLock::new(Default::default()),
             clock: 0,
+            state: QueueState::Ready,
         };
+        if recover {
+            queue.recover();
+        }
         queue.tick();
         queue
+    }
+
+    pub fn set_state(&mut self, new_state: QueueState) {
+        self.state = new_state;
+        self.checkpoint()
     }
 
     pub fn create_channel<S>(&mut self, channel_name: S) -> bool
@@ -181,6 +215,93 @@ impl Queue {
         self.channels.write().unwrap().clear();
     }
 
+    fn recover(&mut self) {
+        let path = self.config.data_directory.join(QUEUE_CHECKPOINT_FILE);
+        let queue_checkpoint: QueueCheckpoint = match File::open(path) {
+            Ok(mut file) => {
+                let mut contents = String::new();
+                let _ = file.read_to_string(&mut contents);
+                let state_result = json::decode(&contents);
+                match state_result {
+                    Ok(state) => state,
+                    Err(error) => {
+                        error!("[{}] error parsing checkpoint information: {}",
+                            self.config.name, error);
+                        return;
+                    }
+                }
+            }
+            Err(error) => {
+                warn!("[{}] error reading checkpoint information: {}",
+                    self.config.name, error);
+                return;
+            }
+        };
+
+        info!("[{}] checkpoint loaded: {:?}", self.config.name, queue_checkpoint);
+
+        self.state = queue_checkpoint.state;
+
+        let mut locked_channels = self.channels.write().unwrap();
+        for (channel_name, channel_checkpoint) in queue_checkpoint.channels {
+            let mut in_flight: LinkedHashMap<_, _, _> = Default::default();
+            for id in channel_checkpoint.in_flight {
+                in_flight.insert(id, Default::default());
+            }
+
+            locked_channels.insert(
+                channel_name,
+                Mutex::new(Channel {
+                    tail: channel_checkpoint.tail,
+                    in_flight: in_flight,
+                })
+            );
+        }
+    }
+
+    fn checkpoint(&mut self) {
+        let mut checkpoint = QueueCheckpoint {
+            state: self.state,
+            .. Default::default()
+        };
+
+        if self.state == QueueState::Ready {
+            {
+                let _ = self.backend_rlock.read();
+                self.backend.checkpoint();
+            }
+            let locked_channels = self.channels.read().unwrap();
+            for (channel_name, channel) in &*locked_channels {
+                let locked_channel = channel.lock().unwrap();
+                checkpoint.channels.insert(
+                    channel_name.clone(),
+                    ChannelCheckpoint {
+                        tail: locked_channel.tail,
+                        in_flight: locked_channel.in_flight
+                            .keys().map(|&id| id).collect()
+                    }
+                );
+            }
+        }
+
+        let tmp_path = self.config.data_directory.join(TMP_QUEUE_CHECKPOINT_FILE);
+        let result = File::create(&tmp_path)
+            .and_then(|mut file| {
+                write!(file, "{}", json::as_pretty_json(&checkpoint)).unwrap();
+                file.sync_data()
+            }).and_then(|_| {
+                let final_path = tmp_path.with_file_name(QUEUE_CHECKPOINT_FILE);
+                fs::rename(tmp_path, final_path)
+            });
+
+        match result {
+            Ok(_) => info!("[{}] checkpointed: {:?}", self.config.name, checkpoint),
+            Err(error) =>
+                warn!("[{}] error writing checkpoint information: {}",
+                    self.config.name, error)
+        }
+    }
+
     pub fn maintenance(&mut self) {
         let smallest_tail = {
             let locked_channels = self.channels.read().unwrap();
@@ -190,17 +311,28 @@ impl Queue {
         };
 
         let _ = self.backend_rlock.read();
+        self.checkpoint();
         self.backend.gc(smallest_tail);
     }
 
     fn tick(&mut self) {
-        self.clock = precise_time_s() as u32;
+        self.tick_to(precise_time_s() as u32);
     }
 
     pub fn tick_to(&mut self, clock: u32) {
         // FIXME: must ensure self.clock is within a single cache line
         self.clock = clock;
         debug!("[{}] tick to {}", self.config.name, self.clock);
+    }
+}
+
+impl Drop for Queue {
+    fn drop(&mut self) {
+        if self.state == QueueState::Deleting {
+            self.purge()
+        } else {
+            self.checkpoint()
+        }
     }
 }
 
@@ -320,7 +452,19 @@ mod tests {
 
     #[test]
     fn test_queue_recover() {
-        // Add code here
+        let mut q = get_queue_opt("test_queue_recover", false);
+        let message = gen_message(0);
+        assert!(q.create_channel("test") == true);
+        assert!(q.put(&message).is_some());
+        assert!(q.put(&message).is_some());
+        assert!(q.get("test").is_some());
+        q.checkpoint();
+
+        q = get_queue_opt("test_queue_recover", true);
+        assert!(q.create_channel("test") == false);
+        assert!(q.get("test").is_some());
+        assert!(q.get("test").is_some());
+        assert!(q.get("test").is_none());
     }
 
     #[test]

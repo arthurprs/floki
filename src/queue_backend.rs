@@ -27,8 +27,8 @@ struct MessageHeader {
     len: u32,
 }
 
-#[derive(Debug, Eq, PartialEq, RustcDecodable, RustcEncodable)]
-struct QueueFileState {
+#[derive(Debug, Default, RustcDecodable, RustcEncodable)]
+struct QueueFileCheckpoint {
     offset: usize,
     closed: bool
 }
@@ -56,10 +56,6 @@ pub struct QueueBackend {
     head: u64,
     tail: u64
 }
-
-const DATA_EXTENSION: &'static str = "data";
-const CHECKPOINT_EXTENSION: &'static str = "checkpoint";
-const TMP_CHECKPOINT_EXTENSION: &'static str = "checkpoint.tmp";
 
 impl QueueFile {
     fn gen_base_file_path(config: &QueueConfig, file_num: usize) -> PathBuf {
@@ -181,9 +177,10 @@ impl QueueFile {
         mman::msync(self.file_mmap as *mut c_void, self.file_size as u64, flags).unwrap();
     }
 
+    // TODO: move some of recover and checkpoint code back into the backend
     fn recover(&mut self) {
         let path = self.base_path.with_extension(CHECKPOINT_EXTENSION);
-        let state: QueueFileState = match File::open(path) {
+        let checkpoint: QueueFileCheckpoint = match File::open(path) {
             Ok(mut file) => {
                 let mut contents = String::new();
                 let _ = file.read_to_string(&mut contents);
@@ -204,10 +201,10 @@ impl QueueFile {
             }
         };
 
-        info!("[{:?}] checkpoint loaded: {:?}", self.base_path, state);
-        self.offset = state.offset;
-        self.closed = state.closed;
-        self.checkpoint_closed = state.closed;
+        info!("[{:?}] checkpoint loaded: {:?}", self.base_path, checkpoint);
+        self.offset = checkpoint.offset;
+        self.closed = checkpoint.closed;
+        self.checkpoint_closed = checkpoint.closed;
 
         // TODO: read forward checking the message hashes
     }
@@ -218,7 +215,7 @@ impl QueueFile {
         }
 
         // FIXME: reset and log stats
-        let state = QueueFileState {
+        let checkpoint = QueueFileCheckpoint {
             offset: self.offset,
             closed: self.closed,
         };
@@ -227,7 +224,7 @@ impl QueueFile {
         let tmp_path = self.base_path.with_extension(TMP_CHECKPOINT_EXTENSION);
         let result = File::create(&tmp_path)
             .and_then(|mut file| {
-                write!(file, "{}", json::as_pretty_json(&state));
+                write!(file, "{}", json::as_pretty_json(&checkpoint)).unwrap();
                 file.sync_data()
             }).and_then(|_| {
                 let final_path = self.base_path.with_extension(CHECKPOINT_EXTENSION);
@@ -236,10 +233,10 @@ impl QueueFile {
 
         match result {
             Ok(_) => {
-                if state.closed {
+                if checkpoint.closed {
                     self.checkpoint_closed = true;
                 }
-                info!("[{:?}] checkpointed: {:?}", self.base_path, state);
+                info!("[{:?}] checkpointed: {:?}", self.base_path, checkpoint);
             }
             Err(error) => {
                 warn!("[{:?}] error writing checkpoint information: {}",
@@ -417,11 +414,5 @@ impl QueueBackend {
             let queue_file = self.files.write().remove(&file_num).unwrap();
             queue_file.purge();
         }
-    }
-}
-
-impl Drop for QueueBackend {
-    fn drop(&mut self) {
-        self.checkpoint();
     }
 }

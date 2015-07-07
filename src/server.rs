@@ -61,8 +61,14 @@ struct Dispatcher {
 type ResponseResult = Result<ResponseBuffer, Status>;
 
 impl ServerBackend {
+	#[inline]
 	fn get_queue(&self, name: &str) -> Option<ArcQueue> {
 		self.queues.get(name).map(|q| q.clone())
+	}
+
+	#[inline]
+	fn remove_queue(&mut self, name: &str) -> Option<ArcQueue> {
+		self.queues.remove(name)
 	}
 
 	fn get_or_create_queue(&mut self, name: &str) -> ArcQueue {
@@ -140,8 +146,13 @@ impl Dispatcher {
 		let (command_name, id_str_opt) = Self::split_colon(_opt.unwrap());
 		if command_name.starts_with('_') {
 			match command_name {
-				"_purge" => queue.purge(),
-				"_delete" => queue.purge(),
+				"_purge" => {
+					queue.purge();
+				},
+				"_delete" => {
+					queue.set_state(QueueState::Deleting);
+					self.state.write().unwrap().remove_queue(queue_name); 
+				},
 				_ => return Err(Status::InvalidArguments)
 			}
 		} else if let Some(id_str) = id_str_opt {
