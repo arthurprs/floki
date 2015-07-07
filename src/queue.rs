@@ -4,6 +4,8 @@ use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::collections::hash_state::DefaultState;
 
+use std::io;
+use std::fs;
 use std::mem;
 use std::cmp;
 use std::rc::Rc;
@@ -23,7 +25,6 @@ struct InFlightState {
 #[derive(Debug)]
 pub struct Channel {
     tail: u64,
-    message_count: u64,
     in_flight: LinkedHashMap<u64, InFlightState, DefaultState<FnvHasher>>
 }
 
@@ -70,6 +71,16 @@ impl ArcQueue {
 impl Queue {
 
     pub fn new(config: QueueConfig, recover: bool) -> Queue {
+        if ! recover {
+            let _ = fs::remove_dir_all(&config.data_directory);
+        }
+        match fs::create_dir_all(&config.data_directory) {
+            Err(ref err) if err.kind() != io::ErrorKind::AlreadyExists => {
+                panic!("failed to open queue directory: {}", err);
+            }
+            _ => ()
+        }
+
         let rc_config = Rc::new(config);
         let mut queue = Queue {
             config: rc_config.clone(),
@@ -92,7 +103,6 @@ impl Queue {
                 Mutex::new(
                     Channel {
                         tail: 0,
-                        message_count: 0,
                         in_flight: Default::default()
                     }
                 )
@@ -289,20 +299,19 @@ mod tests {
 
     #[test]
     fn test_backend_recover() {
-        init_logger();
-        let mut q = get_queue_opt("test_reopen", false);
+        let mut q = get_queue_opt("test_backend_recover", false);
         let message = gen_message(0);
         let mut put_msg_count = 0;
         while q.backend.files_count() < 3 {
             assert!(q.put(&message).is_some());
             put_msg_count += 1;
         }
-        drop(q);
+        q.backend.checkpoint();
 
-        let mut q = get_queue_opt("test_reopen", true);
-        assert!(q.create_channel("test") == true);
+        q = get_queue_opt("test_backend_recover", true);
         assert_eq!(q.backend.files_count(), 3);
         let mut get_msg_count = 0;
+        assert!(q.create_channel("test") == true);
         while let Some(_) = q.get("test") {
             get_msg_count += 1;
         }
@@ -312,6 +321,22 @@ mod tests {
     #[test]
     fn test_queue_recover() {
         // Add code here
+    }
+
+    #[test]
+    fn test_gc() {
+        let message = gen_message(0);
+        let mut q = get_queue_opt("test_reopen", false);
+        assert!(q.create_channel("test") == true);
+
+        while q.backend.files_count() < 3 {
+            assert!(q.put(&message).is_some());
+            assert!(q.get("test").is_some());
+        }
+        q.maintenance();
+
+        // gc should get rid of the first two files
+        assert_eq!(q.backend.files_count(), 1);
     }
 
     #[bench]

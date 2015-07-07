@@ -7,6 +7,7 @@
 #![feature(path_ext)]
 #![feature(hashmap_hasher)]
 #![feature(vecmap)]
+#![feature(drain)]
 
 #[cfg(test)] extern crate test;
 extern crate env_logger;

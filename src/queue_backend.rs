@@ -1,11 +1,11 @@
 use std::ptr;
 use std::io::prelude::*;
 use std::fs::{self, File, OpenOptions};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::os::unix::io::AsRawFd;
 use nix::c_void;
 use nix::sys::mman;
-use spin::RwLock;
+use spin::RwLock as SpinRwLock;
 use std::rc::Rc;
 use std::slice;
 use std::mem::{self, size_of};
@@ -43,7 +43,7 @@ pub struct QueueFile {
     file_num: usize,
     // dirty_bytes: usize,
     // dirty_messages: usize,
-    start_id: u64,
+    tail: u64,
     offset: usize,
     closed: bool,
     checkpoint_closed: bool
@@ -52,7 +52,7 @@ pub struct QueueFile {
 #[derive(Debug)]
 pub struct QueueBackend {
     config: Rc<QueueConfig>,
-    files: RwLock<VecMap<Box<QueueFile>>>,
+    files: SpinRwLock<VecMap<Box<QueueFile>>>,
     head: u64,
     tail: u64
 }
@@ -62,12 +62,12 @@ const CHECKPOINT_EXTENSION: &'static str = "checkpoint";
 const TMP_CHECKPOINT_EXTENSION: &'static str = "checkpoint.tmp";
 
 impl QueueFile {
-    fn base_file_path(config: &QueueConfig, file_num: usize) -> PathBuf {
+    fn gen_base_file_path(config: &QueueConfig, file_num: usize) -> PathBuf {
         config.data_directory.join(format!("{:08}", file_num))
     }
 
     fn create(config: &QueueConfig, file_num: usize) -> QueueFile {
-        let base_path = Self::base_file_path(config, file_num);
+        let base_path = Self::gen_base_file_path(config, file_num);
         let data_path = base_path.with_extension(DATA_EXTENSION);
         debug!("[{}] creating data file {:?}", config.name, data_path);
         let file = OpenOptions::new()
@@ -81,7 +81,7 @@ impl QueueFile {
     }
 
     fn open(config: &QueueConfig, file_num: usize) -> QueueFile {
-        let base_path = Self::base_file_path(config, file_num);
+        let base_path = Self::gen_base_file_path(config, file_num);
         let data_path = base_path.with_extension(DATA_EXTENSION);
         debug!("[{}] opening data file {:?}", config.name, data_path);
         let file = OpenOptions::new()
@@ -108,7 +108,7 @@ impl QueueFile {
             file_size: file_size as usize,
             file_mmap: file_mmap,
             file_num: file_num,
-            start_id: file_num as u64 * config.segment_size,
+            tail: file_num as u64 * config.segment_size,
             // dirty_messages: 0,
             // dirty_bytes: 0,
             offset: 0,
@@ -118,23 +118,23 @@ impl QueueFile {
     }
     
     fn get(&self, id: u64) -> Result<(u64, Message), bool> {
-        if id >= self.start_id + self.offset as u64 {
+        if id >= self.tail + self.offset as u64 {
             return Err(self.closed)
         }
 
         let header: &MessageHeader = unsafe {
-            mem::transmute(self.file_mmap.offset((id - self.start_id) as isize))
+            mem::transmute(self.file_mmap.offset((id - self.tail) as isize))
         };
 
         // check id and possible overflow
         assert_eq!(header.id, id);
-        assert!(id - self.start_id + size_of::<MessageHeader>() as u64 + header.len as u64 <= self.offset as u64);
+        assert!(id - self.tail + size_of::<MessageHeader>() as u64 + header.len as u64 <= self.offset as u64);
 
         let message_total_len = (size_of::<MessageHeader>() + header.len as usize) as u64;
         
         let body = unsafe {
             slice::from_raw_parts(
-                self.file_mmap.offset((id - self.start_id + size_of::<MessageHeader>() as u64) as isize),
+                self.file_mmap.offset((id - self.tail + size_of::<MessageHeader>() as u64) as isize),
                 header.len as usize)
         };
 
@@ -154,7 +154,7 @@ impl QueueFile {
         }
 
         let header = MessageHeader {
-            id: self.start_id + self.offset as u64,
+            id: self.tail + self.offset as u64,
             len: message.body.len() as u32
         };
 
@@ -247,6 +247,17 @@ impl QueueFile {
             }
         }
     }
+
+    fn purge(self) {
+        let mut base_path = self.base_path.clone();
+        drop(self);
+        base_path.set_extension(CHECKPOINT_EXTENSION);
+        let _ = fs::remove_file(&base_path);
+        base_path.set_extension(TMP_CHECKPOINT_EXTENSION);
+        let _ = fs::remove_file(&base_path);
+        base_path.set_extension(DATA_EXTENSION);
+        let _ = fs::remove_file(&base_path);
+    }
 }
 
 impl Drop for QueueFile {
@@ -259,14 +270,12 @@ impl QueueBackend {
     pub fn new(config: Rc<QueueConfig>, recover: bool) -> QueueBackend {
         let mut backend = QueueBackend {
             config: config,
-            files: RwLock::new(VecMap::new()),
+            files: SpinRwLock::new(VecMap::new()),
             head: 0,
             tail: 0
         };
         if recover {
             backend.recover();
-        } else {
-            backend.purge();
         }
         backend
     }
@@ -379,22 +388,35 @@ impl QueueBackend {
 
     pub fn purge(&mut self) {
         // FIXME: terribly broken as msgs may still be pointing to the QueueFiles
-        self.files.write().clear();
-        fs::remove_dir_all(&self.config.data_directory).unwrap();
-        fs::create_dir_all(&self.config.data_directory).unwrap();
+        let mut locked_files = self.files.write();
+        for (_, queue_file) in locked_files.drain() {
+            queue_file.purge();
+        }
         self.tail = 0;
         self.head = 0;
     }
 
     pub fn checkpoint(&mut self) {
-        // FIXME: this blocks the queue in the current form
-        for (file_num, file) in self.files.write().iter_mut() {
-            file.checkpoint();
+        let file_nums: Vec<_> = self.files.read().keys().collect();
+        for file_num in file_nums {
+            self.get_queue_file_mut(file_num).unwrap().checkpoint();
         }
     }
 
     pub fn gc(&mut self, smallest_tail: u64) {
-        // TODO
+        let mut file_nums = Vec::new();
+        // collect files_nums until the first still open or with tail >= smallest_tail
+        for (file_num, queue_file) in &*self.files.read() {
+            if ! queue_file.closed || queue_file.tail < smallest_tail {
+                break
+            }
+            file_nums.push(file_num);
+        }
+        // purge them
+        for file_num in file_nums {
+            let queue_file = self.files.write().remove(&file_num).unwrap();
+            queue_file.purge();
+        }
     }
 }
 

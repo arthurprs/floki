@@ -23,16 +23,17 @@ impl ServerConfig {
     pub fn read() -> ServerConfig {
         debug!("reading config");
 
-        let mut s = String::new();
-        File::open("floki.toml").unwrap().read_to_string(&mut s).unwrap();
+        let config = {
+            let mut s = String::new();
+            File::open("floki.toml").unwrap().read_to_string(&mut s).unwrap();
+            TomlParser::new(&s).parse().unwrap()
+        };
+        info!("done reading config: {:?}", config);
 
-        let config = TomlParser::new(&s).parse().unwrap();
         let port = config.get("port").unwrap().as_integer().unwrap() as u16;
         let bind_address = config.get("bind_address").unwrap().as_str().unwrap();
         let data_directory = config.get("data_directory").unwrap().as_str().unwrap();
         let segment_size_mb = config.get("segment_size_mb").unwrap().as_integer().unwrap();
-
-        info!("done reading config: {:?}", config);
 
         ServerConfig {
             data_directory: data_directory.into(),
@@ -45,8 +46,8 @@ impl ServerConfig {
     pub fn read_queue_configs(self: &ServerConfig) -> Vec<QueueConfig> {
         let read_dir = match fs::read_dir(&self.data_directory) {
             Ok(read_dir) => read_dir,
-            _ =>  {
-                info!("Can't read server data_directory {:?}", self.data_directory);
+            Err(error) => {
+                warn!("Can't read server data_directory {}", error);
                 return Vec::new()
             }
         };
@@ -68,9 +69,6 @@ impl ServerConfig {
 impl QueueConfig {
     fn new(server_config: &ServerConfig, name: String) -> QueueConfig {
         let data_directory = server_config.data_directory.join(&name);
-        if ! Path::new(&data_directory).is_dir() {
-            fs::create_dir_all(&data_directory).unwrap();
-        }
         QueueConfig {
             name: name,
             data_directory: data_directory,
