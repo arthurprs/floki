@@ -9,7 +9,7 @@ use spin::RwLock as SpinRwLock;
 use std::rc::Rc;
 use std::slice;
 use std::mem::{self, size_of};
-use std::collections::VecMap;
+use vec_map::VecMap;
 use rustc_serialize::json;
 
 use config::*;

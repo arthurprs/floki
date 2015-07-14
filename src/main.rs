@@ -6,8 +6,6 @@
 #![feature(tcp)]
 #![feature(path_ext)]
 #![feature(hashmap_hasher)]
-#![feature(vecmap)]
-#![feature(drain)]
 
 #[cfg(test)] extern crate test;
 extern crate env_logger;
@@ -20,6 +18,7 @@ extern crate time;
 extern crate rustc_serialize;
 extern crate toml;
 extern crate linked_hash_map;
+extern crate vec_map;
 extern crate fnv;
 extern crate spin;
 

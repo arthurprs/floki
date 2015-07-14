@@ -18,3 +18,7 @@ spin = "*"
 
 [dependencies.linked-hash-map]
 git="https://github.com/arthurprs/linked-hash-map.git"
+
+[dependencies.vec_map]
+version="*"
+features=["nightly"]
