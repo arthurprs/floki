@@ -29,7 +29,7 @@ struct MessageHeader {
 
 #[derive(Debug, Default, RustcDecodable, RustcEncodable)]
 struct QueueFileCheckpoint {
-    offset: usize,
+    head: u64,
     closed: bool
 }
 
@@ -38,13 +38,13 @@ pub struct QueueFile {
     base_path: PathBuf,
     // TODO: move mmaped file abstraction
     file: File,
-    file_size: usize,
+    file_size: u64,
     file_mmap: *mut u8,
     file_num: usize,
     // dirty_bytes: usize,
     // dirty_messages: usize,
     tail: u64,
-    offset: usize,
+    head: u64,
     closed: bool,
     checkpoint_closed: bool
 }
@@ -101,20 +101,20 @@ impl QueueFile {
         QueueFile {
             base_path: base_path,
             file: file,
-            file_size: file_size as usize,
+            file_size: file_size as u64,
             file_mmap: file_mmap,
             file_num: file_num,
             tail: file_num as u64 * config.segment_size,
+            head: file_num as u64 * config.segment_size,
             // dirty_messages: 0,
             // dirty_bytes: 0,
-            offset: 0,
             closed: false,
             checkpoint_closed: false,
         }
     }
     
     fn get(&self, id: u64) -> Result<(u64, Message), bool> {
-        if id >= self.tail + self.offset as u64 {
+        if id >= self.head {
             return Err(self.closed)
         }
 
@@ -124,7 +124,7 @@ impl QueueFile {
 
         // check id and possible overflow
         assert_eq!(header.id, id);
-        assert!(id - self.tail + size_of::<MessageHeader>() as u64 + header.len as u64 <= self.offset as u64);
+        assert!(header.id + size_of::<MessageHeader>() as u64 + header.len as u64 <= self.head);
 
         let message_total_len = (size_of::<MessageHeader>() + header.len as usize) as u64;
         
@@ -144,28 +144,30 @@ impl QueueFile {
 
     fn append(&mut self, message: &Message) -> Option<u64> {
         let message_total_len = size_of::<MessageHeader>() + message.body.len();
-        if self.offset + message_total_len > self.file_size {
+        let file_offset = self.head - self.tail;
+
+        if file_offset + message_total_len as u64 > self.file_size {
             self.closed = true;
             return None
         }
 
         let header = MessageHeader {
-            id: self.tail + self.offset as u64,
+            id: self.head,
             len: message.body.len() as u32
         };
 
         unsafe {
             ptr::copy_nonoverlapping(
                 mem::transmute(&header),
-                self.file_mmap.offset(self.offset as isize),
+                self.file_mmap.offset(file_offset as isize),
                 size_of::<MessageHeader>());
             ptr::copy_nonoverlapping(
                 message.body.as_ptr(),
-                self.file_mmap.offset(self.offset as isize + size_of::<MessageHeader>() as isize),
+                self.file_mmap.offset(file_offset as isize + size_of::<MessageHeader>() as isize),
                 message.body.len());
         }
 
-        self.offset += message_total_len;
+        self.head += message_total_len as u64;
         // self.dirty_bytes += message_total_len;
         // self.dirty_messages += 1;
 
@@ -202,7 +204,7 @@ impl QueueFile {
         };
 
         info!("[{:?}] checkpoint loaded: {:?}", self.base_path, checkpoint);
-        self.offset = checkpoint.offset;
+        self.head = checkpoint.head;
         self.closed = checkpoint.closed;
         self.checkpoint_closed = checkpoint.closed;
 
@@ -216,7 +218,7 @@ impl QueueFile {
 
         // FIXME: reset and log stats
         let checkpoint = QueueFileCheckpoint {
-            offset: self.offset,
+            head: self.head,
             closed: self.closed,
         };
         self.sync(true);
@@ -278,6 +280,7 @@ impl QueueBackend {
     }
 
     fn recover(&mut self) {
+        let mut locked_files = self.files.write();
         let result = fs::read_dir(&self.config.data_directory).map(|dir| {
             let file_nums = dir.filter_map(|entry_opt| {
                 entry_opt.ok().and_then(|entry| {
@@ -291,13 +294,20 @@ impl QueueBackend {
                 })
             });
 
-            let mut locked_files = self.files.write();
             for file_num in file_nums {
                 info!("[{}] recovering file: {}", self.config.name, file_num);
                 let queue_file = Box::new(QueueFile::open(&self.config, file_num));
                 locked_files.insert(file_num, queue_file);
             }
         });
+
+        if let Some(first_file) = locked_files.values().next() {
+            self.tail = first_file.tail
+        }
+
+        if let Some(last_file) = locked_files.values().last() {
+            self.head = last_file.head;
+        }
 
         if let Err(error) = result {
             warn!("[{}] error while recovering: {}", self.config.name, error);
