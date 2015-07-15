@@ -5,9 +5,9 @@ use toml::Parser as TomlParser;
 
 pub const TMP_QUEUE_CHECKPOINT_FILE: &'static str = "queue.checkpoint.tmp";
 pub const QUEUE_CHECKPOINT_FILE: &'static str = "queue.checkpoint";
+pub const TMP_BACKEND_CHECKPOINT_FILE: &'static str = "backend.checkpoint.tmp";
+pub const BACKEND_CHECKPOINT_FILE: &'static str = "backend.checkpoint";
 pub const DATA_EXTENSION: &'static str = "data";
-pub const CHECKPOINT_EXTENSION: &'static str = "checkpoint";
-pub const TMP_CHECKPOINT_EXTENSION: &'static str = "checkpoint.tmp";
 
 #[derive(Debug)]
 pub struct ServerConfig {

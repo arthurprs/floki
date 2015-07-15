@@ -221,8 +221,8 @@ impl Queue {
             Ok(mut file) => {
                 let mut contents = String::new();
                 let _ = file.read_to_string(&mut contents);
-                let state_result = json::decode(&contents);
-                match state_result {
+                let checkpoint_result = json::decode(&contents);
+                match checkpoint_result {
                     Ok(state) => state,
                     Err(error) => {
                         error!("[{}] error parsing checkpoint information: {}",
