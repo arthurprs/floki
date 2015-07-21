@@ -35,25 +35,25 @@ use server::*;
 
 
 // fn configure_log() {
-// 	let logger_config = fern::DispatchConfig {
-// 	    format: Box::new(|msg: &str, level: &log::LogLevel, location: &log::LogLocation| {
-// 	        format!("[{}]{}:{}: {}",
-// 	        	time::now().strftime("%H:%M:%S.%f").unwrap(),
-// 	        	level,
-// 	        	location.module_path(),
-// 	        	msg)
-// 	    }),
-// 	    output: vec![fern::OutputConfig::stderr()],
-// 	    level: log::LogLevelFilter::Trace,
-// 	};
+//  let logger_config = fern::DispatchConfig {
+//      format: Box::new(|msg: &str, level: &log::LogLevel, location: &log::LogLocation| {
+//          format!("[{}]{}:{}: {}",
+//              time::now().strftime("%H:%M:%S.%f").unwrap(),
+//              level,
+//              location.module_path(),
+//              msg)
+//      }),
+//      output: vec![fern::OutputConfig::stderr()],
+//      level: log::LogLevelFilter::Trace,
+//  };
 
-// 	fern::init_global_logger(logger_config, log::LogLevelFilter::Debug).unwrap();
+//  fern::init_global_logger(logger_config, log::LogLevelFilter::Debug).unwrap();
 // }
 
 #[cfg(not(test))]
 fn main() {
-	env_logger::init().unwrap();
-	// configure_log();
+    env_logger::init().unwrap();
+    // configure_log();
     info!("starting up");
     let server_config = ServerConfig::read();
     // let mut queue_configs = server_config.read_queue_configs();

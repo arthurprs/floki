@@ -1,9 +1,14 @@
+use std::ops::{Deref, DerefMut};
 use std::str::{self, FromStr};
 use std::net::{SocketAddr, lookup_host, SocketAddrV4};
 use std::io::{Read, Write};
 use std::mem;
 use std::sync::{Arc, RwLock};
-use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use spin::Mutex as SpinLock;
+use std::collections::{HashMap, HashSet};
+use std::collections::hash_state::DefaultState;
+use fnv::FnvHasher;
 use mio::tcp::{TcpStream, TcpListener};
 use mio::util::{Slab};
 use mio::{Buf, MutBuf, Token, EventLoop, Interest, PollOpt, ReadHint, Timeout, Handler, Sender};
@@ -17,7 +22,10 @@ use config::*;
 use protocol::*;
 
 const SERVER: Token = Token(0);
-const FIRST_CLIENT: Token = Token(1);
+const INVALID_CLIENT: Token = Token(1);
+const FIRST_CLIENT: Token = Token(2);
+
+const BUSY_WAIT: Token = Token(1000000);
 
 #[derive(Debug)]
 pub enum NotifyMessage {
@@ -26,23 +34,27 @@ pub enum NotifyMessage {
 }
 
 struct Connection {
-   	stream: TcpStream,
-   	token: Token,
-   	request_buffer: RequestBuffer,
-   	response_buffer: Option<ResponseBuffer>,
-   	interest: Interest
+    stream: TcpStream,
+    token: Token,
+    request_buffer: RequestBuffer,
+    response_buffer: Option<ResponseBuffer>,
+    interest: Interest
+}
+
+struct ServerQueue {
+    queue: Queue,
+    waiting_flag: AtomicUsize,
+    wait_list: SpinLock<HashSet<Token, DefaultState<FnvHasher>>>
 }
 
 struct ServerBackend {
     config: ServerConfig,
-    queues: HashMap<String, ArcQueue>,
-    // waiting_queue: HashMap<String, Vec<Token>>,
-    // waiting_token: HashMap<Token, Vec<String>>,
+    queues: HashMap<String, Arc<ServerQueue>, DefaultState<FnvHasher>>,
 }
 
 pub struct Server {
-	listener: TcpListener,
-	state: Arc<RwLock<ServerBackend>>,
+    listener: TcpListener,
+    state: Arc<RwLock<ServerBackend>>,
     thread_pool: ThreadPool
 }
 
@@ -52,278 +64,287 @@ pub struct ServerHandler {
 }
 
 struct Dispatcher {
-	token: Token,
-	request: RequestBuffer,
-	state: Arc<RwLock<ServerBackend>>,
-	sender: Sender<(Token, NotifyMessage)>
+    token: Token,
+    request: RequestBuffer,
+    state: Arc<RwLock<ServerBackend>>,
+    sender: Sender<(Token, NotifyMessage)>
 }
 
 type ResponseResult = Result<ResponseBuffer, Status>;
 
 impl ServerBackend {
-	#[inline]
-	fn get_queue(&self, name: &str) -> Option<ArcQueue> {
-		self.queues.get(name).map(|q| q.clone())
-	}
+    #[inline]
+    fn get_queue(&self, name: &str) -> Option<Arc<ServerQueue>> {
+        self.queues.get(name).map(|q| q.clone())
+    }
 
-	#[inline]
-	fn remove_queue(&mut self, name: &str) -> Option<ArcQueue> {
-		self.queues.remove(name)
-	}
+    #[inline]
+    fn remove_queue(&mut self, name: &str) {
+        self.queues.remove(name);
+        // TODO: connections on wait_list should return errors
+    }
 
-	fn get_or_create_queue(&mut self, name: &str) -> ArcQueue {
-		if let Some(queue) = self.queues.get(name) {
-			return queue.clone()
-		}
-		info!("Creating queue {:?}", name);
-		let queue = ArcQueue::new(Queue::new(self.config.new_queue_config(name), true));
-		trace!("done creating queue {:?}", name);
-		self.queues.insert(name.into(), queue.clone());
-		queue
-	}
-	
+    fn get_or_create_queue(&mut self, name: &str) -> Arc<ServerQueue> {
+        if let Some(q) = self.queues.get(name) {
+            return q.clone()
+        }
+        info!("Creating queue {:?}", name);
+        let inner_queue = Queue::new(self.config.new_queue_config(name), true);
+        trace!("done creating queue {:?}", name);
+
+        let queue = Arc::new(ServerQueue {
+            queue: inner_queue,
+            waiting_flag: Default::default(),
+            wait_list: SpinLock::new(Default::default()),
+        });
+
+        self.queues.insert(name.into(), queue.clone());
+        queue
+    }
+    
 }
 
 impl Dispatcher {
-	fn list_queues(&self) -> String {	
-		let locked_state = self.state.read().unwrap();
-		let queue_names: Vec<_> = locked_state.queues.keys().collect();
-	 	json::encode(&queue_names).unwrap()
-	}
+    fn list_queues(&self) -> String {   
+        let locked_state = self.state.read().unwrap();
+        let queue_names: Vec<_> = locked_state.queues.keys().collect();
+        json::encode(&queue_names).unwrap()
+    }
 
-	fn split_colon(composed: &str) -> (&str, Option<&str>) {
-		if let Some(pos) = composed.find(":") {
-			(&composed[..pos], Some(&composed[pos + 1..]))
-		} else {
-			(composed, None)
-		}
-	}
+    fn split_colon(composed: &str) -> (&str, Option<&str>) {
+        if let Some(pos) = composed.find(":") {
+            (&composed[..pos], Some(&composed[pos + 1..]))
+        } else {
+            (composed, None)
+        }
+    }
 
-	fn get(&self, opcode: OpCode, key_str_slice: &str) -> ResponseResult {
-		let (queue_name, channel_name_opt) = Self::split_colon(key_str_slice);
-		let channel_name = channel_name_opt.unwrap();
-		let queue_opt = self.state.read().unwrap().get_queue(queue_name);
-		if let Some(mut queue) = queue_opt {
-			if let Some(message) = queue.get(channel_name) {
-				Ok(ResponseBuffer::new_get_response(&self.request, message.id, message.body))
-			} else {
-				debug!("queue {:?} channel {:?} has no messages", queue_name, channel_name);
-				Err(Status::KeyNotFound)
-			}
-		} else {
-			debug!("queue {:?} not found", queue_name);
-			Err(Status::InvalidArguments)
-		}
-	}
+    fn get(&self, opcode: OpCode, key_str_slice: &str) -> ResponseResult {
+        let (queue_name, channel_name_opt) = Self::split_colon(key_str_slice);
+        let channel_name = channel_name_opt.unwrap();
+        let sq_opt = self.state.read().unwrap().get_queue(queue_name);
+        if let Some(sq) = sq_opt {
+            if let Some(message) = sq.queue.as_mut().get(channel_name) {
+                Ok(ResponseBuffer::new_get_response(&self.request, message.id, message.body))
+            } else {
+                debug!("queue {:?} channel {:?} has no messages", queue_name, channel_name);
+                Err(Status::KeyNotFound)
+            }
+        } else {
+            debug!("queue {:?} not found", queue_name);
+            Err(Status::InvalidArguments)
+        }
+    }
 
-	fn put(&self, opcode: OpCode, key_str_slice: &str, value_slice: &[u8]) -> ResponseResult {
-		let (queue_name, channel_name_opt) = Self::split_colon(key_str_slice);
-		let queue_opt = self.state.read().unwrap().get_queue(queue_name);
-		let mut queue = queue_opt.unwrap_or_else(|| {
-			self.state.write().unwrap().get_or_create_queue(queue_name)
-		});
+    fn put(&self, opcode: OpCode, key_str_slice: &str, value_slice: &[u8]) -> ResponseResult {
+        let (queue_name, channel_name_opt) = Self::split_colon(key_str_slice);
+        let sq_opt = self.state.read().unwrap().get_queue(queue_name);
+        let sq = sq_opt.unwrap_or_else(|| {
+            self.state.write().unwrap().get_or_create_queue(queue_name)
+        });
 
-		if let Some(channel_name) = channel_name_opt {
-			info!("creating queue {:?} channel {:?}", queue_name, channel_name);
-			queue.create_channel(channel_name);
-		} else {
-			debug!("inserting into {:?} {:?}", key_str_slice, value_slice);
-			let id = queue.put(&Message{id:0, body: value_slice}).unwrap();
-			trace!("inserted message into {:?} with id {:?}", key_str_slice, id);
-		}
-		Ok(ResponseBuffer::new_set_response())
-	}
+        if let Some(channel_name) = channel_name_opt {
+            info!("creating queue {:?} channel {:?}", queue_name, channel_name);
+            sq.queue.as_mut().create_channel(channel_name);
+        } else {
+            debug!("inserting into {:?} {:?}", key_str_slice, value_slice);
+            let id = sq.queue.as_mut().put(&Message{id:0, body: value_slice}).unwrap();
+            trace!("inserted message into {:?} with id {:?}", key_str_slice, id);
+        }
+        Ok(ResponseBuffer::new_set_response())
+    }
 
-	fn delete(&self, opcode: OpCode, key_str_slice: &str) -> ResponseResult {
-		let (queue_name, _opt) = Self::split_colon(key_str_slice);
-		let queue_opt = self.state.read().unwrap().get_queue(queue_name);
-		let mut queue = if let Some(queue) = queue_opt {
-			queue
-		} else {
-			return Err(Status::KeyNotFound)
-		};
+    fn delete(&self, opcode: OpCode, key_str_slice: &str) -> ResponseResult {
+        let (queue_name, _opt) = Self::split_colon(key_str_slice);
+        let sq_opt = self.state.read().unwrap().get_queue(queue_name);
+        let sq = if let Some(queue) = sq_opt {
+            queue
+        } else {
+            return Err(Status::KeyNotFound)
+        };
 
-		let (command_name, id_str_opt) = Self::split_colon(_opt.unwrap());
-		if command_name.starts_with('_') {
-			match command_name {
-				"_purge" => {
-					queue.purge();
-				},
-				"_delete" => {
-					queue.set_state(QueueState::Deleting);
-					self.state.write().unwrap().remove_queue(queue_name); 
-				},
-				_ => return Err(Status::InvalidArguments)
-			}
-		} else if let Some(id_str) = id_str_opt {
-			let channel_name = command_name;
-			let id = if let Ok(id) = id_str_opt.unwrap().parse() {
-				id
-			} else {
-				return Err(Status::InvalidArguments)
-			};
-			debug!("deleting message {:?} from {:?}", id, command_name);
-			if queue.delete(channel_name, id).is_none() {
-				return Err(Status::KeyNotFound)
-			}
-		} else {
-			debug!("deleting channel {:?}", command_name);
-			if ! queue.delete_channel(command_name) {
-				return Err(Status::KeyNotFound)
-			}
-		}
-		Ok(ResponseBuffer::new(opcode, Status::NoError))
-	}
+        let (command_name, id_str_opt) = Self::split_colon(_opt.unwrap());
+        if command_name.starts_with('_') {
+            match command_name {
+                "_purge" => {
+                    sq.queue.as_mut().purge();
+                },
+                "_delete" => {
+                    sq.queue.as_mut().set_state(QueueState::Deleting);
+                    self.state.write().unwrap().remove_queue(queue_name); 
+                },
+                _ => return Err(Status::InvalidArguments)
+            }
+        } else if let Some(id_str) = id_str_opt {
+            let channel_name = command_name;
+            let id = if let Ok(id) = id_str_opt.unwrap().parse() {
+                id
+            } else {
+                return Err(Status::InvalidArguments)
+            };
+            debug!("deleting message {:?} from {:?}", id, command_name);
+            if sq.queue.as_mut().delete(channel_name, id).is_none() {
+                return Err(Status::KeyNotFound)
+            }
+        } else {
+            debug!("deleting channel {:?}", command_name);
+            if ! sq.queue.as_mut().delete_channel(command_name) {
+                return Err(Status::KeyNotFound)
+            }
+        }
+        Ok(ResponseBuffer::new(opcode, Status::NoError))
+    }
 
-	fn dispatch(self) {
-		let opcode = self.request.opcode();
+    fn dispatch(self) {
+        let opcode = self.request.opcode();
 
-		let key_str_slice = str::from_utf8(self.request.key_slice()).unwrap();
-		let value_slice = self.request.value_slice();
+        let key_str_slice = str::from_utf8(self.request.key_slice()).unwrap();
+        let value_slice = self.request.value_slice();
 
-		debug!("dispatch {:?} {:?} {:?} {:?}", self.token, opcode, key_str_slice, value_slice);
+        debug!("dispatch {:?} {:?} {:?} {:?}", self.token, opcode, key_str_slice, value_slice);
 
-		let response_result = match opcode {
-			OpCode::Get | OpCode::GetK | OpCode::GetQ | OpCode::GetKQ
-			if value_slice.is_empty() && !key_str_slice.is_empty() => {
-				self.get(opcode, key_str_slice)
-			}
-			OpCode::Set if !key_str_slice.is_empty() => {
-				self.put(opcode, key_str_slice, value_slice)
-			}
-			OpCode::Delete if !key_str_slice.is_empty() && value_slice.is_empty() => {
-				self.delete(opcode, key_str_slice)
-			}
-			OpCode::NoOp if key_str_slice.is_empty() && value_slice.is_empty() => {
-				Ok(ResponseBuffer::new(opcode, Status::NoError))
-			}
-			_ => Err(Status::InvalidArguments)
-		};
+        let response_result = match opcode {
+            OpCode::Get | OpCode::GetK | OpCode::GetQ | OpCode::GetKQ
+            if value_slice.is_empty() && !key_str_slice.is_empty() => {
+                self.get(opcode, key_str_slice)
+            }
+            OpCode::Set if !key_str_slice.is_empty() => {
+                let r = self.put(opcode, key_str_slice, value_slice);
+                r
+            }
+            OpCode::Delete if !key_str_slice.is_empty() && value_slice.is_empty() => {
+                self.delete(opcode, key_str_slice)
+            }
+            OpCode::NoOp if key_str_slice.is_empty() && value_slice.is_empty() => {
+                Ok(ResponseBuffer::new(opcode, Status::NoError))
+            }
+            _ => Err(Status::InvalidArguments)
+        };
 
-		let response = match response_result {
-			Ok(response) => response,
-			Err(status) => ResponseBuffer::new(opcode, status)
-		};
-		let composed_msg = (self.token, NotifyMessage::Response(response));
-		self.sender.send(composed_msg).unwrap();
-	}
+        let response = match response_result {
+            Ok(response) => response,
+            Err(status) => ResponseBuffer::new(opcode, status)
+        };
+        let composed_msg = (self.token, NotifyMessage::Response(response));
+        self.sender.send(composed_msg).unwrap();
+    }
 }
 
 impl Connection {
-	fn new(stream: TcpStream) -> Connection {
-		Connection {
-			stream: stream,
-			token: FIRST_CLIENT,
-			request_buffer: RequestBuffer::new(),
-			response_buffer: None,
-			interest: Interest::all() - Interest::writable()
-		}
-	}
+    fn new(stream: TcpStream) -> Connection {
+        Connection {
+            stream: stream,
+            token: INVALID_CLIENT,
+            request_buffer: RequestBuffer::new(),
+            response_buffer: None,
+            interest: Interest::all() - Interest::writable()
+        }
+    }
 
-	fn readable(&mut self, server: &mut Server, event_loop: &mut EventLoop<ServerHandler>, hint: ReadHint) -> bool {
-		if hint.is_hup() || hint.is_error() {
-			debug!("received hint {:?} for token {:?}", hint,  self.token);
-			event_loop.deregister(&self.stream).unwrap();
-			return false
-		}
+    fn readable(&mut self, server: &mut Server, event_loop: &mut EventLoop<ServerHandler>, hint: ReadHint) -> bool {
+        if hint.is_hup() || hint.is_error() {
+            debug!("received hint {:?} for token {:?}", hint,  self.token);
+            event_loop.deregister(&self.stream).unwrap();
+            return false
+        }
 
-		while let Ok(bytes_read) = self.stream.read(self.request_buffer.mut_bytes()) {
-			if bytes_read == 0 {
-				break
-			}
-			self.request_buffer.advance(bytes_read);
-			trace!("filled request_buffer with {} bytes, remaining: {}", bytes_read, self.request_buffer.remaining());
-			
-			if self.request_buffer.is_complete() {
-				self.interest = Interest::none();
-				event_loop.reregister(&self.stream, self.token, self.interest, PollOpt::level()).unwrap();
-				
-				debug!("dispatching request {:?} for token {:?}", self.request_buffer, self.token);
-				let dispatcher = Dispatcher {
-					token: self.token,
-					request: mem::replace(&mut self.request_buffer, RequestBuffer::new()),
-					state: server.state.clone(),
-					sender: event_loop.channel(),
-				};
-				server.thread_pool.execute(move || { dispatcher.dispatch() });
-				break
-			} else {
-				// keep reading
-			}
-		}
+        while let Ok(bytes_read) = self.stream.read(self.request_buffer.mut_bytes()) {
+            if bytes_read == 0 {
+                break
+            }
+            self.request_buffer.advance(bytes_read);
+            trace!("filled request_buffer with {} bytes, remaining: {}", bytes_read, self.request_buffer.remaining());
+            
+            if self.request_buffer.is_complete() {
+                self.interest = Interest::none();
+                event_loop.reregister(&self.stream, self.token, self.interest, PollOpt::level()).unwrap();
+                
+                debug!("dispatching request {:?} for token {:?}", self.request_buffer, self.token);
+                let dispatcher = Dispatcher {
+                    token: self.token,
+                    request: mem::replace(&mut self.request_buffer, RequestBuffer::new()),
+                    state: server.state.clone(),
+                    sender: event_loop.channel(),
+                };
+                server.thread_pool.execute(move || { dispatcher.dispatch() });
+                break
+            } else {
+                // keep reading
+            }
+        }
 
-		true
-	}
+        true
+    }
 
-	fn writable(&mut self, server: &mut Server, event_loop: &mut EventLoop<ServerHandler>) -> bool {
-		let response_buffer = self.response_buffer.as_mut().expect("writable with None response_buffer");
-		while let Ok(bytes_written) = self.stream.write(response_buffer.bytes()) {
-			if bytes_written == 0 {
-				break
-			}
-			response_buffer.advance(bytes_written);
-			trace!("filled response_buffer with {} bytes, remaining: {}", bytes_written, response_buffer.remaining());
+    fn writable(&mut self, server: &mut Server, event_loop: &mut EventLoop<ServerHandler>) -> bool {
+        let response_buffer = self.response_buffer.as_mut().expect("writable with None response_buffer");
+        while let Ok(bytes_written) = self.stream.write(response_buffer.bytes()) {
+            if bytes_written == 0 {
+                break
+            }
+            response_buffer.advance(bytes_written);
+            trace!("filled response_buffer with {} bytes, remaining: {}", bytes_written, response_buffer.remaining());
 
-			if response_buffer.is_complete() {
-				debug!("done sending response {:?} to token {:?}", response_buffer, self.token);
-				self.interest = Interest::all() - Interest::writable();
-				event_loop.reregister(&self.stream, self.token, self.interest, PollOpt::level()).unwrap();
-				if response_buffer.opcode() == OpCode::Exit {
-					return false;
-				}
-				break
-			} else {
-				// keep writing
-			}
-		}
-		true
-	}
+            if response_buffer.is_complete() {
+                debug!("done sending response {:?} to token {:?}", response_buffer, self.token);
+                self.interest = Interest::all() - Interest::writable();
+                event_loop.reregister(&self.stream, self.token, self.interest, PollOpt::level()).unwrap();
+                if response_buffer.opcode() == OpCode::Exit {
+                    return false;
+                }
+                break
+            } else {
+                // keep writing
+            }
+        }
+        true
+    }
 
-	fn notify(&mut self, server: &mut Server, event_loop: &mut EventLoop<ServerHandler>, msg: NotifyMessage) -> bool {
-		match msg {
-			NotifyMessage::Response(response_buffer) => {
-				self.response_buffer = Some(response_buffer);
-				self.interest = Interest::all() - Interest::readable();
-				event_loop.reregister(&self.stream, self.token, self.interest, PollOpt::level()).unwrap();
-			}
-			_ => panic!("can't handle msg {:?}", msg)
-		}
-		true
-	}
+    fn notify(&mut self, server: &mut Server, event_loop: &mut EventLoop<ServerHandler>, msg: NotifyMessage) -> bool {
+        match msg {
+            NotifyMessage::Response(response_buffer) => {
+                self.response_buffer = Some(response_buffer);
+                self.interest = Interest::all() - Interest::readable();
+                event_loop.reregister(&self.stream, self.token, self.interest, PollOpt::level()).unwrap();
+            }
+            _ => panic!("can't handle msg {:?}", msg)
+        }
+        true
+    }
 }
 
 impl Server {
-	pub fn new(config: ServerConfig) -> (ServerHandler, EventLoop<ServerHandler>) {
-		let addr = SocketAddr::from_str("127.0.0.1:9797").unwrap();
+    pub fn new(config: ServerConfig) -> (ServerHandler, EventLoop<ServerHandler>) {
+        let addr = SocketAddr::from_str("127.0.0.1:9797").unwrap();
 
-		debug!("binding tcp socket to {:?}", addr);
-		let listener = TcpListener::bind(&addr).unwrap();
+        debug!("binding tcp socket to {:?}", addr);
+        let listener = TcpListener::bind(&addr).unwrap();
 
-		let num_cpus = get_num_cpus();
-		let num_threads = num_cpus * 3 / 2;
-		debug!("detected {} cpus, using {} threads", num_cpus, num_threads);
+        let num_cpus = get_num_cpus();
+        let num_threads = num_cpus * 3 / 2;
+        debug!("detected {} cpus, using {} threads", num_cpus, num_threads);
 
-		let server = Server {
-			listener: listener,
-			state: Arc::new(RwLock::new(ServerBackend {
-				config: config,
-				queues: HashMap::new(),
-			})),
-			thread_pool: ThreadPool::new(num_threads)
-		};
+        let server = Server {
+            listener: listener,
+            state: Arc::new(RwLock::new(ServerBackend {
+                config: config,
+                queues: Default::default(),
+            })),
+            thread_pool: ThreadPool::new(num_threads)
+        };
 
-		let mut event_loop = EventLoop::new().unwrap();
-		event_loop.register_opt(&server.listener, SERVER, Interest::all() - Interest::writable(), PollOpt::edge()).unwrap();
+        let mut event_loop = EventLoop::new().unwrap();
+        event_loop.register_opt(&server.listener, SERVER, Interest::all() - Interest::writable(), PollOpt::edge()).unwrap();
 
-		let server_handler = ServerHandler {
-			server: server,
-			connections: Slab::new_starting_at(FIRST_CLIENT, 1024)
-		};
+        let server_handler = ServerHandler {
+            server: server,
+            connections: Slab::new_starting_at(FIRST_CLIENT, 1024)
+        };
 
-		(server_handler, event_loop)
-	}
+        (server_handler, event_loop)
+    }
 
-	fn accept(&mut self, connections: &mut Slab<Connection>, event_loop: &mut EventLoop<ServerHandler>) -> bool {
+    fn accept(&mut self, connections: &mut Slab<Connection>, event_loop: &mut EventLoop<ServerHandler>) -> bool {
         let (stream, connection_addr) = self.listener.accept().unwrap();
         debug!("incomming connection from {:?}", connection_addr);
 
@@ -344,76 +365,76 @@ impl Server {
             PollOpt::level()
         ).unwrap();
         true
-	}
+    }
 }
 
 impl Handler for ServerHandler {
-	type Timeout = ();
+    type Timeout = ();
     type Message = (Token, NotifyMessage);
 
-	#[inline]
-	fn readable(&mut self, event_loop: &mut EventLoop<Self>, token: Token, hint: ReadHint) {
-		trace!("readable event for token {:?} hint {:?}", token, hint);
-		let is_ok = match token {
-			SERVER => self.server.accept(&mut self.connections, event_loop),
-			token => if let Some(connection) = self.connections.get_mut(token) {
-				connection.readable(&mut self.server, event_loop, hint)
-			} else {
-				trace!("token {:?} not found", token);
-				false
-			}
-		};
-		if !is_ok {
-			trace!("deregistering token {:?}", token);
-			self.connections.remove(token);
-		}
+    #[inline]
+    fn readable(&mut self, event_loop: &mut EventLoop<Self>, token: Token, hint: ReadHint) {
+        trace!("readable event for token {:?} hint {:?}", token, hint);
+        let is_ok = match token {
+            SERVER => self.server.accept(&mut self.connections, event_loop),
+            token => if let Some(connection) = self.connections.get_mut(token) {
+                connection.readable(&mut self.server, event_loop, hint)
+            } else {
+                trace!("token {:?} not found", token);
+                false
+            }
+        };
+        if !is_ok {
+            trace!("deregistering token {:?}", token);
+            self.connections.remove(token);
+        }
 
-		trace!("done readable event for token {:?}", token);
-	}
+        trace!("done readable event for token {:?}", token);
+    }
 
-	#[inline]
-	fn writable(&mut self, event_loop: &mut EventLoop<Self>, token: Token) {
-		trace!("writable event for token {:?}", token);
-		let is_ok = match token {
-			SERVER => unreachable!(),
-			token => if let Some(connection) = self.connections.get_mut(token) {
-				connection.writable(&mut self.server, event_loop)
-			} else {
-				trace!("token {:?} not found", token);
-				false
-			}
-		};
-		if !is_ok {
-			trace!("deregistering token {:?}", token);
-			self.connections.remove(token);
-		}
-		trace!("done writable event for token {:?}", token);
-	}
+    #[inline]
+    fn writable(&mut self, event_loop: &mut EventLoop<Self>, token: Token) {
+        trace!("writable event for token {:?}", token);
+        let is_ok = match token {
+            SERVER => unreachable!(),
+            token => if let Some(connection) = self.connections.get_mut(token) {
+                connection.writable(&mut self.server, event_loop)
+            } else {
+                trace!("token {:?} not found", token);
+                false
+            }
+        };
+        if !is_ok {
+            trace!("deregistering token {:?}", token);
+            self.connections.remove(token);
+        }
+        trace!("done writable event for token {:?}", token);
+    }
 
-	fn notify(&mut self, event_loop: &mut EventLoop<Self>, composed_msg: Self::Message) {
-		let (token, message) = composed_msg;
-		trace!("notify event for token {:?} with {:?}", token, message);
-		let is_ok = match token {
-			SERVER => unreachable!(),
-			token => if let Some(connection) = self.connections.get_mut(token) {
-				connection.notify(&mut self.server, event_loop, message)
-			} else {
-				trace!("token {:?} not found", token);
-				false
-			}
-		};
-		if !is_ok {
-			trace!("deregistering token {:?}", token);
-			self.connections.remove(token);
-		}
-		trace!("end notify event for token {:?}", token);
-	}
+    fn notify(&mut self, event_loop: &mut EventLoop<Self>, composed_msg: Self::Message) {
+        let (token, message) = composed_msg;
+        trace!("notify event for token {:?} with {:?}", token, message);
+        let is_ok = match token {
+            SERVER => unreachable!(),
+            token => if let Some(connection) = self.connections.get_mut(token) {
+                connection.notify(&mut self.server, event_loop, message)
+            } else {
+                trace!("token {:?} not found", token);
+                false
+            }
+        };
+        if !is_ok {
+            trace!("deregistering token {:?}", token);
+            self.connections.remove(token);
+        }
+        trace!("end notify event for token {:?}", token);
+    }
 
-	fn timeout(&mut self, event_loop: &mut EventLoop<Self>, timeout: Self::Timeout) {
-		warn!("timeout {:?}", timeout);
-	}
+    fn timeout(&mut self, event_loop: &mut EventLoop<Self>, timeout: Self::Timeout) {
+        warn!("timeout {:?}", timeout);
+    }
 
- 	fn interrupted(&mut self, event_loop: &mut EventLoop<Self>) {
- 		panic!("interrupted");
-	}
+    fn interrupted(&mut self, event_loop: &mut EventLoop<Self>) {
+        panic!("interrupted");
+    }
 }

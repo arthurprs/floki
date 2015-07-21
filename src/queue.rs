@@ -3,6 +3,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::collections::{HashMap, BTreeMap};
 use std::collections::hash_map::Entry;
 use std::collections::hash_state::DefaultState;
+use fnv::FnvHasher;
 use std::io::{self, Read, Write};
 use std::fs::{self, File};
 use std::mem;
@@ -10,7 +11,6 @@ use std::cmp;
 use std::rc::Rc;
 use linked_hash_map::LinkedHashMap;
 use time::precise_time_s;
-use fnv::FnvHasher;
 use rustc_serialize::json;
 
 use config::*;
@@ -52,7 +52,7 @@ pub struct Channel {
     in_flight: LinkedHashMap<u64, InFlightState, DefaultState<FnvHasher>>
 }
 
-#[derive(Debug)]
+//#[derive(Debug)]
 pub struct Queue {
     config: Rc<QueueConfig>,
     // backend writes don't block readers
@@ -62,36 +62,12 @@ pub struct Queue {
     backend_rlock: RwLock<()>,
     backend: QueueBackend,
     channels: RwLock<HashMap<String, Mutex<Channel>, DefaultState<FnvHasher>>>,
-    clock: u32,
+    clock: u32, // local copy of the internal clock
     state: QueueState,
 }
 
-#[derive(Clone)]
-pub struct ArcQueue(Arc<Queue>);
-
-unsafe impl Sync for ArcQueue {}
-unsafe impl Send for ArcQueue {}
-
-impl Deref for ArcQueue {
-    type Target = Queue;
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl DerefMut for ArcQueue {
-    #[allow(mutable_transmutes)]
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        let queue: &Self::Target = self;
-        unsafe { mem::transmute(queue) }
-    }
-}
-
-impl ArcQueue {
-    pub fn new(queue: Queue) -> ArcQueue {
-        ArcQueue(Arc::new(queue))
-    }
-}
+unsafe impl Sync for Queue {}
+unsafe impl Send for Queue {}
 
 impl Queue {
 
@@ -172,8 +148,6 @@ impl Queue {
             }
 
             // fetch from the backend
-            // TODO: if we have incremental ids,
-            //       we can add to in_flight and unlock the channel before fetching from backend
             if let Some((new_tail, message)) = self.backend.get(locked_channel.tail) {
                 locked_channel.tail = new_tail;
                 let state = InFlightState {
@@ -324,6 +298,11 @@ impl Queue {
         self.clock = clock;
         debug!("[{}] tick to {}", self.config.name, self.clock);
     }
+
+    #[allow(mutable_transmutes)]
+    pub fn as_mut(&self) -> &mut Self {
+        unsafe { mem::transmute(self) }
+    }
 }
 
 impl Drop for Queue {
@@ -348,8 +327,7 @@ mod tests {
         let server_config = ServerConfig::read();
         let mut queue_config = server_config.new_queue_config(name);
         queue_config.time_to_live = 1;
-        let mut queue = Queue::new(queue_config, recover);
-        queue
+        Queue::new(queue_config, recover)
     }
 
     fn get_queue() -> Queue {
@@ -363,11 +341,6 @@ mod tests {
             id: id,
             body: b"333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333"
         }
-    }
-
-    fn init_logger() {
-        use env_logger;
-        env_logger::init();
     }
 
     #[test]
