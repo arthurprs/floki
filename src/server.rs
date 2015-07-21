@@ -79,9 +79,11 @@ impl ServerBackend {
     }
 
     #[inline]
-    fn remove_queue(&mut self, name: &str) {
-        self.queues.remove(name);
-        // TODO: connections on wait_list should return errors
+    fn delete_queue(&mut self, name: &str) {
+        if let Some(q) = self.queues.remove(name) {
+            q.queue.as_mut().set_state(QueueState::Deleting);
+            // TODO: connections on wait_list should return errors
+        };
     }
 
     fn get_or_create_queue(&mut self, name: &str) -> Arc<ServerQueue> {
@@ -170,8 +172,7 @@ impl Dispatcher {
                     sq.queue.as_mut().purge();
                 },
                 "_delete" => {
-                    sq.queue.as_mut().set_state(QueueState::Deleting);
-                    self.state.write().unwrap().remove_queue(queue_name); 
+                    self.state.write().unwrap().delete_queue(queue_name);
                 },
                 _ => return Err(Status::InvalidArguments)
             }
