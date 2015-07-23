@@ -325,10 +325,7 @@ impl Server {
         (server_handler, event_loop)
     }
 
-    fn accept<'a>(
-                &'a mut self,
-                connections: &'a mut Slab<Connection<'a>>,
-                event_loop: &'a mut EventLoop<ServerHandler<'a>>) -> bool {
+     fn accept<'a,'b,'d,'e>( &'a mut self, connections: &'b mut Slab<Connection<'a>>, event_loop: &'d mut EventLoop<ServerHandler<'e>>) -> bool {
         let (stream, connection_addr) = self.listener.accept().unwrap();
         debug!("incomming connection from {:?}", connection_addr);
 
@@ -352,6 +349,13 @@ impl Server {
     }
 }
 
+impl<'a> ServerHandler<'a> {
+    #[inline]
+    fn call_accept(&'a mut self, event_loop: &'a mut EventLoop<Self>) -> bool {
+        self.server.accept(&mut self.connections, event_loop)
+    }
+}
+
 impl<'a> Handler for ServerHandler<'a> {
     type Timeout = ();
     type Message = (Token, NotifyMessage);
@@ -360,7 +364,7 @@ impl<'a> Handler for ServerHandler<'a> {
     fn readable(&mut self, event_loop: &mut EventLoop<Self>, token: Token, hint: ReadHint) {
         trace!("readable event for token {:?} hint {:?}", token, hint);
         let is_ok = match token {
-            SERVER => self.server.accept(&mut self.connections, event_loop),
+            SERVER => self.call_accept(event_loop),
             token => if let Some(connection) = self.connections.get_mut(token) {
                 connection.readable(&mut self.server, event_loop, hint)
             } else {
