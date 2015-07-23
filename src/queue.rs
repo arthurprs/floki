@@ -1,20 +1,18 @@
 use std::ops::{Deref, DerefMut};
 use std::sync::{Arc, Mutex, RwLock};
-use std::collections::{HashMap, BTreeMap};
+use std::collections::BTreeMap;
 use std::collections::hash_map::Entry;
-use std::collections::hash_state::DefaultState;
-use fnv::FnvHasher;
 use std::io::{self, Read, Write};
 use std::fs::{self, File};
 use std::mem;
 use std::cmp;
 use std::rc::Rc;
-use linked_hash_map::LinkedHashMap;
 use time::precise_time_s;
 use rustc_serialize::json;
 
 use config::*;
 use queue_backend::*;
+use utils::*;
 
 #[derive(Eq, PartialEq, Debug, Copy, Clone, RustcDecodable, RustcEncodable)]
 pub enum QueueState {
@@ -30,6 +28,7 @@ impl Default for QueueState {
 
 #[derive(Debug, Eq, PartialEq, RustcDecodable, RustcEncodable)]
 struct ChannelCheckpoint {
+    last_touched: u32,
     tail: u64,
     in_flight: Vec<u64>
 }
@@ -48,11 +47,12 @@ struct InFlightState {
 
 #[derive(Debug)]
 pub struct Channel {
+    last_touched: u32,
     tail: u64,
-    in_flight: LinkedHashMap<u64, InFlightState, DefaultState<FnvHasher>>
+    in_flight: LinkedHashMap<u64, InFlightState>
 }
 
-//#[derive(Debug)]
+#[derive(Debug)]
 pub struct Queue {
     config: Rc<QueueConfig>,
     // backend writes don't block readers
@@ -61,7 +61,7 @@ pub struct Queue {
     backend_wlock: Mutex<()>,
     backend_rlock: RwLock<()>,
     backend: QueueBackend,
-    channels: RwLock<HashMap<String, Mutex<Channel>, DefaultState<FnvHasher>>>,
+    channels: RwLock<HashMap<String, Mutex<Channel>>>,
     clock: u32, // local copy of the internal clock
     state: QueueState,
 }
@@ -112,6 +112,7 @@ impl Queue {
             vacant_entry.insert(
                 Mutex::new(
                     Channel {
+                        last_touched: self.clock,
                         tail: 0,
                         in_flight: Default::default()
                     }
@@ -134,6 +135,8 @@ impl Queue {
         let locked_channels = self.channels.read().unwrap();
         if let Some(channel) = locked_channels.get(channel_name) {
             let mut locked_channel = channel.lock().unwrap();
+
+            locked_channel.last_touched = self.clock;
 
             // check in flight queue for timeouts
             if let Some((&id, &InFlightState { expiration, ..} )) = locked_channel.in_flight.front() {
@@ -173,7 +176,9 @@ impl Queue {
     pub fn delete(&mut self, channel_name: &str, id: u64) -> Option<bool> {
         let locked_channels = self.channels.read().unwrap();
         if let Some(channel) = locked_channels.get(channel_name) {
-            let removed_opt = channel.lock().unwrap().in_flight.remove(&id);
+            let mut locked_channel = channel.lock().unwrap();
+            locked_channel.last_touched = self.clock;
+            let removed_opt = locked_channel.in_flight.remove(&id);
             trace!("[{}] message {} deleted from channel: {}",
                 self.config.name, id, removed_opt.is_some());
             return Some(removed_opt.is_some())
@@ -218,7 +223,7 @@ impl Queue {
 
         let mut locked_channels = self.channels.write().unwrap();
         for (channel_name, channel_checkpoint) in queue_checkpoint.channels {
-            let mut in_flight: LinkedHashMap<_, _, _> = Default::default();
+            let mut in_flight: LinkedHashMap<_, _> = Default::default();
             for id in channel_checkpoint.in_flight {
                 in_flight.insert(id, Default::default());
             }
@@ -226,6 +231,7 @@ impl Queue {
             locked_channels.insert(
                 channel_name,
                 Mutex::new(Channel {
+                    last_touched: channel_checkpoint.last_touched,
                     tail: channel_checkpoint.tail,
                     in_flight: in_flight,
                 })
@@ -250,6 +256,7 @@ impl Queue {
                 checkpoint.channels.insert(
                     channel_name.clone(),
                     ChannelCheckpoint {
+                        last_touched: locked_channel.last_touched,
                         tail: locked_channel.tail,
                         in_flight: locked_channel.in_flight
                             .keys().map(|&id| id).collect()

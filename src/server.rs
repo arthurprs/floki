@@ -6,9 +6,7 @@ use std::mem;
 use std::sync::{Arc, RwLock};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use spin::Mutex as SpinLock;
-use std::collections::{HashMap, HashSet};
-use std::collections::hash_state::DefaultState;
-use fnv::FnvHasher;
+use std::collections::{HashSet};
 use mio::tcp::{TcpStream, TcpListener};
 use mio::util::{Slab};
 use mio::{Buf, MutBuf, Token, EventLoop, Interest, PollOpt, ReadHint, Timeout, Handler, Sender};
@@ -20,6 +18,7 @@ use queue::*;
 use queue_backend::Message;
 use config::*;
 use protocol::*;
+use utils::*;
 
 const SERVER: Token = Token(0);
 const INVALID_CLIENT: Token = Token(1);
@@ -28,88 +27,77 @@ const FIRST_CLIENT: Token = Token(2);
 const BUSY_WAIT: Token = Token(1000000);
 
 #[derive(Debug)]
-pub enum NotifyMessage {
-    Response(ResponseBuffer),
-    Available(String),
-}
-
-struct Connection {
+struct Connection<'a> {
     stream: TcpStream,
+    state: &'a ServerBackend,
     token: Token,
-    request_buffer: RequestBuffer,
-    response_buffer: Option<ResponseBuffer>,
+    request: RequestBuffer,
+    response: Option<ResponseBuffer>,
     interest: Interest
 }
 
+#[derive(Debug)]
 struct ServerQueue {
-    queue: Queue,
-    waiting_flag: AtomicUsize,
-    wait_list: SpinLock<HashSet<Token, DefaultState<FnvHasher>>>
+    queue: Arc<Queue>,
+    waiting_clients: Vec<Token>
 }
 
+#[derive(Debug)]
 struct ServerBackend {
     config: ServerConfig,
-    queues: HashMap<String, Arc<ServerQueue>, DefaultState<FnvHasher>>,
+    queues: HashMap<String, ServerQueue>,
+}
+
+#[derive(Debug)]
+pub enum NotifyMessage {
+    Response(ResponseBuffer),
+    Available(Arc<ServerQueue>),
 }
 
 pub struct Server {
     listener: TcpListener,
-    state: Arc<RwLock<ServerBackend>>,
+    backend: ServerBackend,
     thread_pool: ThreadPool
 }
 
-pub struct ServerHandler {
+pub struct ServerHandler<'a> {
     server: Server,
-    connections: Slab<Connection>,
-}
-
-struct Dispatcher {
-    token: Token,
-    request: RequestBuffer,
-    state: Arc<RwLock<ServerBackend>>,
-    sender: Sender<(Token, NotifyMessage)>
+    connections: Slab<Connection<'a>>,
 }
 
 type ResponseResult = Result<ResponseBuffer, Status>;
 
 impl ServerBackend {
     #[inline]
-    fn get_queue(&self, name: &str) -> Option<Arc<ServerQueue>> {
-        self.queues.get(name).map(|q| q.clone())
+    fn get_queue(&self, name: &str) -> Option<&ServerQueue> {
+        self.queues.get(name)
     }
 
-    #[inline]
     fn delete_queue(&mut self, name: &str) {
         if let Some(q) = self.queues.remove(name) {
             q.queue.as_mut().set_state(QueueState::Deleting);
             // TODO: connections on wait_list should return errors
-        };
-    }
-
-    fn get_or_create_queue(&mut self, name: &str) -> Arc<ServerQueue> {
-        if let Some(q) = self.queues.get(name) {
-            return q.clone()
         }
-        info!("Creating queue {:?}", name);
-        let inner_queue = Queue::new(self.config.new_queue_config(name), true);
-        trace!("done creating queue {:?}", name);
-
-        let queue = Arc::new(ServerQueue {
-            queue: inner_queue,
-            waiting_flag: Default::default(),
-            wait_list: SpinLock::new(Default::default()),
-        });
-
-        self.queues.insert(name.into(), queue.clone());
-        queue
     }
-    
+
+    fn get_or_create_queue(&mut self, name: &str) -> &ServerQueue {
+        self.queues.entry(name.into()).or_insert_with(|| {
+
+            info!("Creating queue {:?}", name);
+            let inner_queue = Queue::new(self.config.new_queue_config(name), true);
+            trace!("done creating queue {:?}", name);
+
+            ServerQueue {
+                queue: Arc::new(inner_queue),
+                waiting_clients: Default::default(),
+            }
+        })
+    }
 }
 
-impl Dispatcher {
+impl<'a> Connection<'a> {
     fn list_queues(&self) -> String {   
-        let locked_state = self.state.read().unwrap();
-        let queue_names: Vec<_> = locked_state.queues.keys().collect();
+        let queue_names: Vec<_> = self.state.queues.keys().collect();
         json::encode(&queue_names).unwrap()
     }
 
@@ -124,7 +112,7 @@ impl Dispatcher {
     fn get(&self, opcode: OpCode, key_str_slice: &str) -> ResponseResult {
         let (queue_name, channel_name_opt) = Self::split_colon(key_str_slice);
         let channel_name = channel_name_opt.unwrap();
-        let sq_opt = self.state.read().unwrap().get_queue(queue_name);
+        let sq_opt = self.state.get_queue(queue_name);
         if let Some(sq) = sq_opt {
             if let Some(message) = sq.queue.as_mut().get(channel_name) {
                 Ok(ResponseBuffer::new_get_response(&self.request, message.id, message.body))
@@ -140,7 +128,7 @@ impl Dispatcher {
 
     fn put(&self, opcode: OpCode, key_str_slice: &str, value_slice: &[u8]) -> ResponseResult {
         let (queue_name, channel_name_opt) = Self::split_colon(key_str_slice);
-        let sq_opt = self.state.read().unwrap().get_queue(queue_name);
+        let sq_opt = self.state.get_queue(queue_name);
         let sq = sq_opt.unwrap_or_else(|| {
             self.state.write().unwrap().get_or_create_queue(queue_name)
         });
@@ -158,7 +146,7 @@ impl Dispatcher {
 
     fn delete(&self, opcode: OpCode, key_str_slice: &str) -> ResponseResult {
         let (queue_name, _opt) = Self::split_colon(key_str_slice);
-        let sq_opt = self.state.read().unwrap().get_queue(queue_name);
+        let sq_opt = self.state.get_queue(queue_name);
         let sq = if let Some(queue) = sq_opt {
             queue
         } else {
@@ -196,7 +184,7 @@ impl Dispatcher {
         Ok(ResponseBuffer::new(opcode, Status::NoError))
     }
 
-    fn dispatch(self) {
+    fn dispatch(&mut self) {
         let opcode = self.request.opcode();
 
         let key_str_slice = str::from_utf8(self.request.key_slice()).unwrap();
@@ -210,8 +198,7 @@ impl Dispatcher {
                 self.get(opcode, key_str_slice)
             }
             OpCode::Set if !key_str_slice.is_empty() => {
-                let r = self.put(opcode, key_str_slice, value_slice);
-                r
+                self.put(opcode, key_str_slice, value_slice)
             }
             OpCode::Delete if !key_str_slice.is_empty() && value_slice.is_empty() => {
                 self.delete(opcode, key_str_slice)
@@ -227,17 +214,16 @@ impl Dispatcher {
             Err(status) => ResponseBuffer::new(opcode, status)
         };
         let composed_msg = (self.token, NotifyMessage::Response(response));
-        self.sender.send(composed_msg).unwrap();
+        // self.sender.send(composed_msg).unwrap();
     }
-}
 
-impl Connection {
-    fn new(stream: TcpStream) -> Connection {
+    fn new(stream: TcpStream, state: &'a ServerBackend) -> Connection<'a> {
         Connection {
             stream: stream,
+            state: state,
             token: INVALID_CLIENT,
-            request_buffer: RequestBuffer::new(),
-            response_buffer: None,
+            request: RequestBuffer::new(),
+            response: None,
             interest: Interest::all() - Interest::writable()
         }
     }
@@ -249,25 +235,19 @@ impl Connection {
             return false
         }
 
-        while let Ok(bytes_read) = self.stream.read(self.request_buffer.mut_bytes()) {
+        while let Ok(bytes_read) = self.stream.read(self.request.mut_bytes()) {
             if bytes_read == 0 {
                 break
             }
-            self.request_buffer.advance(bytes_read);
-            trace!("filled request_buffer with {} bytes, remaining: {}", bytes_read, self.request_buffer.remaining());
+            self.request.advance(bytes_read);
+            trace!("filled request with {} bytes, remaining: {}", bytes_read, self.request.remaining());
             
-            if self.request_buffer.is_complete() {
+            if self.request.is_complete() {
                 self.interest = Interest::none();
                 event_loop.reregister(&self.stream, self.token, self.interest, PollOpt::level()).unwrap();
                 
-                debug!("dispatching request {:?} for token {:?}", self.request_buffer, self.token);
-                let dispatcher = Dispatcher {
-                    token: self.token,
-                    request: mem::replace(&mut self.request_buffer, RequestBuffer::new()),
-                    state: server.state.clone(),
-                    sender: event_loop.channel(),
-                };
-                server.thread_pool.execute(move || { dispatcher.dispatch() });
+                debug!("dispatching request {:?} for token {:?}", self.request, self.token);
+                self.dispatch();
                 break
             } else {
                 // keep reading
@@ -278,19 +258,19 @@ impl Connection {
     }
 
     fn writable(&mut self, server: &mut Server, event_loop: &mut EventLoop<ServerHandler>) -> bool {
-        let response_buffer = self.response_buffer.as_mut().expect("writable with None response_buffer");
-        while let Ok(bytes_written) = self.stream.write(response_buffer.bytes()) {
+        let response = self.response.as_mut().expect("writable with None response");
+        while let Ok(bytes_written) = self.stream.write(response.bytes()) {
             if bytes_written == 0 {
                 break
             }
-            response_buffer.advance(bytes_written);
-            trace!("filled response_buffer with {} bytes, remaining: {}", bytes_written, response_buffer.remaining());
+            response.advance(bytes_written);
+            trace!("filled response with {} bytes, remaining: {}", bytes_written, response.remaining());
 
-            if response_buffer.is_complete() {
-                debug!("done sending response {:?} to token {:?}", response_buffer, self.token);
+            if response.is_complete() {
+                debug!("done sending response {:?} to token {:?}", response, self.token);
                 self.interest = Interest::all() - Interest::writable();
                 event_loop.reregister(&self.stream, self.token, self.interest, PollOpt::level()).unwrap();
-                if response_buffer.opcode() == OpCode::Exit {
+                if response.opcode() == OpCode::Exit {
                     return false;
                 }
                 break
@@ -303,8 +283,8 @@ impl Connection {
 
     fn notify(&mut self, server: &mut Server, event_loop: &mut EventLoop<ServerHandler>, msg: NotifyMessage) -> bool {
         match msg {
-            NotifyMessage::Response(response_buffer) => {
-                self.response_buffer = Some(response_buffer);
+            NotifyMessage::Response(response) => {
+                self.response = Some(response);
                 self.interest = Interest::all() - Interest::readable();
                 event_loop.reregister(&self.stream, self.token, self.interest, PollOpt::level()).unwrap();
             }
@@ -315,22 +295,22 @@ impl Connection {
 }
 
 impl Server {
-    pub fn new(config: ServerConfig) -> (ServerHandler, EventLoop<ServerHandler>) {
+    pub fn new<'a>(config: ServerConfig) -> (ServerHandler<'a>, EventLoop<ServerHandler<'a>>) {
         let addr = SocketAddr::from_str("127.0.0.1:9797").unwrap();
 
         debug!("binding tcp socket to {:?}", addr);
         let listener = TcpListener::bind(&addr).unwrap();
 
         let num_cpus = get_num_cpus();
-        let num_threads = num_cpus * 3 / 2;
+        let num_threads = num_cpus + 2;
         debug!("detected {} cpus, using {} threads", num_cpus, num_threads);
 
         let server = Server {
             listener: listener,
-            state: Arc::new(RwLock::new(ServerBackend {
+            backend: ServerBackend {
                 config: config,
                 queues: Default::default(),
-            })),
+            },
             thread_pool: ThreadPool::new(num_threads)
         };
 
@@ -345,7 +325,10 @@ impl Server {
         (server_handler, event_loop)
     }
 
-    fn accept(&mut self, connections: &mut Slab<Connection>, event_loop: &mut EventLoop<ServerHandler>) -> bool {
+    fn accept<'a>(
+                &'a mut self,
+                connections: &'a mut Slab<Connection<'a>>,
+                event_loop: &'a mut EventLoop<ServerHandler<'a>>) -> bool {
         let (stream, connection_addr) = self.listener.accept().unwrap();
         debug!("incomming connection from {:?}", connection_addr);
 
@@ -353,7 +336,7 @@ impl Server {
         // TODO: use TCP_CORK
         stream.set_nodelay(false).unwrap();
 
-        let connection = Connection::new(stream);
+        let connection = Connection::new(stream, &self.backend);
 
         let token = connections.insert(connection).ok().unwrap();
 
@@ -369,7 +352,7 @@ impl Server {
     }
 }
 
-impl Handler for ServerHandler {
+impl<'a> Handler for ServerHandler<'a> {
     type Timeout = ();
     type Message = (Token, NotifyMessage);
 

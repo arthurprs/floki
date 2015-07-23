@@ -27,6 +27,7 @@ mod queue;
 mod server;
 mod protocol;
 mod queue_backend;
+mod utils;
 
 use config::*;
 use queue::*;
