@@ -4,16 +4,16 @@ version = "0.1.0"
 authors = ["arthurprs <arthurprs@gmail.com>"]
 
 [dependencies]
-rustc-serialize = "0.3.15"
-log = "0.3.1"
-env_logger = "0.3.0"
-mio = "0.3.6"
-toml = "0.1.20"
-threadpool = "0.1.4"
+rustc-serialize = "*"
+log = "*"
+env_logger = "*"
+mio = "0.4.*"
 nix = "0.3.6"
-time = "0.1.25"
-num_cpus = "0.2.6"
-fnv = "1.0.0"
+toml = "*"
+threadpool = "*"
+clock_ticks = "*"
+num_cpus = "*"
+fnv = "*"
 spin = "*"
 
 [dependencies.linked-hash-map]
@@ -22,3 +22,20 @@ git="https://github.com/arthurprs/linked-hash-map.git"
 [dependencies.vec_map]
 version="*"
 features=["nightly"]
+
+
+[profile.dev]
+opt-level = 0
+debug = true
+rpath = false
+lto = false
+debug-assertions = true
+codegen-units = 8
+
+[profile.release]
+opt-level = 3
+debug = true
+rpath = false
+lto = false
+debug-assertions = false
+codegen-units = 1

@@ -2,10 +2,9 @@
 #![allow(dead_code)] 
 #![allow(unused_variables)]
 #![allow(raw_pointer_derive)]
-#![cfg_attr(test, feature(test))]
-#![feature(tcp)]
 #![feature(path_ext)]
 #![feature(hashmap_hasher)]
+#![cfg_attr(test, feature(test))]
 
 #[cfg(test)] extern crate test;
 extern crate env_logger;
@@ -14,7 +13,7 @@ extern crate nix;
 extern crate mio;
 extern crate num_cpus;
 extern crate threadpool;
-extern crate time;
+extern crate clock_ticks;
 extern crate rustc_serialize;
 extern crate toml;
 extern crate linked_hash_map;

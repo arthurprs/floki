@@ -203,7 +203,7 @@ impl RequestBuffer {
     }
 
     pub fn is_complete(&self) -> bool {
-        self.bytes_read == size_of::<RequestHeader>() + self.body.capacity()
+        self.bytes_read == size_of::<RequestHeader>() + self.header.get_total_body_len()
     }
 
     pub fn is_too_large(&self) -> bool {

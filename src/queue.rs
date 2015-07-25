@@ -7,7 +7,7 @@ use std::fs::{self, File};
 use std::mem;
 use std::cmp;
 use std::rc::Rc;
-use time::precise_time_s;
+use clock_ticks::precise_time_s;
 use rustc_serialize::json;
 
 use config::*;
@@ -70,7 +70,6 @@ unsafe impl Sync for Queue {}
 unsafe impl Send for Queue {}
 
 impl Queue {
-
     pub fn new(config: QueueConfig, recover: bool) -> Queue {
         if ! recover {
             let _ = fs::remove_dir_all(&config.data_directory);
@@ -109,15 +108,13 @@ impl Queue {
         let channel_name: String = channel_name.into();
         let mut locked_channel = self.channels.write().unwrap();
         if let Entry::Vacant(vacant_entry) = locked_channel.entry(channel_name) {
-            vacant_entry.insert(
-                Mutex::new(
-                    Channel {
-                        last_touched: self.clock,
-                        tail: 0,
-                        in_flight: Default::default()
-                    }
-                )
-            );
+            let channel = Channel {
+                last_touched: self.clock,
+                tail: 0,
+                in_flight: Default::default()
+            };
+            debug!("creating channel {:?}", channel);
+            vacant_entry.insert(Mutex::new(channel));
             true
         } else {
             false
@@ -191,6 +188,10 @@ impl Queue {
         let _ = self.backend_rlock.write().unwrap();
         let _ = self.backend_wlock.lock().unwrap();
         self.backend.purge();
+        let mut path = self.config.data_directory.join(QUEUE_CHECKPOINT_FILE);
+        fs::remove_file(&path);
+        path.set_file_name(TMP_QUEUE_CHECKPOINT_FILE);
+        fs::remove_file(&path);
         self.channels.write().unwrap().clear();
     }
 
@@ -301,7 +302,6 @@ impl Queue {
     }
 
     pub fn tick_to(&mut self, clock: u32) {
-        // FIXME: must ensure self.clock is within a single cache line
         self.clock = clock;
         debug!("[{}] tick to {}", self.config.name, self.clock);
     }

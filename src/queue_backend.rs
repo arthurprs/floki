@@ -315,6 +315,10 @@ impl QueueBackend {
         }
         self.tail = 0;
         self.head = 0;
+        let mut path = self.config.data_directory.join(BACKEND_CHECKPOINT_FILE);
+        fs::remove_file(&path);
+        path.set_file_name(TMP_BACKEND_CHECKPOINT_FILE);
+        fs::remove_file(&path);
     }
 
 
