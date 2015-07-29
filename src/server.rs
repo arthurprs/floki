@@ -2,6 +2,8 @@ use std::ops::{Deref, DerefMut};
 use std::str::{self, FromStr};
 use std::net::{SocketAddr, lookup_host, SocketAddrV4};
 use std::io::{Read, Write};
+use std::io::Result as IoResult;
+use std::io::Error as IoError;
 use std::mem;
 use std::sync::{Arc, RwLock};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -13,6 +15,7 @@ use mio::{Buf, MutBuf, Token, EventLoop, EventSet, PollOpt, Timeout, Handler, Se
 use threadpool::ThreadPool;
 use num_cpus::get as get_num_cpus;
 use rustc_serialize::json;
+use std::os::unix::io::{AsRawFd, RawFd};
 
 use queue::*;
 use queue_backend::Message;
@@ -21,8 +24,7 @@ use protocol::*;
 use utils::*;
 
 const SERVER: Token = Token(0);
-const INVALID_CLIENT: Token = Token(1);
-const FIRST_CLIENT: Token = Token(2);
+const FIRST_CLIENT: Token = Token(1);
 
 const BUSY_WAIT: Token = Token(1000000);
 
@@ -99,6 +101,26 @@ impl ServerBackend {
     }
 }
 
+fn write_response(stream: &mut TcpStream, response: &mut ResponseBuffer) -> IoResult<usize> {
+    let bytes = response.bytes();
+    if bytes.is_empty() && response.remaining() != 0 {
+        trace!("response.bytes().is_empty() && response.remaining() != 0");
+        if let Some((fd, fd_offset)) = response.send_file_opt {
+            let r = sendfile(stream.as_raw_fd(), fd, fd_offset, response.remaining());
+            trace!("sendfile returned {}", r);
+            if r == -1 {
+                Err(IoError::from_raw_os_error(r as i32))
+            } else {
+                Ok(r as usize)
+            }
+        } else {
+            unreachable!();
+        }
+    } else {
+        stream.write(response.bytes())
+    }
+}
+
 impl Connection {
     fn split_colon(composed: &str) -> (&str, Option<&str>) {
         if let Some(pos) = composed.find(":") {
@@ -114,7 +136,12 @@ impl Connection {
         let sq_opt = backend.get_queue(queue_name);
         if let Some(sq) = sq_opt {
             if let Some(message) = sq.queue.as_mut().get(channel_name) {
-                Ok(ResponseBuffer::new_get_response(&self.request, message.id, message.body))
+                if let Some(send_file) = message.send_file_opt {
+                    let send_file = message.send_file_opt.unwrap();
+                    Ok(ResponseBuffer::new_get_response_fd(&self.request, message.id, send_file.0, send_file.1, send_file.2))
+                } else {
+                    Ok(ResponseBuffer::new_get_response(&self.request, message.id, message.body))
+                }
             } else {
                 debug!("queue {:?} channel {:?} has no messages", queue_name, channel_name);
                 Err(Status::KeyNotFound)
@@ -134,7 +161,7 @@ impl Connection {
             sq.queue.as_mut().create_channel(channel_name);
         } else {
             debug!("inserting into {:?} {:?}", key_str_slice, value_slice);
-            let id = sq.queue.as_mut().put(&Message{id:0, body: value_slice}).unwrap();
+            let id = sq.queue.as_mut().put(&Message{id:0, body: value_slice, send_file_opt: None}).unwrap();
             trace!("inserted message into {:?} with id {:?}", key_str_slice, id);
         }
         Ok(ResponseBuffer::new_set_response())
@@ -217,10 +244,10 @@ impl Connection {
         }
     }
 
-    fn new(stream: TcpStream) -> Connection {
+    fn new(token: Token, stream: TcpStream) -> Connection {
         Connection {
             stream: stream,
-            token: INVALID_CLIENT,
+            token: token,
             request: RequestBuffer::new(),
             response: None,
             interest: EventSet::all() - EventSet::writable()
@@ -257,12 +284,11 @@ impl Connection {
             }
         }
 
+
+
         if events.is_writable() {
             let response = self.response.as_mut().expect("writable with None response");
-            while let Ok(bytes_written) = self.stream.write(response.bytes()) {
-                if bytes_written == 0 {
-                    break
-                }
+            while let Ok(bytes_written) = write_response(&mut self.stream, response) {
                 response.advance(bytes_written);
                 trace!("filled response with {} bytes, remaining: {}", bytes_written, response.remaining());
 
@@ -336,10 +362,15 @@ impl Server {
             // Don't buffer output in TCP - kills latency sensitive benchmarks
             // TODO: use TCP_CORK
             stream.set_nodelay(true).unwrap();
+            // {
+            //     use std::os::unix::io::AsRawFd;
+            //     use nix::sys::socket;
+            //     socket::setsockopt(
+            //         stream.as_raw_fd(), socket::SockLevel::Tcp, socket::sockopt::TcpNoDelay, &true
+            //     ).unwrap();
+            // }
 
-            let connection = Connection::new(stream);
-
-            let token = connections.insert(connection).ok().unwrap();
+            let token = connections.insert_with(|token| Connection::new(token, stream)).unwrap();
 
             connections[token].token = token;
             debug!("assigned token {:?} to client {:?}", token, connection_addr);
@@ -375,7 +406,7 @@ impl Handler for ServerHandler {
             self.connections.remove(token);
         }
 
-        trace!("done readable event for token {:?}", token);
+        trace!("done events {:?} for token {:?}", events, token);
     }
 
     #[inline]
@@ -404,5 +435,21 @@ impl Handler for ServerHandler {
 
     fn interrupted(&mut self, event_loop: &mut EventLoop<Self>) {
         panic!("interrupted");
+    }
+}
+
+use libc::{c_void, size_t, off_t, ssize_t};
+mod ffi {
+    use std::os::unix::io::RawFd;
+    use libc::{c_void, size_t, off_t, ssize_t};
+    extern {
+        pub fn sendfile(out_fd: RawFd, in_fd: RawFd, offset: *mut off_t, count: size_t) -> ssize_t;
+    }
+}
+
+fn sendfile(out_fd: RawFd, in_fd: RawFd, offset: usize, count: usize) -> isize {
+    unsafe {
+        let mut offset = offset as off_t;
+        ffi::sendfile(out_fd, in_fd, &mut offset, count as size_t) as isize
     }
 }

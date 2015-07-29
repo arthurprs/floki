@@ -3,6 +3,7 @@
 #![allow(unused_variables)]
 #![allow(raw_pointer_derive)]
 #![feature(path_ext)]
+#![feature(libc)]
 #![feature(hashmap_hasher)]
 #![cfg_attr(test, feature(test))]
 
@@ -20,6 +21,7 @@ extern crate linked_hash_map;
 extern crate vec_map;
 extern crate fnv;
 extern crate spin;
+extern crate libc;
 
 mod config;
 mod queue;

@@ -12,13 +12,16 @@ use std::slice;
 use std::mem::{self, size_of};
 use vec_map::VecMap;
 use rustc_serialize::json;
+use std::os::unix::io::RawFd;
 
 use config::*;
+use utils::*;
 
 #[derive(Debug)]
 pub struct Message<'a> {
     pub id: u64,
-    pub body: &'a[u8]
+    pub body: &'a[u8],
+    pub send_file_opt: Option<(RawFd, usize, usize)>
 }
 
 #[repr(packed)]
@@ -75,6 +78,7 @@ impl QueueFile {
                 .read(true)
                 .write(true)
                 .create(true)
+                .truncate(true)
                 .open(data_path).unwrap();
         // hopefully the filesystem supports sparse files
         file.set_len(config.segment_size).unwrap();
@@ -102,7 +106,11 @@ impl QueueFile {
             ptr::null_mut(), file_size,
             mman::PROT_READ | mman::PROT_WRITE, mman::MAP_SHARED,
             file.as_raw_fd(), 0).unwrap() as *mut u8;
-        
+        mman::madvise(
+            file_mmap as *mut c_void,
+            file_size,
+            mman::MADV_SEQUENTIAL).unwrap();
+
         QueueFile {
             base_path: base_path,
             file: file,
@@ -138,12 +146,22 @@ impl QueueFile {
                 header.len as usize)
         };
 
+        // Looks like sendfile is slower for msgs w/ len < 512s
+        // possibly because it only needs ~2 system calls instead of ~3
+        // experiment with tcp_cork to check if it helps
         let message = Message {
             id: id,
-            body: body
+            body: body,
+            send_file_opt: None,
+            // body: b"",
+            // send_file_opt: Some((
+            //     self.file.as_raw_fd(),
+            //     (id - self.tail + size_of::<MessageHeader>() as u64) as usize,
+            //     header.len as usize
+            // ))
         };
 
-        Ok((id + message_total_len, message))
+        Ok((id + message_total_len as u64, message))
     }
 
     fn append(&mut self, message: &Message) -> Option<u64> {
@@ -170,7 +188,12 @@ impl QueueFile {
                 self.file_mmap.offset(file_offset as isize + size_of::<MessageHeader>() as isize),
                 message.body.len());
         }
-
+        // unsafe {
+        //     self.file.write_all(slice::from_raw_parts::<u8>(
+        //         mem::transmute(&header), size_of::<MessageHeader>()
+        //     )).unwrap();
+        //     self.file.write_all(message.body).unwrap();
+        // }
         self.head += message_total_len as u64;
         // self.dirty_bytes += message_total_len;
         // self.dirty_messages += 1;
@@ -200,11 +223,11 @@ impl QueueFile {
         checkpoint
     }
 
-    fn purge(self) {
-        let mut base_path = self.base_path.clone();
+    fn purge(mut self) {
+        let mut base_path = mem::replace(&mut self.base_path, PathBuf::new());
         drop(self);
         base_path.set_extension(DATA_EXTENSION);
-        let _ = fs::remove_file(&base_path);
+        remove_file_if_exist(&base_path).unwrap();
     }
 }
 
@@ -316,9 +339,9 @@ impl QueueBackend {
         self.tail = 0;
         self.head = 0;
         let mut path = self.config.data_directory.join(BACKEND_CHECKPOINT_FILE);
-        fs::remove_file(&path);
+        remove_file_if_exist(&path).unwrap();
         path.set_file_name(TMP_BACKEND_CHECKPOINT_FILE);
-        fs::remove_file(&path);
+        remove_file_if_exist(&path).unwrap();
     }
 
 

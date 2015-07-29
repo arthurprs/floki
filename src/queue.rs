@@ -72,14 +72,9 @@ unsafe impl Send for Queue {}
 impl Queue {
     pub fn new(config: QueueConfig, recover: bool) -> Queue {
         if ! recover {
-            let _ = fs::remove_dir_all(&config.data_directory);
+            remove_dir_if_exist(&config.data_directory).unwrap();
         }
-        match fs::create_dir_all(&config.data_directory) {
-            Err(ref err) if err.kind() != io::ErrorKind::AlreadyExists => {
-                panic!("failed to open queue directory: {}", err);
-            }
-            _ => ()
-        }
+        create_dir_if_not_exist(&config.data_directory).unwrap();
 
         let rc_config = Rc::new(config);
         let mut queue = Queue {
@@ -95,6 +90,7 @@ impl Queue {
             queue.recover();
         }
         queue.tick();
+        queue.checkpoint();
         queue
     }
 
@@ -188,11 +184,12 @@ impl Queue {
         let _ = self.backend_rlock.write().unwrap();
         let _ = self.backend_wlock.lock().unwrap();
         self.backend.purge();
-        let mut path = self.config.data_directory.join(QUEUE_CHECKPOINT_FILE);
-        fs::remove_file(&path);
-        path.set_file_name(TMP_QUEUE_CHECKPOINT_FILE);
-        fs::remove_file(&path);
-        self.channels.write().unwrap().clear();
+        remove_dir_if_exist(&self.config.data_directory).unwrap();
+        create_dir_if_not_exist(&self.config.data_directory).unwrap();
+        for (_, channel) in &mut*self.channels.write().unwrap() {
+            let mut locked_channel = channel.lock().unwrap();
+            locked_channel.tail = 0;
+        }
     }
 
     fn recover(&mut self) {
@@ -315,7 +312,7 @@ impl Queue {
 impl Drop for Queue {
     fn drop(&mut self) {
         if self.state == QueueState::Deleting {
-            self.purge()
+            remove_dir_if_exist(&self.config.data_directory).unwrap();
         } else {
             self.checkpoint()
         }
@@ -346,7 +343,8 @@ mod tests {
     fn gen_message(id: u64) -> Message<'static> {
         Message {
             id: id,
-            body: b"333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333"
+            body: b"333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333",
+            send_file_opt: None,
         }
     }
 

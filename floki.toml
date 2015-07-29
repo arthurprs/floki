@@ -1,5 +1,5 @@
 bind_address="127.0.0.1"
 port=9797
 data_directory="./test_data_dir"
-segment_size_mb=2048
+segment_size_mb=4
 segments_prealocated=2
