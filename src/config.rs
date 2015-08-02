@@ -13,7 +13,6 @@ pub const DATA_EXTENSION: &'static str = "data";
 pub struct ServerConfig {
     pub data_directory: PathBuf,
     pub bind_address: String,
-    pub port: u16,
     pub segment_size: u64,
 }
 
@@ -36,14 +35,12 @@ impl ServerConfig {
         };
         info!("done reading config: {:?}", config);
 
-        let port = config.get("port").unwrap().as_integer().unwrap() as u16;
         let bind_address = config.get("bind_address").unwrap().as_str().unwrap();
         let data_directory = config.get("data_directory").unwrap().as_str().unwrap();
         let segment_size_mb = config.get("segment_size_mb").unwrap().as_integer().unwrap();
 
         ServerConfig {
             data_directory: data_directory.into(),
-            port: port,
             bind_address: bind_address.into(),
             segment_size: segment_size_mb as u64 * 1024 * 1024,
         }

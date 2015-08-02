@@ -9,6 +9,7 @@ use std::cmp;
 use std::rc::Rc;
 use clock_ticks::precise_time_s;
 use rustc_serialize::json;
+use std::fmt;
 
 use config::*;
 use queue_backend::*;
@@ -17,6 +18,7 @@ use utils::*;
 #[derive(Eq, PartialEq, Debug, Copy, Clone, RustcDecodable, RustcEncodable)]
 pub enum QueueState {
     Ready,
+    Purging,
     Deleting
 }
 
@@ -87,16 +89,17 @@ impl Queue {
             state: QueueState::Ready,
         };
         if recover {
-            queue.recover();
+           queue.recover();
+        } else {
+           queue.checkpoint();
         }
         queue.tick();
-        queue.checkpoint();
         queue
     }
 
-    pub fn set_state(&mut self, new_state: QueueState) {
+    fn set_state(&mut self, new_state: QueueState) {
+        // TODO: state machine check?
         self.state = new_state;
-        self.checkpoint()
     }
 
     pub fn create_channel<S>(&mut self, channel_name: S) -> bool
@@ -165,8 +168,8 @@ impl Queue {
         self.backend.put(message)
     }
 
-    /// delete access is suposed to be thread-safe, even while writing
-    pub fn delete(&mut self, channel_name: &str, id: u64) -> Option<bool> {
+    /// ack access is suposed to be thread-safe, even while writing
+    pub fn ack(&mut self, channel_name: &str, id: u64) -> Option<bool> {
         let locked_channels = self.channels.read().unwrap();
         if let Some(channel) = locked_channels.get(channel_name) {
             let mut locked_channel = channel.lock().unwrap();
@@ -183,13 +186,25 @@ impl Queue {
         info!("[{}] purging", self.config.name);
         let _ = self.backend_rlock.write().unwrap();
         let _ = self.backend_wlock.lock().unwrap();
+        self.set_state(QueueState::Purging);
+        self.checkpoint();
         self.backend.purge();
-        remove_dir_if_exist(&self.config.data_directory).unwrap();
-        create_dir_if_not_exist(&self.config.data_directory).unwrap();
         for (_, channel) in &mut*self.channels.write().unwrap() {
             let mut locked_channel = channel.lock().unwrap();
             locked_channel.tail = 0;
         }
+        self.set_state(QueueState::Ready);
+        self.checkpoint();
+    }
+
+    pub fn delete(&mut self) {
+        info!("[{}] deleting", self.config.name);
+        let _ = self.backend_rlock.write().unwrap();
+        let _ = self.backend_wlock.lock().unwrap();
+        self.set_state(QueueState::Deleting);
+        self.checkpoint();
+        self.backend.delete();
+        remove_dir_if_exist(&self.config.data_directory).unwrap();
     }
 
     fn recover(&mut self) {
@@ -215,25 +230,35 @@ impl Queue {
             }
         };
 
-        info!("[{}] checkpoint loaded: {:?}", self.config.name, queue_checkpoint);
+        info!("[{}] checkpoint loaded: {:?}", self.config.name, queue_checkpoint.state);
 
         self.state = queue_checkpoint.state;
 
-        let mut locked_channels = self.channels.write().unwrap();
-        for (channel_name, channel_checkpoint) in queue_checkpoint.channels {
-            let mut in_flight: LinkedHashMap<_, _> = Default::default();
-            for id in channel_checkpoint.in_flight {
-                in_flight.insert(id, Default::default());
-            }
+        match self.state {
+            QueueState::Ready => {
+                let mut locked_channels = self.channels.write().unwrap();
+                for (channel_name, channel_checkpoint) in queue_checkpoint.channels {
+                    let mut in_flight: LinkedHashMap<_, _> = Default::default();
+                    for id in channel_checkpoint.in_flight {
+                        in_flight.insert(id, Default::default());
+                    }
 
-            locked_channels.insert(
-                channel_name,
-                Mutex::new(Channel {
-                    last_touched: channel_checkpoint.last_touched,
-                    tail: channel_checkpoint.tail,
-                    in_flight: in_flight,
-                })
-            );
+                    locked_channels.insert(
+                        channel_name,
+                        Mutex::new(Channel {
+                            last_touched: channel_checkpoint.last_touched,
+                            tail: channel_checkpoint.tail,
+                            in_flight: in_flight,
+                        })
+                    );
+                }
+            }
+            QueueState::Purging => {
+                // just return as is
+            }
+            QueueState::Deleting => {
+                // TODO: return some sort of error
+            }
         }
     }
 
@@ -256,8 +281,7 @@ impl Queue {
                     ChannelCheckpoint {
                         last_touched: locked_channel.last_touched,
                         tail: locked_channel.tail,
-                        in_flight: locked_channel.in_flight
-                            .keys().map(|&id| id).collect()
+                        in_flight: locked_channel.in_flight.keys().cloned().collect()
                     }
                 );
             }
@@ -274,7 +298,7 @@ impl Queue {
             });
 
         match result {
-            Ok(_) => info!("[{}] checkpointed: {:?}", self.config.name, checkpoint),
+            Ok(_) => info!("[{}] checkpointed: {:?}", self.config.name, checkpoint.state),
             Err(error) =>
                 warn!("[{}] error writing checkpoint information: {}",
                     self.config.name, error)
@@ -311,9 +335,7 @@ impl Queue {
 
 impl Drop for Queue {
     fn drop(&mut self) {
-        if self.state == QueueState::Deleting {
-            remove_dir_if_exist(&self.config.data_directory).unwrap();
-        } else {
+        if self.state != QueueState::Deleting {
             self.checkpoint()
         }
     }

@@ -207,7 +207,7 @@ impl QueueFile {
     }
 
     fn recover(&mut self, checkpoint: QueueFileCheckpoint) {
-        info!("[{:?}] checkpoint loaded: {:?}", self.base_path, checkpoint);
+        //debug!("[{:?}] checkpoint loaded: {:?}", self.base_path, checkpoint);
         self.head = checkpoint.head;
         self.closed = checkpoint.closed;
         // TODO: read forward checking the message hashes
@@ -299,13 +299,9 @@ impl QueueBackend {
             unsafe { mem::transmute(q_file_ptr) }
         };
 
-        let result = q_file.append(message);
-        if let Some(new_head) = result {
-            self.head = new_head;
-            result
-        } else {
-            panic!("Can't write to a newly created file!")
-        }
+        let new_head = q_file.append(message).expect("Can't write to a newly created file!");
+        self.head = new_head;
+        Some(new_head)
     }
 
     /// Get a new message from the Queue just after the specified tail
@@ -338,12 +334,15 @@ impl QueueBackend {
         }
         self.tail = 0;
         self.head = 0;
-        let mut path = self.config.data_directory.join(BACKEND_CHECKPOINT_FILE);
-        remove_file_if_exist(&path).unwrap();
-        path.set_file_name(TMP_BACKEND_CHECKPOINT_FILE);
+        let path = self.config.data_directory.join(BACKEND_CHECKPOINT_FILE);
         remove_file_if_exist(&path).unwrap();
     }
 
+    pub fn delete(&mut self) {
+        self.files.write().clear();
+        let path = self.config.data_directory.join(BACKEND_CHECKPOINT_FILE);
+        remove_file_if_exist(&path).unwrap();
+    }
 
     fn recover(&mut self) {
         let path = self.config.data_directory.join(BACKEND_CHECKPOINT_FILE);
@@ -368,9 +367,11 @@ impl QueueBackend {
             }
         };
 
+
+        info!("[{}] checkpoint loaded: {:?}", self.config.name, backend_checkpoint);
+
         let mut locked_files = self.files.write();
         for (file_num, file_checkpoint) in backend_checkpoint.files {
-            info!("[{}] recovering file: {}", self.config.name, file_num);
             let queue_file = Box::new(QueueFile::open(
                 &self.config, file_num, file_checkpoint));
             locked_files.insert(file_num, queue_file);
@@ -406,7 +407,7 @@ impl QueueBackend {
 
         match result {
             Ok(_) => {
-                info!("[{:?}] checkpointed: {:?}", self.config.name, checkpoint);
+                info!("[{:?}] checkpointed: {:?}", self.config.name, checkpoint.files);
             }
             Err(error) => {
                 warn!("[{:?}] error writing checkpoint information: {}",

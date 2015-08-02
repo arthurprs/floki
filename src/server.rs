@@ -76,7 +76,7 @@ impl ServerBackend {
 
     fn delete_queue(&mut self, name: &str) {
         if let Some(q) = self.queues.remove(name) {
-            q.queue.as_mut().set_state(QueueState::Deleting);
+            q.queue.as_mut().delete();
             // TODO: connections on wait_list should return errors
         }
     }
@@ -201,7 +201,7 @@ impl Connection {
                 return Err(Status::InvalidArguments)
             };
             debug!("deleting message {:?} from {:?}", id, command_name);
-            if sq.queue.as_mut().delete(channel_name, id).is_none() {
+            if sq.queue.as_mut().ack(channel_name, id).is_none() {
                 return Err(Status::KeyNotFound)
             }
         } else {
@@ -270,7 +270,7 @@ impl Connection {
                 trace!("filled request with {} bytes, remaining: {}", bytes_read, self.request.remaining());
                 
                 if self.request.is_complete() {
-                    self.interest = EventSet::none();
+                    self.interest = EventSet::all() - EventSet::readable() - EventSet::writable();
                     event_loop.reregister(&self.stream, self.token, self.interest, PollOpt::level()).unwrap();
                     
                     debug!("dispatching request {:?} for token {:?}", self.request, self.token);
@@ -283,8 +283,6 @@ impl Connection {
                 }
             }
         }
-
-
 
         if events.is_writable() {
             let response = self.response.as_mut().expect("writable with None response");
@@ -323,7 +321,7 @@ impl Connection {
 
 impl Server {
     pub fn new(config: ServerConfig) -> (ServerHandler, EventLoop<ServerHandler>) {
-        let addr = SocketAddr::from_str("127.0.0.1:9797").unwrap();
+        let addr = SocketAddr::from_str(&config.bind_address).unwrap();
 
         debug!("binding tcp socket to {:?}", addr);
         let listener = TcpListener::bind(&addr).unwrap();
