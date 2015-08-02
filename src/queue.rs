@@ -308,9 +308,7 @@ impl Queue {
     pub fn maintenance(&mut self) {
         let smallest_tail = {
             let locked_channels = self.channels.read().unwrap();
-            locked_channels.values().fold(0, |st, ch| {
-                cmp::min(st, ch.lock().unwrap().tail)
-            })
+            locked_channels.values().map(|ch| ch.lock().unwrap().tail).min().unwrap_or(0)
         };
 
         let _ = self.backend_rlock.read();
