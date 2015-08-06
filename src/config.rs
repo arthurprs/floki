@@ -37,12 +37,12 @@ impl ServerConfig {
 
         let bind_address = config.get("bind_address").unwrap().as_str().unwrap();
         let data_directory = config.get("data_directory").unwrap().as_str().unwrap();
-        let segment_size_mb = config.get("segment_size_mb").unwrap().as_integer().unwrap();
+        let segment_size = config.get("segment_size").unwrap().as_integer().unwrap();
 
         ServerConfig {
             data_directory: data_directory.into(),
             bind_address: bind_address.into(),
-            segment_size: segment_size_mb as u64 * 1024 * 1024,
+            segment_size: segment_size as u64 * 1024 * 1024,
         }
     }
 

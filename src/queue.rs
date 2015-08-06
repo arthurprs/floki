@@ -192,6 +192,7 @@ impl Queue {
         for (_, channel) in &mut*self.channels.write().unwrap() {
             let mut locked_channel = channel.lock().unwrap();
             locked_channel.tail = 0;
+            locked_channel.in_flight.clear();
         }
         self.set_state(QueueState::Ready);
         self.checkpoint();

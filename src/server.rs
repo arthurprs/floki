@@ -44,20 +44,16 @@ struct ServerQueue {
 }
 
 #[derive(Debug)]
-struct ServerBackend {
-    config: ServerConfig,
-    queues: HashMap<String, ServerQueue>,
-}
-
-#[derive(Debug)]
 pub enum NotifyMessage {
     Response(ResponseBuffer),
     Available(Arc<ServerQueue>),
 }
 
+// #[derive(Debug)]
 pub struct Server {
+    config: ServerConfig,
+    queues: HashMap<String, ServerQueue>,
     listener: TcpListener,
-    backend: ServerBackend,
     thread_pool: ThreadPool
 }
 
@@ -68,7 +64,7 @@ pub struct ServerHandler {
 
 type ResponseResult = Result<ResponseBuffer, Status>;
 
-impl ServerBackend {
+impl Server {
     #[inline]
     fn get_queue(&self, name: &str) -> Option<&ServerQueue> {
         self.queues.get(name)
@@ -130,10 +126,10 @@ impl Connection {
         }
     }
 
-    fn get(&self, backend: &mut ServerBackend, opcode: OpCode, key_str_slice: &str) -> ResponseResult {
+    fn get(&self, server: &mut Server, opcode: OpCode, key_str_slice: &str) -> ResponseResult {
         let (queue_name, channel_name_opt) = Self::split_colon(key_str_slice);
         let channel_name = channel_name_opt.unwrap();
-        let sq_opt = backend.get_queue(queue_name);
+        let sq_opt = server.get_queue(queue_name);
         if let Some(sq) = sq_opt {
             if let Some(message) = sq.queue.as_mut().get(channel_name) {
                 if let Some(send_file) = message.send_file_opt {
@@ -152,9 +148,9 @@ impl Connection {
         }
     }
 
-    fn put(&self, backend: &mut ServerBackend, opcode: OpCode, key_str_slice: &str, value_slice: &[u8]) -> ResponseResult {
+    fn put(&self, server: &mut Server, opcode: OpCode, key_str_slice: &str, value_slice: &[u8]) -> ResponseResult {
         let (queue_name, channel_name_opt) = Self::split_colon(key_str_slice);
-        let sq = backend.get_or_create_queue(queue_name);
+        let sq = server.get_or_create_queue(queue_name);
 
         if let Some(channel_name) = channel_name_opt {
             info!("creating queue {:?} channel {:?}", queue_name, channel_name);
@@ -167,28 +163,28 @@ impl Connection {
         Ok(ResponseBuffer::new_set_response())
     }
 
-    fn delete(&self, backend: &mut ServerBackend, opcode: OpCode, key_str_slice: &str) -> ResponseResult {
+    fn delete(&self, server: &mut Server, opcode: OpCode, key_str_slice: &str) -> ResponseResult {
         let (queue_name, _opt) = Self::split_colon(key_str_slice);
 
         let (command_name, id_str_opt) = Self::split_colon(_opt.unwrap());
         if command_name.starts_with('_') {
             match command_name {
                 "_purge" => {
-                    if let Some(sq) = backend.get_queue(queue_name) {
+                    if let Some(sq) = server.get_queue(queue_name) {
                         sq.queue.as_mut().purge();
                     } else {
                         return Err(Status::KeyNotFound);
                     }
                 },
                 "_delete" => {
-                    backend.delete_queue(queue_name);
+                    server.delete_queue(queue_name);
                 },
                 _ => return Err(Status::InvalidArguments)
             }
             return Ok(ResponseBuffer::new(opcode, Status::NoError));
         }
 
-        let sq = if let Some(queue) = backend.get_queue(queue_name) {
+        let sq = if let Some(queue) = server.get_queue(queue_name) {
             queue
         } else {
             return Err(Status::KeyNotFound)
@@ -213,7 +209,7 @@ impl Connection {
         Ok(ResponseBuffer::new(opcode, Status::NoError))
     }
 
-    fn dispatch(&mut self, backend: &mut ServerBackend) -> ResponseBuffer {
+    fn dispatch(&mut self, server: &mut Server) -> ResponseBuffer {
         let opcode = self.request.opcode();
 
         let key_str_slice = str::from_utf8(self.request.key_slice()).unwrap();
@@ -224,13 +220,13 @@ impl Connection {
         let response_result = match opcode {
             OpCode::Get | OpCode::GetK | OpCode::GetQ | OpCode::GetKQ
             if value_slice.is_empty() && !key_str_slice.is_empty() => {
-                self.get(backend, opcode, key_str_slice)
+                self.get(server, opcode, key_str_slice)
             }
             OpCode::Set if !key_str_slice.is_empty() => {
-                self.put(backend, opcode, key_str_slice, value_slice)
+                self.put(server, opcode, key_str_slice, value_slice)
             }
             OpCode::Delete if !key_str_slice.is_empty() && value_slice.is_empty() => {
-                self.delete(backend, opcode, key_str_slice)
+                self.delete(server, opcode, key_str_slice)
             }
             OpCode::NoOp if key_str_slice.is_empty() && value_slice.is_empty() => {
                 Ok(ResponseBuffer::new(opcode, Status::NoError))
@@ -274,7 +270,7 @@ impl Connection {
                     event_loop.reregister(&self.stream, self.token, self.interest, PollOpt::level()).unwrap();
                     
                     debug!("dispatching request {:?} for token {:?}", self.request, self.token);
-                    let response = self.dispatch(&mut server.backend);
+                    let response = self.dispatch(server);
                     self.request.clear();
                     self.notify(server, event_loop, NotifyMessage::Response(response));
                     break
@@ -332,10 +328,8 @@ impl Server {
 
         let server = Server {
             listener: listener,
-            backend: ServerBackend {
-                config: config,
-                queues: Default::default(),
-            },
+            config: config,
+            queues: Default::default(),
             thread_pool: ThreadPool::new(num_threads)
         };
 
