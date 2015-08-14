@@ -14,10 +14,10 @@ threadpool = "*"
 clock_ticks = "*"
 num_cpus = "*"
 fnv = "*"
-spin = "*"
+linked-hash-map = "*"
 
-[dependencies.linked-hash-map]
-git="https://github.com/arthurprs/linked-hash-map.git"
+[dependencies.spin]
+git="https://github.com/mvdnes/spinlock-rs.git"
 
 [dependencies.vec_map]
 version="*"

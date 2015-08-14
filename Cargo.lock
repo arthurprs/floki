@@ -5,13 +5,13 @@ dependencies = [
  "clock_ticks 0.0.6 (registry+https://github.com/rust-lang/crates.io-index)",
  "env_logger 0.3.1 (registry+https://github.com/rust-lang/crates.io-index)",
  "fnv 1.0.0 (registry+https://github.com/rust-lang/crates.io-index)",
- "linked-hash-map 0.0.6 (git+https://github.com/arthurprs/linked-hash-map.git)",
+ "linked-hash-map 0.0.6 (registry+https://github.com/rust-lang/crates.io-index)",
  "log 0.3.1 (registry+https://github.com/rust-lang/crates.io-index)",
  "mio 0.4.1 (registry+https://github.com/rust-lang/crates.io-index)",
  "nix 0.3.9 (registry+https://github.com/rust-lang/crates.io-index)",
  "num_cpus 0.2.6 (registry+https://github.com/rust-lang/crates.io-index)",
  "rustc-serialize 0.3.15 (registry+https://github.com/rust-lang/crates.io-index)",
- "spin 0.3.1 (registry+https://github.com/rust-lang/crates.io-index)",
+ "spin 0.3.1 (git+https://github.com/mvdnes/spinlock-rs.git)",
  "threadpool 0.1.4 (registry+https://github.com/rust-lang/crates.io-index)",
  "toml 0.1.21 (registry+https://github.com/rust-lang/crates.io-index)",
  "vec_map 0.3.0 (registry+https://github.com/rust-lang/crates.io-index)",
@@ -32,7 +32,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 
 [[package]]
 name = "bytes"
-version = "0.2.10"
+version = "0.2.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 
 [[package]]
@@ -73,7 +73,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 [[package]]
 name = "linked-hash-map"
 version = "0.0.6"
-source = "git+https://github.com/arthurprs/linked-hash-map.git#db6c3b4d341f1bb801780b8ba2f64a6646013cb2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
 
 [[package]]
 name = "log"
@@ -96,7 +96,7 @@ name = "mio"
 version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 dependencies = [
- "bytes 0.2.10 (registry+https://github.com/rust-lang/crates.io-index)",
+ "bytes 0.2.11 (registry+https://github.com/rust-lang/crates.io-index)",
  "clock_ticks 0.0.5 (registry+https://github.com/rust-lang/crates.io-index)",
  "libc 0.1.8 (registry+https://github.com/rust-lang/crates.io-index)",
  "log 0.3.1 (registry+https://github.com/rust-lang/crates.io-index)",
@@ -150,7 +150,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 [[package]]
 name = "spin"
 version = "0.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
+source = "git+https://github.com/mvdnes/spinlock-rs.git#5fd3b7adfda6eef438d837c14130ce6d3bba64a0"
 
 [[package]]
 name = "threadpool"

@@ -29,12 +29,21 @@ const FIRST_CLIENT: Token = Token(1);
 const BUSY_WAIT: Token = Token(1000000);
 
 #[derive(Debug)]
+pub enum NotifyMessage {
+    Wait,
+    Response,
+}
+
+
+#[derive(Debug)]
 struct Connection {
     token: Token,
     stream: TcpStream,
     request: RequestBuffer,
     response: Option<ResponseBuffer>,
-    interest: EventSet
+    interest: EventSet,
+    processing: bool,
+    chann: Sender<(Token, NotifyMessage)>
 }
 
 #[derive(Debug)]
@@ -43,18 +52,12 @@ struct ServerQueue {
     waiting_clients: Vec<Token>
 }
 
-#[derive(Debug)]
-pub enum NotifyMessage {
-    Response(ResponseBuffer),
-    Available(Arc<ServerQueue>),
-}
-
 // #[derive(Debug)]
 pub struct Server {
     config: ServerConfig,
     queues: HashMap<String, ServerQueue>,
     listener: TcpListener,
-    thread_pool: ThreadPool
+    thread_pool: ThreadPool,
 }
 
 pub struct ServerHandler {
@@ -209,7 +212,7 @@ impl Connection {
         Ok(ResponseBuffer::new(opcode, Status::NoError))
     }
 
-    fn dispatch(&mut self, server: &mut Server) -> ResponseBuffer {
+    fn dispatch(&mut self, server: &mut Server) {
         let opcode = self.request.opcode();
 
         let key_str_slice = str::from_utf8(self.request.key_slice()).unwrap();
@@ -234,19 +237,24 @@ impl Connection {
             _ => Err(Status::InvalidArguments)
         };
 
-        match response_result {
+        self.response = Some(match response_result {
             Ok(response) => response,
             Err(status) => ResponseBuffer::new(opcode, status)
-        }
+        });
+
+
+        self.chann.send((self.token, NotifyMessage::Response));
     }
 
-    fn new(token: Token, stream: TcpStream) -> Connection {
+    fn new(token: Token, stream: TcpStream, chann: Sender<(Token, NotifyMessage)>) -> Connection {
         Connection {
             stream: stream,
             token: token,
             request: RequestBuffer::new(),
             response: None,
-            interest: EventSet::all() - EventSet::writable()
+            interest: EventSet::all() - EventSet::writable(),
+            processing: false,
+            chann: chann,
         }
     }
 
@@ -270,9 +278,12 @@ impl Connection {
                     event_loop.reregister(&self.stream, self.token, self.interest, PollOpt::level()).unwrap();
                     
                     debug!("dispatching request {:?} for token {:?}", self.request, self.token);
-                    let response = self.dispatch(server);
-                    self.request.clear();
-                    self.notify(server, event_loop, NotifyMessage::Response(response));
+                    self.processing = true;
+                    let server_ptr: &'static mut Server = unsafe { mem::transmute(server as *mut _) };
+                    let connection_ptr: &'static mut Self = unsafe { mem::transmute(self as *mut _) };
+                    server.thread_pool.execute(move || {
+                        connection_ptr.dispatch(server_ptr);
+                    });
                     break
                 } else {
                     // keep reading
@@ -304,8 +315,11 @@ impl Connection {
 
     fn notify(&mut self, server: &mut Server, event_loop: &mut EventLoop<ServerHandler>, msg: NotifyMessage) -> bool {
         match msg {
-            NotifyMessage::Response(response) => {
-                self.response = Some(response);
+            NotifyMessage::Response => {
+                assert!(self.processing);
+                assert!(self.response.is_some());
+                self.request.clear();
+                self.processing = false;
                 self.interest = EventSet::all() - EventSet::readable();
                 event_loop.reregister(&self.stream, self.token, self.interest, PollOpt::level()).unwrap();
             }
@@ -354,17 +368,10 @@ impl Server {
             // Don't buffer output in TCP - kills latency sensitive benchmarks
             // TODO: use TCP_CORK
             stream.set_nodelay(true).unwrap();
-            // {
-            //     use std::os::unix::io::AsRawFd;
-            //     use nix::sys::socket;
-            //     socket::setsockopt(
-            //         stream.as_raw_fd(), socket::SockLevel::Tcp, socket::sockopt::TcpNoDelay, &true
-            //     ).unwrap();
-            // }
 
-            let token = connections.insert_with(|token| Connection::new(token, stream)).unwrap();
+            let token = connections.insert_with(
+                |token| Connection::new(token, stream, event_loop.channel())).unwrap();
 
-            connections[token].token = token;
             debug!("assigned token {:?} to client {:?}", token, connection_addr);
 
             event_loop.register_opt(
