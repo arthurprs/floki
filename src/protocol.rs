@@ -330,6 +330,11 @@ impl ResponseBuffer {
         response
     }
 
+    pub fn clear(&mut self) {
+        self.body.clear();
+        self.bytes_written = 0;
+    }
+
     pub fn is_complete(&self) -> bool {
         self.bytes_written == self.header.get_total_len()
     }

@@ -34,7 +34,6 @@ pub enum NotifyMessage {
     Response,
 }
 
-
 #[derive(Debug)]
 struct Connection {
     token: Token,
@@ -42,8 +41,9 @@ struct Connection {
     request: RequestBuffer,
     response: Option<ResponseBuffer>,
     interest: EventSet,
+    chann: Sender<(Token, NotifyMessage)>,
     processing: bool,
-    chann: Sender<(Token, NotifyMessage)>
+    hup: bool,
 }
 
 #[derive(Debug)]
@@ -243,7 +243,7 @@ impl Connection {
         });
 
 
-        self.chann.send((self.token, NotifyMessage::Response));
+        self.chann.send((self.token, NotifyMessage::Response)).unwrap();
     }
 
     fn new(token: Token, stream: TcpStream, chann: Sender<(Token, NotifyMessage)>) -> Connection {
@@ -253,8 +253,9 @@ impl Connection {
             request: RequestBuffer::new(),
             response: None,
             interest: EventSet::all() - EventSet::writable(),
-            processing: false,
             chann: chann,
+            processing: false,
+            hup: false,
         }
     }
 
@@ -262,7 +263,8 @@ impl Connection {
         if events.is_hup() || events.is_error() {
             debug!("received events {:?} for token {:?}", events,  self.token);
             event_loop.deregister(&self.stream).unwrap();
-            return false
+            self.hup = true;
+            return self.processing
         }
 
         if events.is_readable() {
@@ -314,6 +316,10 @@ impl Connection {
     }
 
     fn notify(&mut self, server: &mut Server, event_loop: &mut EventLoop<ServerHandler>, msg: NotifyMessage) -> bool {
+        if self.hup {
+            return false;
+        }
+
         match msg {
             NotifyMessage::Response => {
                 assert!(self.processing);
