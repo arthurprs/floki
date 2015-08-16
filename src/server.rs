@@ -215,7 +215,7 @@ impl Connection {
     fn dispatch(&mut self, server: &mut Server) {
         let opcode = self.request.opcode();
 
-        let key_str_slice = str::from_utf8(self.request.key_slice()).unwrap();
+        let key_str_slice = unsafe { str::from_utf8_unchecked(self.request.key_slice()) };
         let value_slice = self.request.value_slice();
 
         debug!("dispatch {:?} {:?} {:?} {:?}", self.token, opcode, key_str_slice, value_slice);

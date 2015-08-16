@@ -151,14 +151,14 @@ impl QueueFile {
         // experiment with tcp_cork to check if it helps
         let message = Message {
             id: id,
-            body: body,
-            send_file_opt: None,
-            // body: b"",
-            // send_file_opt: Some((
-            //     self.file.as_raw_fd(),
-            //     (id - self.tail + size_of::<MessageHeader>() as u64) as usize,
-            //     header.len as usize
-            // ))
+            // body: body,
+            // send_file_opt: None,
+            body: b"",
+            send_file_opt: Some((
+                self.file.as_raw_fd(),
+                (id - self.tail + size_of::<MessageHeader>() as u64) as usize,
+                header.len as usize
+            ))
         };
 
         Ok((id + message_total_len as u64, message))

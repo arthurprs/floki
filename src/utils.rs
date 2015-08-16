@@ -15,7 +15,7 @@ pub fn remove_file_if_exist<P: AsRef<Path>>(path: P) -> io::Result<()> {
         Err(ref err) if err.kind() == io::ErrorKind::NotFound => {
             Ok(())
         }
-        result @ _ => result
+        result => result
     }
 }
 
@@ -24,7 +24,7 @@ pub fn remove_dir_if_exist<P: AsRef<Path>>(path: P) -> io::Result<()> {
         Err(ref err) if err.kind() == io::ErrorKind::NotFound => {
             Ok(())
         }
-        result @ _ => result
+        result => result
     }
 }
 
@@ -33,6 +33,6 @@ pub fn create_dir_if_not_exist<P: AsRef<Path>>(path: P) -> io::Result<()> {
         Err(ref err) if err.kind() == io::ErrorKind::AlreadyExists => {
             Ok(())
         }
-        result @ _ => result
+        result => result
     }
 }

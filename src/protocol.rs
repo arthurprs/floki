@@ -175,6 +175,7 @@ pub struct RequestBuffer {
 #[derive(Debug)]
 pub struct ResponseBuffer {
     header: ResponseHeader,
+    extras: [u8; 4],
     body: Vec<u8>,
     bytes_written: usize,
     pub send_file_opt: Option<(RawFd, usize)>,
@@ -257,6 +258,7 @@ impl ResponseBuffer {
     pub fn new(opcode: OpCode, status: Status) -> ResponseBuffer {
         let mut response = ResponseBuffer {
             header: unsafe { mem::zeroed() },
+            extras: unsafe { mem::zeroed() },
             body: Vec::new(),
             bytes_written: 0,
             send_file_opt: None
@@ -270,6 +272,7 @@ impl ResponseBuffer {
     pub fn new_set_response() -> ResponseBuffer {
         let mut response = ResponseBuffer {
             header: unsafe { mem::zeroed() },
+            extras: unsafe { mem::zeroed() },
             body: Vec::new(),
             bytes_written: 0,
             send_file_opt: None
@@ -282,13 +285,14 @@ impl ResponseBuffer {
     pub fn new_get_response(request: &RequestBuffer, cas: u64, value: &[u8]) -> ResponseBuffer {
         let mut response = ResponseBuffer {
             header: unsafe { mem::zeroed() },
+            extras: unsafe { mem::zeroed() },
             body: Vec::new(),
             bytes_written: 0,
             send_file_opt: None
         };
         response.header.magic = RESPONSE_MAGIC;
         response.header.opcode = request.header.opcode;
-        response.header.cas = cas;
+        response.header.cas = cas.to_be();
         let key: &[u8] = if request.opcode().include_key() {
             request.key_slice()
         } else {
@@ -298,8 +302,7 @@ impl ResponseBuffer {
         response.header.set_extras_len(4);
         response.header.set_key_len(key.len());
         response.header.set_total_body_len(total_body_len);
-        response.body.reserve_exact(total_body_len);
-        response.body.write_all(b"\0\0\0\0").unwrap();
+        response.body.reserve_exact(total_body_len - 4);
         response.body.write_all(key).unwrap();
         response.body.write_all(value).unwrap();
         response
@@ -308,24 +311,24 @@ impl ResponseBuffer {
     pub fn new_get_response_fd(request: &RequestBuffer, cas: u64, fd: RawFd, f_offset: usize, f_count: usize) -> ResponseBuffer {
         let mut response = ResponseBuffer {
             header: unsafe { mem::zeroed() },
+            extras: unsafe { mem::zeroed() },
             body: Vec::new(),
             bytes_written: 0,
             send_file_opt: Some((fd, f_offset))
         };
         response.header.magic = RESPONSE_MAGIC;
         response.header.opcode = request.header.opcode;
-        response.header.cas = cas;
+        response.header.cas = cas.to_be();
         let key: &[u8] = if request.opcode().include_key() {
             request.key_slice()
         } else {
             b""
         };
-        let internal_body_len = 4 + key.len();
+        let internal_body_len = key.len();
         response.header.set_extras_len(4);
         response.header.set_key_len(key.len());
-        response.header.set_total_body_len(internal_body_len + f_count);
+        response.header.set_total_body_len(4 + internal_body_len + f_count);
         response.body.reserve_exact(internal_body_len);
-        response.body.write_all(b"\0\0\0\0").unwrap();
         response.body.write_all(key).unwrap();
         response
     }
@@ -347,24 +350,24 @@ impl ResponseBuffer {
 impl Buf for ResponseBuffer {
     
     fn remaining(&self) -> usize {
-        if self.bytes_written < size_of::<ResponseHeader>() {
-            size_of::<RequestHeader>() - self.bytes_written
-        } else if self.bytes_written < size_of::<ResponseHeader>() + self.body.len() {
-            size_of::<ResponseHeader>() + self.body.len() - self.bytes_written
+        if self.bytes_written < size_of::<ResponseHeader>() + self.header.get_extras_len() {
+            size_of::<ResponseHeader>() + self.header.get_extras_len() - self.bytes_written
+        } else if self.bytes_written < size_of::<ResponseHeader>() + self.header.get_extras_len() + self.body.len() {
+            size_of::<ResponseHeader>() + self.header.get_extras_len() + self.body.len() - self.bytes_written
         } else {
-            self.header.get_total_len() - self.bytes_written
+            size_of::<ResponseHeader>() + self.header.get_total_body_len() - self.bytes_written
         }
     }
 
     fn bytes(&self) -> &[u8] {
         unsafe {
-            let u8_ptr = if self.bytes_written < size_of::<ResponseHeader>() {
+            let u8_ptr = if self.bytes_written < size_of::<ResponseHeader>() + self.header.get_extras_len() {
                 (&self.header as *const ResponseHeader as *const u8).offset(self.bytes_written as isize)
             } else {
-                if self.bytes_written < size_of::<ResponseHeader>() + self.body.len() {
-                    self.body.as_ptr().offset((self.bytes_written - size_of::<ResponseHeader>()) as isize)
+                if self.bytes_written < size_of::<ResponseHeader>() + self.header.get_extras_len() + self.body.len() {
+                    self.body.as_ptr().offset((self.bytes_written - size_of::<ResponseHeader>() - self.header.get_extras_len()) as isize)
                 } else {
-                    return b"";
+                    return b""
                 }
             };
             slice::from_raw_parts(u8_ptr, self.remaining())
@@ -372,9 +375,9 @@ impl Buf for ResponseBuffer {
     }
 
     fn advance(&mut self, cnt: usize) {
-        if self.bytes_written < size_of::<ResponseHeader>() &&
-                self.bytes_written + cnt >= size_of::<ResponseHeader>() {
-            debug_assert!(self.bytes_written + cnt == size_of::<ResponseHeader>());
+        if self.bytes_written < size_of::<ResponseHeader>() + self.header.get_extras_len() &&
+                self.bytes_written + cnt >= size_of::<ResponseHeader>() + self.header.get_extras_len() {
+            debug_assert!(self.bytes_written + cnt == size_of::<ResponseHeader>() + self.header.get_extras_len());
         }
         self.bytes_written += cnt;
     }
