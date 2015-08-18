@@ -103,7 +103,7 @@ impl Server {
 fn write_response(stream: &mut TcpStream, response: &mut ResponseBuffer) -> IoResult<usize> {
     let bytes = response.bytes();
     if bytes.is_empty() && response.remaining() != 0 {
-        trace!("response.bytes().is_empty() && response.remaining() != 0");
+        trace!("response.bytes().is_empty() && response.remaining() == {}", response.remaining());
         if let Some((fd, fd_offset)) = response.send_file_opt {
             let r = sendfile(stream.as_raw_fd(), fd, fd_offset, response.remaining());
             trace!("sendfile returned {}", r);
