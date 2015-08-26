@@ -3,3 +3,5 @@ data_directory="./test_data_dir"
 segment_size=256
 segments_prealocated=2
 checkpoint_interval=10
+awake_timeout=500
+maintenance_timeout=5000

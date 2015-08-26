@@ -17,7 +17,7 @@ fnv = "*"
 linked-hash-map = "*"
 
 [dependencies.spin]
-git="https://github.com/mvdnes/spinlock-rs.git"
+git="https://github.com/arthurprs/spinlock-rs.git"
 
 [dependencies.vec_map]
 version="*"

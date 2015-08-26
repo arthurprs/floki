@@ -1,21 +1,19 @@
-use std::ops::{Deref, DerefMut};
 use std::str::{self, FromStr};
 use std::net::{SocketAddr, lookup_host, SocketAddrV4};
-use std::io::{Read, Write};
-use std::io::Result as IoResult;
-use std::io::Error as IoError;
+use std::io::{Read, Write, Result as IoResult, Error as IoError};
+use std::os::unix::io::{AsRawFd, RawFd};
 use std::mem;
+use std::thread::{self, Thread, JoinHandle};
 use std::sync::{Arc, RwLock};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use spin::Mutex as SpinLock;
-use std::collections::{HashSet};
+use spin::{Mutex as SpinLock, RwLock as SpinRwLock};
+use std::collections::HashSet;
 use mio::tcp::{TcpStream, TcpListener};
-use mio::util::{Slab};
+use mio::util::Slab;
 use mio::{Buf, MutBuf, Token, EventLoop, EventSet, PollOpt, Timeout, Handler, Sender};
 use threadpool::ThreadPool;
 use num_cpus::get as get_num_cpus;
 use rustc_serialize::json;
-use std::os::unix::io::{AsRawFd, RawFd};
 
 use queue::*;
 use queue_backend::Message;
@@ -26,12 +24,15 @@ use utils::*;
 const SERVER: Token = Token(0);
 const FIRST_CLIENT: Token = Token(1);
 
-const BUSY_WAIT: Token = Token(1000000);
-
 #[derive(Debug)]
 pub enum NotifyMessage {
-    Wait,
     Response,
+}
+
+#[derive(Debug)]
+pub enum TimeoutMessage {
+    Awake,
+    Maintenance
 }
 
 #[derive(Debug)]
@@ -48,14 +49,14 @@ struct Connection {
 
 #[derive(Debug)]
 struct ServerQueue {
-    queue: Arc<Queue>,
-    waiting_clients: Vec<Token>
+    queue: Queue,
+    waiting_clients: SpinLock<Vec<Token>>
 }
 
 // #[derive(Debug)]
 pub struct Server {
     config: ServerConfig,
-    queues: HashMap<String, ServerQueue>,
+    queues: SpinRwLock<HashMap<String, Arc<ServerQueue>>>,
     listener: TcpListener,
     thread_pool: ThreadPool,
 }
@@ -69,34 +70,38 @@ type ResponseResult = Result<ResponseBuffer, Status>;
 
 impl Server {
     #[inline]
-    fn get_queue(&self, name: &str) -> Option<&ServerQueue> {
-        self.queues.get(name)
+    fn get_queue(&self, name: &str) -> Option<Arc<ServerQueue>> {
+        self.queues.read().get(name).map(|q| q.clone())
     }
 
-    fn delete_queue(&mut self, name: &str) {
-        if let Some(q) = self.queues.remove(name) {
-            q.queue.as_mut().delete();
-            // TODO: connections on wait_list should return errors
+    fn delete_queue(&self, name: &str) -> Option<Arc<ServerQueue>> {
+        let result = self.queues.write().remove(name);
+        if let Some(ref sq) = result {
+            sq.queue.as_mut().delete();
         }
+        result
     }
 
     fn list_queues(&self) -> String {   
-        let queue_names: Vec<_> = self.queues.keys().collect();
+        let queue_names: Vec<_> = self.queues.read().keys().cloned().collect();
         json::encode(&queue_names).unwrap()
     }
 
-    fn get_or_create_queue(&mut self, name: &str) -> &ServerQueue {
+    fn get_or_create_queue(&self, name: &str) -> Arc<ServerQueue> {
+        if let Some(sq) = self.get_queue(name) {
+            return sq
+        }
         let server_config = &self.config;
-        self.queues.entry(name.into()).or_insert_with(|| {
+        self.queues.write().entry(name.into()).or_insert_with(|| {
             info!("Creating queue {:?}", name);
             let inner_queue = Queue::new(server_config.new_queue_config(name), true);
             trace!("done creating queue {:?}", name);
 
-            ServerQueue {
-                queue: Arc::new(inner_queue),
+            Arc::new(ServerQueue {
+                queue: inner_queue,
                 waiting_clients: Default::default(),
-            }
-        })
+            })
+        }).clone()
     }
 }
 
@@ -122,14 +127,14 @@ fn write_response(stream: &mut TcpStream, response: &mut ResponseBuffer) -> IoRe
 
 impl Connection {
     fn split_colon(composed: &str) -> (&str, Option<&str>) {
-        if let Some(pos) = composed.find(":") {
+        if let Some(pos) = composed.find(':') {
             (&composed[..pos], Some(&composed[pos + 1..]))
         } else {
             (composed, None)
         }
     }
 
-    fn get(&self, server: &mut Server, opcode: OpCode, key_str_slice: &str) -> ResponseResult {
+    fn get(&self, server: &Server, opcode: OpCode, key_str_slice: &str) -> ResponseResult {
         let (queue_name, channel_name_opt) = Self::split_colon(key_str_slice);
         let channel_name = channel_name_opt.unwrap();
         let sq_opt = server.get_queue(queue_name);
@@ -143,6 +148,7 @@ impl Connection {
                 }
             } else {
                 debug!("queue {:?} channel {:?} has no messages", queue_name, channel_name);
+                sq.waiting_clients.lock().push(self.token);
                 Err(Status::KeyNotFound)
             }
         } else {
@@ -151,7 +157,7 @@ impl Connection {
         }
     }
 
-    fn put(&self, server: &mut Server, opcode: OpCode, key_str_slice: &str, value_slice: &[u8]) -> ResponseResult {
+    fn put(&self, server: &Server, opcode: OpCode, key_str_slice: &str, value_slice: &[u8]) -> ResponseResult {
         let (queue_name, channel_name_opt) = Self::split_colon(key_str_slice);
         let sq = server.get_or_create_queue(queue_name);
 
@@ -160,13 +166,14 @@ impl Connection {
             sq.queue.as_mut().create_channel(channel_name);
         } else {
             debug!("inserting into {:?} {:?}", key_str_slice, value_slice);
-            let id = sq.queue.as_mut().put(&Message{id:0, body: value_slice, send_file_opt: None}).unwrap();
+            let id = sq.queue.as_mut().put(&Message{id: 0, body: value_slice, send_file_opt: None}).unwrap();
             trace!("inserted message into {:?} with id {:?}", key_str_slice, id);
         }
+
         Ok(ResponseBuffer::new_set_response())
     }
 
-    fn delete(&self, server: &mut Server, opcode: OpCode, key_str_slice: &str) -> ResponseResult {
+    fn delete(&self, server: &Server, opcode: OpCode, key_str_slice: &str) -> ResponseResult {
         let (queue_name, _opt) = Self::split_colon(key_str_slice);
 
         let (command_name, id_str_opt) = Self::split_colon(_opt.unwrap());
@@ -180,7 +187,9 @@ impl Connection {
                     }
                 },
                 "_delete" => {
-                    server.delete_queue(queue_name);
+                    if let None = server.delete_queue(queue_name) {
+                        return Err(Status::KeyNotFound);
+                    }
                 },
                 _ => return Err(Status::InvalidArguments)
             }
@@ -192,6 +201,7 @@ impl Connection {
         } else {
             return Err(Status::KeyNotFound)
         };
+
         if let Some(id_str) = id_str_opt {
             let channel_name = command_name;
             let id = if let Ok(id) = id_str_opt.unwrap().parse() {
@@ -212,7 +222,7 @@ impl Connection {
         Ok(ResponseBuffer::new(opcode, Status::NoError))
     }
 
-    fn dispatch(&mut self, server: &mut Server) {
+    fn dispatch(&mut self, server: &Server) {
         let opcode = self.request.opcode();
 
         let key_str_slice = unsafe { str::from_utf8_unchecked(self.request.key_slice()) };
@@ -242,8 +252,20 @@ impl Connection {
             Err(status) => ResponseBuffer::new(opcode, status)
         });
 
-
         self.chann.send((self.token, NotifyMessage::Response)).unwrap();
+    }
+
+    fn dispatch_in_pool(&mut self, server: &Server) {
+        debug!("dispatching request {:?} for token {:?}", self.request, self.token);
+        assert!(!self.processing);
+        assert!(self.request.is_complete());
+        self.processing = true;
+        let connection_ptr: &'static mut Self = unsafe { mem::transmute(self as *mut _) };
+        let server_ptr: &'static mut Server = unsafe { mem::transmute(server as *const _) };
+        server.thread_pool.execute(move || {
+            debug_assert!(connection_ptr.processing);
+            connection_ptr.dispatch(server_ptr);
+        });
     }
 
     fn new(token: Token, stream: TcpStream, chann: Sender<(Token, NotifyMessage)>) -> Connection {
@@ -278,14 +300,7 @@ impl Connection {
                 if self.request.is_complete() {
                     self.interest = EventSet::all() - EventSet::readable() - EventSet::writable();
                     event_loop.reregister(&self.stream, self.token, self.interest, PollOpt::level()).unwrap();
-                    
-                    debug!("dispatching request {:?} for token {:?}", self.request, self.token);
-                    self.processing = true;
-                    let server_ptr: &'static mut Server = unsafe { mem::transmute(server as *mut _) };
-                    let connection_ptr: &'static mut Self = unsafe { mem::transmute(self as *mut _) };
-                    server.thread_pool.execute(move || {
-                        connection_ptr.dispatch(server_ptr);
-                    });
+                    self.dispatch_in_pool(server);
                     break
                 } else {
                     // keep reading
@@ -329,13 +344,21 @@ impl Connection {
                 self.interest = EventSet::all() - EventSet::readable();
                 event_loop.reregister(&self.stream, self.token, self.interest, PollOpt::level()).unwrap();
             }
-            _ => panic!("can't handle msg {:?}", msg)
+            //_ => panic!("can't handle msg {:?}", msg)
         }
         true
     }
 }
 
 impl Server {
+    fn maintenance_thread_fn(&self) {
+        // add code here
+    }
+
+    fn awaken_monitor_thread_fn(&self) {
+        // add code here
+    }
+
     pub fn new(config: ServerConfig) -> (ServerHandler, EventLoop<ServerHandler>) {
         let addr = SocketAddr::from_str(&config.bind_address).unwrap();
 
@@ -381,17 +404,23 @@ impl Server {
             debug!("assigned token {:?} to client {:?}", token, connection_addr);
 
             event_loop.register_opt(
-                &connections[token].stream, token,
+                &connections[token].stream,
+                token,
                 connections[token].interest,
                 PollOpt::level()
             ).unwrap();
         }
         true
     }
+
+    fn notify(&mut self, connections: &mut Slab<Connection>, event_loop: &mut EventLoop<ServerHandler>, msg: NotifyMessage) -> bool {
+        panic!("can't handle msg {:?}", msg);
+        // true
+    }
 }
 
 impl Handler for ServerHandler {
-    type Timeout = ();
+    type Timeout = TimeoutMessage;
     type Message = (Token, NotifyMessage);
 
     #[inline]
@@ -419,7 +448,7 @@ impl Handler for ServerHandler {
         let (token, message) = composed_msg;
         trace!("notify event for token {:?} with {:?}", token, message);
         let is_ok = match token {
-            SERVER => unreachable!(),
+            SERVER => self.server.notify(&mut self.connections, event_loop, message),
             token => if let Some(connection) = self.connections.get_mut(token) {
                 connection.notify(&mut self.server, event_loop, message)
             } else {
@@ -435,7 +464,10 @@ impl Handler for ServerHandler {
     }
 
     fn timeout(&mut self, event_loop: &mut EventLoop<Self>, timeout: Self::Timeout) {
-        warn!("timeout {:?}", timeout);
+        match timeout {
+            TimeoutMessage::Awake => (),
+            TimeoutMessage::Maintenance => ()
+        }
     }
 
     fn interrupted(&mut self, event_loop: &mut EventLoop<Self>) {

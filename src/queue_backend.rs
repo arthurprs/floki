@@ -147,7 +147,6 @@ impl QueueFile {
         };
 
         // Looks like sendfile is slower for msgs w/ len < 512s
-        // possibly because it only needs ~2 system calls instead of ~3
         // experiment with tcp_cork to check if it helps
         let message = Message {
             id: id,

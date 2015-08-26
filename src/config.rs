@@ -14,6 +14,8 @@ pub struct ServerConfig {
     pub data_directory: PathBuf,
     pub bind_address: String,
     pub segment_size: u64,
+    pub awake_timeout: u32,
+    pub maintenance_timeout: u32,
 }
 
 #[derive(Debug)]
@@ -38,11 +40,15 @@ impl ServerConfig {
         let bind_address = config.get("bind_address").unwrap().as_str().unwrap();
         let data_directory = config.get("data_directory").unwrap().as_str().unwrap();
         let segment_size = config.get("segment_size").unwrap().as_integer().unwrap();
+        let awake_timeout = config.get("awake_timeout").unwrap().as_integer().unwrap();
+        let maintenance_timeout = config.get("maintenace_timeout").unwrap().as_integer().unwrap();
 
         ServerConfig {
             data_directory: data_directory.into(),
             bind_address: bind_address.into(),
             segment_size: segment_size as u64 * 1024 * 1024,
+            awake_timeout: awake_timeout as u32,
+            maintenance_timeout: maintenance_timeout as u32,
         }
     }
 
