@@ -102,6 +102,10 @@ impl Queue {
         self.state = new_state;
     }
 
+    pub fn tail(&self) -> u64 {
+        self.backend.tail()
+    }
+
     pub fn create_channel<S>(&mut self, channel_name: S) -> bool
             where String: From<S> {
         let channel_name: String = channel_name.into();
@@ -153,8 +157,8 @@ impl Queue {
                     expiration: self.clock + self.config.time_to_live,
                     retry: 0
                 };
-                locked_channel.in_flight.insert(message.id, state);
-                trace!("[{}] fetched msg {} from backend", self.config.name, message.id);
+                locked_channel.in_flight.insert(message.id(), state);
+                trace!("[{}] fetched msg {} from backend", self.config.name, message.id());
                 return Some(message)
             }
         }
@@ -162,7 +166,7 @@ impl Queue {
     }
 
     /// all calls are serialized internally
-    pub fn put(&mut self, message: &Message) -> Option<u64> {
+    pub fn put(&mut self, message: &[u8]) -> Option<u64> {
         let _ = self.backend_wlock.lock().unwrap();
         trace!("[{}] putting message", self.config.name);
         self.backend.put(message)

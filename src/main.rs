@@ -5,7 +5,9 @@
 #![feature(path_ext)]
 #![feature(libc)]
 #![feature(hashmap_hasher)]
+#![feature(drain)]
 #![cfg_attr(test, feature(test))]
+#![feature(str_match_indices)]
 
 #[cfg(test)] extern crate test;
 extern crate env_logger;
@@ -22,6 +24,7 @@ extern crate vec_map;
 extern crate fnv;
 extern crate spin;
 extern crate libc;
+extern crate rand;
 
 mod config;
 mod queue;

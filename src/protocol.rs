@@ -2,6 +2,7 @@ use mio::{Buf, MutBuf};
 use std::slice;
 use std::mem::{self, size_of};
 use std::io::Write;
+use std::str;
 use std::fmt;
 use std::os::unix::io::RawFd;
 
@@ -168,6 +169,7 @@ impl ResponseHeader {
 #[derive(Debug)]
 pub struct RequestBuffer {
     body: Vec<u8>,
+    arg_offsets: Vec<(usize, usize)>,
     bytes_read: usize
 }
 
@@ -184,8 +186,20 @@ impl RequestBuffer {
         unsafe { v.set_len(4096) };
         RequestBuffer {
             body: v,
+            arg_offsets: Vec::new(),
             bytes_read: 0,
         }
+    }
+
+    fn parse_args(&mut self) {
+        let mut start = 0;
+        let mut arg_offsets = Vec::new();
+        for (colon_offset, _) in self.key_str().match_indices(':') {
+            arg_offsets.push((start, colon_offset));
+            start = colon_offset + 1;
+        }
+        arg_offsets.push((start, self.key_str().len()));
+        self.arg_offsets = arg_offsets;
     }
 
     #[inline(always)]
@@ -201,6 +215,24 @@ impl RequestBuffer {
     pub fn clear(&mut self) {
         unsafe { self.body.set_len(4096) };
         self.bytes_read = 0;
+    }
+
+    pub fn arg_count(&self) -> usize {
+        self.arg_offsets.len()
+    }
+
+    pub fn arg_str(&self, arg_number: usize) -> Option<&str> {
+        self.arg_offsets.get(arg_number).map(|&(start, end)| {
+            unsafe { str::from_utf8_unchecked(&self.key_slice()[start..end]) }
+        })
+    }
+
+    pub fn arg_uint(&self, arg_number: usize) -> Option<u64> {
+        self.arg_str(arg_number).and_then(|s| s.parse::<u64>().ok())
+    }
+
+    pub fn key_str(&self) -> &str {
+        unsafe { str::from_utf8_unchecked(self.key_slice()) }
     }
     
     pub fn key_slice(&self) -> &[u8] {
@@ -249,6 +281,9 @@ impl MutBuf for RequestBuffer {
             unsafe { self.body.set_len(total_len) };
         }
         self.bytes_read += cnt;
+        if self.is_complete() {
+            self.parse_args();
+        }
     }
 
     fn mut_bytes(&mut self) -> &mut [u8] {
@@ -311,7 +346,7 @@ impl ResponseBuffer {
         response
     }
 
-    pub fn new_get_response_fd(request: &RequestBuffer, cas: u64, fd: RawFd, f_offset: usize, f_count: usize) -> ResponseBuffer {
+    pub fn new_get_response_fd(request: &RequestBuffer, cas: u64, fd: RawFd, f_offset: usize, f_size: usize) -> ResponseBuffer {
         let mut response = ResponseBuffer {
             body: Vec::with_capacity(128),
             bytes_written: 0,
@@ -330,7 +365,7 @@ impl ResponseBuffer {
         let internal_body_len = 4 + key.len();
         response.header_mut().set_extras_len(4);
         response.header_mut().set_key_len(key.len());
-        response.header_mut().set_total_body_len(internal_body_len + f_count);
+        response.header_mut().set_total_body_len(internal_body_len + f_size);
         response.body.reserve(internal_body_len);
         response.body.write_all(b"\0\0\0\0").unwrap();
         response.body.write_all(key).unwrap();

@@ -4,6 +4,7 @@ use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::os::unix::io::AsRawFd;
 use std::collections::BTreeMap;
+use std::sync::Arc;
 use nix::c_void;
 use nix::sys::mman;
 use spin::RwLock as SpinRwLock;
@@ -18,11 +19,38 @@ use config::*;
 use utils::*;
 
 #[derive(Debug)]
-pub struct Message<'a> {
-    pub id: u64,
-    pub body: &'a[u8],
-    pub send_file_opt: Option<(RawFd, usize, usize)>
+struct InnerMessage {
+    id: u64,
+    len: u32,
+    mmap_ptr: *mut u8,
+    file_offset: u64,
 }
+
+#[derive(Debug)]
+pub struct Message {
+    file: Arc<QueueFile>,
+    inner: InnerMessage,
+}
+
+impl Message {
+    pub fn id(&self) -> u64 {
+        self.inner.id
+    }
+
+    pub fn len(&self) -> u32 {
+        self.inner.len
+    }
+
+    pub fn body(&self) -> &[u8] {
+        unsafe { slice::from_raw_parts(self.inner.mmap_ptr, self.inner.len as usize) }
+    }
+
+    pub fn file_info(&self) -> (RawFd, u64) {
+        (self.file.file.as_raw_fd(), self.inner.file_offset as u64)
+    }
+}
+
+unsafe impl Send for Message {}
 
 #[repr(packed)]
 struct MessageHeader {
@@ -55,12 +83,13 @@ pub struct QueueFile {
     tail: u64,
     head: u64,
     closed: bool,
+    deleted: bool,
 }
 
 #[derive(Debug)]
 pub struct QueueBackend {
     config: Rc<QueueConfig>,
-    files: SpinRwLock<VecMap<Box<QueueFile>>>,
+    files: SpinRwLock<VecMap<Arc<QueueFile>>>,
     head: u64,
     tail: u64
 }
@@ -122,10 +151,11 @@ impl QueueFile {
             // dirty_messages: 0,
             // dirty_bytes: 0,
             closed: false,
+            deleted: false,
         }
     }
     
-    fn get(&self, id: u64) -> Result<(u64, Message), bool> {
+    fn get(&self, id: u64) -> Result<(u64, InnerMessage), bool> {
         if id >= self.head {
             return Err(self.closed)
         }
@@ -139,32 +169,20 @@ impl QueueFile {
         assert!(header.id + size_of::<MessageHeader>() as u64 + header.len as u64 <= self.head);
 
         let message_total_len = (size_of::<MessageHeader>() + header.len as usize) as u64;
-        
-        let body = unsafe {
-            slice::from_raw_parts(
-                self.file_mmap.offset((id - self.tail + size_of::<MessageHeader>() as u64) as isize),
-                header.len as usize)
-        };
+        let mmap_ptr = unsafe { self.file_mmap.offset((id - self.tail + size_of::<MessageHeader>() as u64) as isize) };
 
-        // Looks like sendfile is slower for msgs w/ len < 512s
-        // experiment with tcp_cork to check if it helps
-        let message = Message {
+        let message = InnerMessage {
             id: id,
-            // body: body,
-            // send_file_opt: None,
-            body: b"",
-            send_file_opt: Some((
-                self.file.as_raw_fd(),
-                (id - self.tail + size_of::<MessageHeader>() as u64) as usize,
-                header.len as usize
-            ))
+            len: header.len,
+            mmap_ptr: mmap_ptr,
+            file_offset: id - self.tail + size_of::<MessageHeader>() as u64,
         };
 
         Ok((id + message_total_len as u64, message))
     }
 
-    fn append(&mut self, message: &Message) -> Option<u64> {
-        let message_total_len = size_of::<MessageHeader>() + message.body.len();
+    fn append(&mut self, message: &[u8]) -> Option<u64> {
+        let message_total_len = size_of::<MessageHeader>() + message.len();
         let file_offset = self.head - self.tail;
 
         if file_offset + message_total_len as u64 > self.file_size {
@@ -174,7 +192,7 @@ impl QueueFile {
 
         let header = MessageHeader {
             id: self.head,
-            len: message.body.len() as u32
+            len: message.len() as u32
         };
 
         unsafe {
@@ -183,9 +201,9 @@ impl QueueFile {
                 self.file_mmap.offset(file_offset as isize),
                 size_of::<MessageHeader>());
             ptr::copy_nonoverlapping(
-                message.body.as_ptr(),
+                message.as_ptr(),
                 self.file_mmap.offset(file_offset as isize + size_of::<MessageHeader>() as isize),
-                message.body.len());
+                message.len());
         }
         // unsafe {
         //     self.file.write_all(slice::from_raw_parts::<u8>(
@@ -222,17 +240,18 @@ impl QueueFile {
         checkpoint
     }
 
-    fn purge(mut self) {
-        let mut base_path = mem::replace(&mut self.base_path, PathBuf::new());
-        drop(self);
-        base_path.set_extension(DATA_EXTENSION);
-        remove_file_if_exist(&base_path).unwrap();
+    fn purge(&mut self) {
+        assert!(!self.deleted);
+        self.deleted = true;
     }
 }
 
 impl Drop for QueueFile {
     fn drop(&mut self) {
         mman::munmap(self.file_mmap as *mut c_void, self.file_size as u64).unwrap();
+        if self.deleted {
+            remove_file_if_exist(&self.base_path).unwrap();
+        }
     }
 }
 
@@ -253,27 +272,29 @@ impl QueueBackend {
     /// this relies on Box beeing at the same place even if this vector is reallocated
     /// also, this doen't do any ref count, so one must make sure the mmap is alive while there
     /// are messages pointing to this QueueFile
-    fn get_queue_file(&self, index: usize) -> Option<&QueueFile> {
-        let files = self.files.read();
-        match files.get(&index) {
-            Some(file_box_ref) => unsafe {
-                Some(mem::transmute(&(**file_box_ref)))
-            },
-            _ => None
-        }
+    #[inline]
+    fn get_queue_file(&self, index: usize) -> Option<Arc<QueueFile>> {
+        self.files.read().get(&index).map(|q| q.clone())
     }
 
+    #[inline]
     fn get_queue_file_mut(&mut self, index: usize) -> Option<&mut QueueFile> {
-        unsafe { mem::transmute(self.get_queue_file(index)) }
+        self.files.read().get(&index).map(|file_box_ref| {
+            unsafe { mem::transmute(&**file_box_ref as *const QueueFile) }
+        })
     }
 
     pub fn files_count(&self) -> usize {
         self.files.read().len()
     }
 
+    pub fn tail(&self) -> u64 {
+        self.tail
+    }
+
     /// Put a message at the end of the Queue, return the message id if succesfull
     /// Note: it's the caller responsability to serialize write calls
-    pub fn put(&mut self, message: &Message) -> Option<u64> {
+    pub fn put(&mut self, message: &[u8]) -> Option<u64> {
         let mut head_file = (self.head / self.config.segment_size) as usize;
         let result = if let Some(q_file) = self.get_queue_file_mut(head_file) {
             q_file.append(message)
@@ -291,9 +312,9 @@ impl QueueBackend {
         }
 
         let q_file: &mut QueueFile = {
-            let mut queue_file = Box::new(QueueFile::create(
+            let queue_file = Arc::new(QueueFile::create(
                 &self.config, head_file));
-            let q_file_ptr = (&mut *queue_file) as *mut QueueFile;
+            let q_file_ptr = (&*queue_file) as *const QueueFile;
             assert!(self.files.write().insert(head_file, queue_file).is_none());
             unsafe { mem::transmute(q_file_ptr) }
         };
@@ -310,7 +331,10 @@ impl QueueBackend {
             match self.get_queue_file(tail_file) {
                 Some(q_file) => {
                     match q_file.get(tail) {
-                        Ok(result) => return Some(result),
+                        Ok((new_tail, inner_message)) => return Some((new_tail, Message {
+                            file: q_file,
+                            inner: inner_message
+                        })),
                         Err(false) => return None,
                         Err(true) => {
                             // retry in the beginning of the next file
@@ -326,11 +350,13 @@ impl QueueBackend {
     }
 
     pub fn purge(&mut self) {
-        // FIXME: terribly broken as msgs may still be pointing to the QueueFiles
-        let mut locked_files = self.files.write();
-        for (_, queue_file) in locked_files.drain() {
-            queue_file.purge();
+        // BAD CODE
+        let file_numbers: Vec<usize> = self.files.read().keys().collect();
+        for file_num in file_numbers {
+            self.get_queue_file_mut(file_num).unwrap().purge();
         }
+        let mut locked_files = self.files.write();
+        locked_files.clear();
         self.tail = 0;
         self.head = 0;
         let path = self.config.data_directory.join(BACKEND_CHECKPOINT_FILE);
@@ -371,7 +397,7 @@ impl QueueBackend {
 
         let mut locked_files = self.files.write();
         for (file_num, file_checkpoint) in backend_checkpoint.files {
-            let queue_file = Box::new(QueueFile::open(
+            let queue_file = Arc::new(QueueFile::open(
                 &self.config, file_num, file_checkpoint));
             locked_files.insert(file_num, queue_file);
         }
@@ -426,8 +452,8 @@ impl QueueBackend {
         }
         // purge them
         for file_num in file_nums {
-            let queue_file = self.files.write().remove(&file_num).unwrap();
-            queue_file.purge();
+            self.get_queue_file_mut(file_num).unwrap().purge();
+            self.files.write().remove(&file_num).unwrap();
         }
     }
 }

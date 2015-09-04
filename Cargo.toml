@@ -15,6 +15,7 @@ clock_ticks = "*"
 num_cpus = "*"
 fnv = "*"
 linked-hash-map = "*"
+rand = "*"
 
 [dependencies.spin]
 git="https://github.com/arthurprs/spinlock-rs.git"
@@ -22,7 +23,6 @@ git="https://github.com/arthurprs/spinlock-rs.git"
 [dependencies.vec_map]
 version="*"
 features=["nightly"]
-
 
 [profile.dev]
 opt-level = 0
