@@ -13,7 +13,6 @@ use mio::{Buf, MutBuf, Token, EventLoop, EventSet, PollOpt, Timeout, Handler, Se
 use threadpool::ThreadPool;
 use num_cpus::get as get_num_cpus;
 use rustc_serialize::json;
-use rand::{self, Rng, XorShiftRng};
 use queue::*;
 use queue_backend::Message;
 use config::*;
@@ -25,26 +24,47 @@ const FIRST_CLIENT: Token = Token(1);
 
 #[derive(Debug)]
 pub enum NotifyMessage {
-    Response{cookie: u64, response: ResponseBuffer},
-    WouldBlock{cookie: u64, request: RequestBuffer, timeout: u64},
-    Retry{cookie: u64, fail: bool}
+    Response{response: ResponseBuffer},
+    WouldBlock{request: RequestBuffer, timeout: u64},
+    Retry{fail: bool}
 }
 
-pub type NotifyType = (Token, NotifyMessage);
+pub type NotifyType = (Cookie, NotifyMessage);
 
 #[derive(Debug)]
 pub enum TimeoutMessage {}
 
 pub type TimeoutType = (Token);
 
+#[derive(Copy, Clone, Eq, PartialEq, Debug)]
+struct Cookie(u64);
+
+impl Cookie {
+    fn new(token: Token, nonce: u64) -> Cookie {
+        Cookie((token.0 << 48) as u64 | (nonce & 0xFFFFFF))
+    }
+
+    fn token(self) -> Token {
+        Token((self.0 >> 48) as usize)
+    }
+
+    fn nonce(self) -> u64 {
+        self.0 & 0xFFFFFF
+    }
+
+    fn next(self) -> Cookie {
+        Cookie(self.0 + 1)
+    }
+}
+
 struct Connection {
     token: Token,
+    cookie: Cookie,
     stream: TcpStream,
     interest: EventSet,
     request: Option<RequestBuffer>,
     response: Option<ResponseBuffer>,
     timeout: Option<Timeout>,
-    cookie: u64,
     processing: bool,
     waiting: bool,
     hup: bool,
@@ -52,8 +72,7 @@ struct Connection {
 
 struct Dispatch {
     config: Arc<ServerConfig>,
-    token: Token,
-    cookie: u64,
+    cookie: Cookie,
     request: RequestBuffer,
     channel: Sender<NotifyType>,
     queues: Arc<SpinRwLock<HashMap<String, Arc<ServerQueue>>>>,
@@ -62,7 +81,7 @@ struct Dispatch {
 #[derive(Debug)]
 struct ServerQueue {
     queue: Queue,
-    waiting_clients: SpinLock<Vec<(Token, u64)>>
+    waiting_clients: SpinLock<Vec<Cookie>>
 }
 
 pub struct Server {
@@ -70,7 +89,6 @@ pub struct Server {
     queues: Arc<SpinRwLock<HashMap<String, Arc<ServerQueue>>>>,
     listener: TcpListener,
     thread_pool: ThreadPool,
-    rng: XorShiftRng,
 }
 
 pub struct ServerHandler {
@@ -91,8 +109,8 @@ impl Dispatch {
         if let Some(ref sq) = result {
             sq.queue.as_mut().delete();
             let mut locked = sq.waiting_clients.lock();
-            for (token, cookie) in locked.drain(..) {
-                self.channel.send((token, NotifyMessage::Retry{cookie: cookie, fail: true})).unwrap();
+            for cookie in locked.drain(..) {
+                self.channel.send((cookie, NotifyMessage::Retry{fail: true})).unwrap();
             }
         }
         result
@@ -135,7 +153,7 @@ impl Dispatch {
             }
         } else {
             debug!("queue {:?} channel {:?} has no messages", queue_name, channel_name);
-            sq.waiting_clients.lock().push((self.token, self.cookie));
+            sq.waiting_clients.lock().push(self.cookie);
             Ok(None)
         }
     }
@@ -164,8 +182,8 @@ impl Dispatch {
             };
 
             if let Some(waiting_clients) = waiting_clients_opt {
-                for (token, cookie) in waiting_clients {
-                    self.channel.send((token, NotifyMessage::Retry{cookie: cookie, fail: false})).unwrap();
+                for cookie in waiting_clients {
+                    self.channel.send((cookie, NotifyMessage::Retry{fail: false})).unwrap();
                 }
             }
         }
@@ -216,7 +234,7 @@ impl Dispatch {
         let opcode = self.request.opcode();
 
         debug!("dispatch {:?} {:?} {:?} {:?}",
-            self.token, opcode, self.request.key_str(), self.request.value_slice());
+            self.cookie.token(), opcode, self.request.key_str(), self.request.value_slice());
 
         let response_result = match opcode {
             OpCode::Get | OpCode::GetK | OpCode::GetQ | OpCode::GetKQ => {
@@ -236,21 +254,18 @@ impl Dispatch {
 
         let notification = match response_result {
             Ok(Some(response)) => NotifyMessage::Response{
-                cookie: self.cookie,
                 response: response
             },
             Ok(None) => NotifyMessage::WouldBlock{
-                cookie: self.cookie,
                 request: mem::replace(&mut self.request, RequestBuffer::new()),
-                timeout: 10000
+                timeout: 5000
             },
             Err(status) => NotifyMessage::Response{
-                cookie: self.cookie,
                 response: ResponseBuffer::new(opcode, status)
             },
         };
 
-        self.channel.send((self.token, notification)).unwrap();
+        self.channel.send((self.cookie, notification)).unwrap();
     }
 }
 
@@ -279,12 +294,12 @@ impl Connection {
     fn new(token: Token, stream: TcpStream, chann: Sender<NotifyType>) -> Connection {
         Connection {
             token: token,
+            cookie: Cookie::new(token, 0),
             stream: stream,
             interest: EventSet::all() - EventSet::writable(),
             request: Some(RequestBuffer::new()),
             response: None,
             timeout: None,
-            cookie: 0,
             processing: false,
             waiting: false,
             hup: false,
@@ -351,47 +366,47 @@ impl Connection {
         true
     }
 
-    fn notify(&mut self, server: &mut Server, event_loop: &mut EventLoop<ServerHandler>, msg: NotifyMessage) -> bool {
+    fn notify(&mut self, server: &mut Server, event_loop: &mut EventLoop<ServerHandler>, notification: NotifyType) -> bool {
         if self.hup {
             return false;
         }
 
+        let (cookie, msg) = notification;
+
+        if cookie != self.cookie {
+            return true
+        }
+
         match msg {
-            NotifyMessage::WouldBlock{cookie, request, timeout} => {
-                if cookie == self.cookie {
-                    assert!(!self.waiting);
-                    assert!(self.processing);
-                    self.processing = false;
-                    self.waiting = true;
-                    self.request = Some(request);
-                    event_loop.timeout_ms((self.token), timeout).unwrap();
-                }
+            NotifyMessage::WouldBlock{request, timeout} => {
+                assert!(!self.waiting);
+                assert!(self.processing);
+                self.processing = false;
+                self.waiting = true;
+                self.request = Some(request);
+                event_loop.timeout_ms((self.token), timeout).unwrap();
             },
-            NotifyMessage::Response{cookie, response} => {
-                if cookie == self.cookie {
-                    assert!(!self.waiting);
-                    assert!(self.processing);
-                    self.processing = false;
-                    self.response = Some(response);
+            NotifyMessage::Response{response} => {
+                assert!(!self.waiting);
+                assert!(self.processing);
+                self.processing = false;
+                self.response = Some(response);
+                self.interest = EventSet::all() - EventSet::readable();
+                event_loop.reregister(&self.stream, self.token, self.interest, PollOpt::level()).unwrap();
+            },
+            NotifyMessage::Retry{fail} => {
+                assert!(self.waiting);
+                assert!(!self.processing);
+                self.waiting = false;
+                if fail {
+                    let opcode = self.request.as_ref().unwrap().opcode();
+                    self.response = Some(ResponseBuffer::new(opcode, Status::InvalidArguments));
                     self.interest = EventSet::all() - EventSet::readable();
                     event_loop.reregister(&self.stream, self.token, self.interest, PollOpt::level()).unwrap();
-                }
-            },
-            NotifyMessage::Retry{cookie, fail} => {
-                if cookie == self.cookie {
-                    assert!(self.waiting);
-                    assert!(!self.processing);
-                    self.waiting = false;
-                    if fail {
-                        let opcode = self.request.as_ref().unwrap().opcode();
-                        self.response = Some(ResponseBuffer::new(opcode, Status::InvalidArguments));
-                        self.interest = EventSet::all() - EventSet::readable();
-                        event_loop.reregister(&self.stream, self.token, self.interest, PollOpt::level()).unwrap();
-                    } else {
-                        self.processing = true;
-                        let request = self.request.take().unwrap();
-                        self.dispatch(request, server, event_loop);
-                    }
+                } else {
+                    self.processing = true;
+                    let request = self.request.take().unwrap();
+                    self.dispatch(request, server, event_loop);
                 }
             },
             // _ => panic!("can't handle msg {:?}", msg)
@@ -401,12 +416,11 @@ impl Connection {
     }
 
     fn dispatch(&mut self, request: RequestBuffer, server: &mut Server, event_loop: &mut EventLoop<ServerHandler>) {
-        self.cookie = server.rng.gen();
+        self.cookie = self.cookie.next();
         let mut dispatch = Dispatch {
+            cookie: self.cookie,
             config: server.config.clone(),
             channel: event_loop.channel(),
-            cookie: self.cookie,
-            token: self.token,
             request: request,
             queues: server.queues.clone(),
         };
@@ -431,7 +445,6 @@ impl Server {
             config: Arc::new(config),
             queues: Default::default(),
             thread_pool: ThreadPool::new(num_threads),
-            rng: rand::weak_rng(),
         };
 
         let mut event_loop = EventLoop::new().unwrap();
@@ -471,8 +484,8 @@ impl Server {
         true
     }
 
-    fn notify(&mut self, connections: &mut Slab<Connection>, event_loop: &mut EventLoop<ServerHandler>, msg: NotifyMessage) -> bool {
-        match msg {
+    fn notify(&mut self, connections: &mut Slab<Connection>, event_loop: &mut EventLoop<ServerHandler>, notification: NotifyType) -> bool {
+        match notification {
             // NotifyMessage::Awake(tokens) => {
             //     for token in tokens {
             //         let connection = &connections[token];
@@ -482,7 +495,7 @@ impl Server {
             //         connection.dispatch_in_pool(self);
             //     }
             // }
-            _ => panic!("can't handle msg {:?}", msg)
+            (_, msg) => panic!("can't handle msg {:?}", msg)
         }
         true
     }
@@ -513,13 +526,13 @@ impl Handler for ServerHandler {
     }
 
     #[inline]
-    fn notify(&mut self, event_loop: &mut EventLoop<Self>, composed_msg: Self::Message) {
-        let (token, message) = composed_msg;
-        trace!("notify event for token {:?} with {:?}", token, message);
+    fn notify(&mut self, event_loop: &mut EventLoop<Self>, notification: Self::Message) {
+        let token = notification.0.token();
+        trace!("notify event for token {:?} with {:?}", token, notification.1);
         let is_ok = match token {
-            SERVER => self.server.notify(&mut self.connections, event_loop, message),
+            SERVER => self.server.notify(&mut self.connections, event_loop, notification),
             token => if let Some(connection) = self.connections.get_mut(token) {
-                connection.notify(&mut self.server, event_loop, message)
+                connection.notify(&mut self.server, event_loop, notification)
             } else {
                 trace!("token {:?} not found", token);
                 false
