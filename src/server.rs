@@ -13,6 +13,7 @@ use mio::{Buf, MutBuf, Token, EventLoop, EventSet, PollOpt, Timeout, Handler, Se
 use threadpool::ThreadPool;
 use num_cpus::get as get_num_cpus;
 use rustc_serialize::json;
+use rand::{Rng, weak_rng, XorShiftRng};
 use queue::*;
 use queue_backend::Message;
 use config::*;
@@ -53,7 +54,7 @@ impl Cookie {
     }
 
     fn next(self) -> Cookie {
-        Cookie(self.0 + 1)
+        Self::new(self.token(), self.nonce().wrapping_add(1))
     }
 }
 
@@ -70,6 +71,12 @@ struct Connection {
     hup: bool,
 }
 
+#[derive(Debug)]
+struct ServerQueue {
+    queue: Queue,
+    waiting_clients: SpinLock<Vec<Cookie>>
+}
+
 struct Dispatch {
     config: Arc<ServerConfig>,
     cookie: Cookie,
@@ -78,17 +85,12 @@ struct Dispatch {
     queues: Arc<SpinRwLock<HashMap<String, Arc<ServerQueue>>>>,
 }
 
-#[derive(Debug)]
-struct ServerQueue {
-    queue: Queue,
-    waiting_clients: SpinLock<Vec<Cookie>>
-}
-
 pub struct Server {
     config: Arc<ServerConfig>,
     queues: Arc<SpinRwLock<HashMap<String, Arc<ServerQueue>>>>,
     listener: TcpListener,
     thread_pool: ThreadPool,
+    rng: XorShiftRng,
 }
 
 pub struct ServerHandler {
@@ -291,10 +293,10 @@ fn write_response(stream: &mut TcpStream, response: &mut ResponseBuffer) -> IoRe
 
 impl Connection {
 
-    fn new(token: Token, stream: TcpStream, chann: Sender<NotifyType>) -> Connection {
+    fn new(token: Token, nonce: u64, stream: TcpStream, chann: Sender<NotifyType>) -> Connection {
         Connection {
             token: token,
-            cookie: Cookie::new(token, 0),
+            cookie: Cookie::new(token, nonce),
             stream: stream,
             interest: EventSet::all() - EventSet::writable(),
             request: Some(RequestBuffer::new()),
@@ -445,6 +447,7 @@ impl Server {
             config: Arc::new(config),
             queues: Default::default(),
             thread_pool: ThreadPool::new(num_threads),
+            rng: weak_rng()
         };
 
         let mut event_loop = EventLoop::new().unwrap();
@@ -470,7 +473,7 @@ impl Server {
             stream.set_nodelay(true).unwrap();
 
             let token = connections.insert_with(
-                |token| Connection::new(token, stream, event_loop.channel())).unwrap();
+                |token| Connection::new(token, self.rng.gen(), stream, event_loop.channel())).unwrap();
 
             debug!("assigned token {:?} to client {:?}", token, connection_addr);
 
