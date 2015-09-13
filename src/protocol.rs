@@ -169,8 +169,8 @@ impl ResponseHeader {
 #[derive(Debug)]
 pub struct RequestBuffer {
     body: Vec<u8>,
-    arg_offsets: Vec<(usize, usize)>,
-    bytes_read: usize
+    bytes_read: u32,
+    arg_offsets: [(u16, u16); 3],
 }
 
 #[derive(Debug)]
@@ -186,19 +186,24 @@ impl RequestBuffer {
         unsafe { v.set_len(4096) };
         RequestBuffer {
             body: v,
-            arg_offsets: Vec::new(),
             bytes_read: 0,
+            arg_offsets: [(0xFFFF, 0xFFFF); 3],
         }
     }
 
     fn parse_args(&mut self) {
+        let mut arg_count = 0;
         let mut start = 0;
-        let mut arg_offsets = Vec::new();
+        let mut arg_offsets = [(0xFFFF, 0xFFFF); 3];
         for (colon_offset, _) in self.key_str().match_indices(':') {
-            arg_offsets.push((start, colon_offset));
+            arg_offsets[arg_count] = (start as u16, colon_offset as u16);
             start = colon_offset + 1;
+            arg_count += 1;
+            if arg_count >= 2 {
+                break
+            }
         }
-        arg_offsets.push((start, self.key_str().len()));
+        arg_offsets[arg_count] = (start as u16, self.key_str().len() as u16);
         self.arg_offsets = arg_offsets;
     }
 
@@ -222,8 +227,12 @@ impl RequestBuffer {
     }
 
     pub fn arg_str(&self, arg_number: usize) -> Option<&str> {
-        self.arg_offsets.get(arg_number).map(|&(start, end)| {
-            unsafe { str::from_utf8_unchecked(&self.key_slice()[start..end]) }
+        self.arg_offsets.get(arg_number).and_then(|&(start, end)| {
+            if start != 0xFFFF {
+                Some(unsafe { str::from_utf8_unchecked(&self.key_slice()[start as usize..end as usize]) })
+            } else {
+                None
+            }
         })
     }
 
@@ -246,15 +255,15 @@ impl RequestBuffer {
     }
 
     pub fn is_complete(&self) -> bool {
-        if self.bytes_read < size_of::<RequestHeader>() {
+        if (self.bytes_read as usize) < size_of::<RequestHeader>() {
             false
         } else {
-            self.bytes_read == self.header().get_total_len()
+            (self.bytes_read as usize) == self.header().get_total_len()
         }
     }
 
     pub fn is_too_large(&self) -> bool {
-        if self.bytes_read <= size_of::<RequestHeader>() {
+        if (self.bytes_read as usize) <= size_of::<RequestHeader>() {
             false
         } else {
             self.header().get_key_len() > 256 || self.header().get_total_body_len() > 256 * 1024
@@ -268,26 +277,26 @@ impl RequestBuffer {
 
 impl MutBuf for RequestBuffer {
     fn remaining(&self) -> usize {
-        self.body[self.bytes_read..].len()
+        self.body[self.bytes_read as usize..].len()
     }
 
     fn advance(&mut self, cnt: usize) {
-        if self.bytes_read < size_of::<RequestHeader>() &&
-                self.bytes_read + cnt >= size_of::<RequestHeader>() {
+        if (self.bytes_read as usize) < size_of::<RequestHeader>() &&
+                (self.bytes_read as usize) + cnt >= size_of::<RequestHeader>() {
             let total_len = self.header().get_total_len();
             if self.body.capacity() < total_len {
                 self.body.reserve_exact(total_len);
             }
             unsafe { self.body.set_len(total_len) };
         }
-        self.bytes_read += cnt;
+        self.bytes_read += cnt as u32;
         if self.is_complete() {
             self.parse_args();
         }
     }
 
     fn mut_bytes(&mut self) -> &mut [u8] {
-        &mut self.body[self.bytes_read..]
+        &mut self.body[self.bytes_read as usize..]
     }
 }
 

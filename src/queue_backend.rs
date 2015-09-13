@@ -392,7 +392,6 @@ impl QueueBackend {
             }
         };
 
-
         info!("[{}] checkpoint loaded: {:?}", self.config.name, backend_checkpoint);
 
         let mut locked_files = self.files.write();

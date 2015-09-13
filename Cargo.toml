@@ -34,7 +34,7 @@ codegen-units = 8
 
 [profile.release]
 opt-level = 3
-debug = false
+debug = true
 rpath = false
 lto = false
 debug-assertions = false

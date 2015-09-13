@@ -97,6 +97,10 @@ impl Queue {
         queue
     }
 
+    pub fn name(&self) -> &str {
+        &self.config.name
+    }
+
     fn set_state(&mut self, new_state: QueueState) {
         // TODO: state machine check?
         self.state = new_state;
@@ -130,8 +134,8 @@ impl Queue {
     }
 
     /// get access is suposed to be thread-safe, even while writing
-    pub fn get(&mut self, channel_name: &str) -> Option<Message> {
-        let _ = self.backend_rlock.read().unwrap();
+    pub fn get(&mut self, channel_name: &str) -> Option<Result<Message, u64>> {
+        let rlock = self.backend_rlock.read().unwrap();
         let locked_channels = self.channels.read().unwrap();
         if let Some(channel) = locked_channels.get(channel_name) {
             let mut locked_channel = channel.lock().unwrap();
@@ -146,7 +150,7 @@ impl Queue {
                     state.expiration = self.clock + self.config.time_to_live;
                     state.retry += 1;
                     trace!("[{}] msg {} expired and will be sent again", self.config.name, id);
-                    return Some(self.backend.get(id).unwrap().1)
+                    return Some(Ok(self.backend.get(id).unwrap().1))
                 }
             }
 
@@ -159,15 +163,16 @@ impl Queue {
                 };
                 locked_channel.in_flight.insert(message.id(), state);
                 trace!("[{}] fetched msg {} from backend", self.config.name, message.id());
-                return Some(message)
+                return Some(Ok(message))
             }
+            return Some(Err(locked_channel.tail))
         }
         None
     }
 
     /// all calls are serialized internally
     pub fn put(&mut self, message: &[u8]) -> Option<u64> {
-        let _ = self.backend_wlock.lock().unwrap();
+        let wlock = self.backend_wlock.lock().unwrap();
         trace!("[{}] putting message", self.config.name);
         self.backend.put(message)
     }
@@ -188,26 +193,26 @@ impl Queue {
 
     pub fn purge(&mut self) {
         info!("[{}] purging", self.config.name);
-        let _ = self.backend_rlock.write().unwrap();
-        let _ = self.backend_wlock.lock().unwrap();
-        self.set_state(QueueState::Purging);
-        self.checkpoint();
+        let rlock = self.backend_rlock.write().unwrap();
+        let wlock = self.backend_wlock.lock().unwrap();
+        self.as_mut().set_state(QueueState::Purging);
+        self.as_mut().checkpoint();
         self.backend.purge();
         for (_, channel) in &mut*self.channels.write().unwrap() {
             let mut locked_channel = channel.lock().unwrap();
             locked_channel.tail = 0;
             locked_channel.in_flight.clear();
         }
-        self.set_state(QueueState::Ready);
-        self.checkpoint();
+        self.as_mut().set_state(QueueState::Ready);
+        self.as_mut().checkpoint();
     }
 
     pub fn delete(&mut self) {
         info!("[{}] deleting", self.config.name);
-        let _ = self.backend_rlock.write().unwrap();
-        let _ = self.backend_wlock.lock().unwrap();
-        self.set_state(QueueState::Deleting);
-        self.checkpoint();
+        let rlock = self.backend_rlock.write().unwrap();
+        let wlock = self.backend_wlock.lock().unwrap();
+        self.as_mut().set_state(QueueState::Deleting);
+        self.as_mut().checkpoint();
         self.backend.delete();
         remove_dir_if_exist(&self.config.data_directory).unwrap();
     }
@@ -274,10 +279,7 @@ impl Queue {
         };
 
         if self.state == QueueState::Ready {
-            {
-                let _ = self.backend_rlock.read();
-                self.backend.checkpoint();
-            }
+            self.backend.checkpoint();
             let locked_channels = self.channels.read().unwrap();
             for (channel_name, channel) in &*locked_channels {
                 let locked_channel = channel.lock().unwrap();
@@ -316,8 +318,8 @@ impl Queue {
             locked_channels.values().map(|ch| ch.lock().unwrap().tail).min().unwrap_or(0)
         };
 
-        let _ = self.backend_rlock.read();
-        self.checkpoint();
+        let rlock = self.backend_rlock.read();
+        self.as_mut().checkpoint();
         self.backend.gc(smallest_tail);
     }
 
