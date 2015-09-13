@@ -367,12 +367,8 @@ mod tests {
         get_queue_opt(name, false)
     }
 
-    fn gen_message(id: u64) -> Message<'static> {
-        Message {
-            id: id,
-            body: b"333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333",
-            send_file_opt: None,
-        }
+    fn gen_message(id: u64) -> &'static [u8] {
+        return b"333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333";
     }
 
     #[test]
@@ -493,7 +489,7 @@ mod tests {
         let mut q = get_queue();
         let m = &gen_message(0);
         let n = 10000;
-        b.bytes = (m.body.len() * n) as u64;
+        b.bytes = (m.len() * n) as u64;
         b.iter(|| {
             for _ in (0..n) {
                 let r = q.put(m);
@@ -508,12 +504,12 @@ mod tests {
         let m = &gen_message(0);
         let n = 10000;
         q.create_channel("test");
-        b.bytes = (m.body.len() * n) as u64;
+        b.bytes = (m.len() * n) as u64;
         b.iter(|| {
             for _ in (0..n) {
                 let p = q.put(m);
                 let r = q.get("test");
-                assert_eq!(p.unwrap(), r.unwrap().id);
+                assert_eq!(p.unwrap(), r.unwrap().unwrap().id());
             }
         });
     }
