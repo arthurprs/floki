@@ -1,6 +1,6 @@
 use std::ops::{Deref, DerefMut};
 use std::sync::{Arc, Mutex, RwLock};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BinaryHeap};
 use std::collections::hash_map::Entry;
 use std::io::{self, Read, Write};
 use std::fs::{self, File};
@@ -14,6 +14,7 @@ use std::fmt;
 use config::*;
 use queue_backend::*;
 use utils::*;
+use rev::Rev;
 
 #[derive(Eq, PartialEq, Debug, Copy, Clone, RustcDecodable, RustcEncodable)]
 pub enum QueueState {
@@ -32,7 +33,6 @@ impl Default for QueueState {
 struct ChannelCheckpoint {
     last_touched: u32,
     tail: u64,
-    in_flight: Vec<u64>
 }
 
 #[derive(Debug, Default, RustcDecodable, RustcEncodable)]
@@ -51,7 +51,8 @@ struct InFlightState {
 pub struct Channel {
     last_touched: u32,
     tail: u64,
-    in_flight: LinkedHashMap<u64, InFlightState>
+    in_flight: LinkedHashMap<u64, InFlightState>,
+    in_flight_heap: BinaryHeap<Rev<u64>>,
 }
 
 #[derive(Debug)]
@@ -68,10 +69,24 @@ pub struct Queue {
     state: QueueState,
 }
 
+impl Channel {
+    fn real_tail(&self) -> u64 {
+        if let Some(&Rev(tail)) = self.in_flight_heap.peek() {
+            tail
+        } else {
+            self.tail
+        }
+    }
+}
+
 unsafe impl Sync for Queue {}
 unsafe impl Send for Queue {}
 
 impl Queue {
+    pub fn discover(data_directory: &str) -> Vec<Result<Queue, ()>> {
+        Default::default()
+    }
+
     pub fn new(config: QueueConfig, recover: bool) -> Queue {
         if ! recover {
             remove_dir_if_exist(&config.data_directory).unwrap();
@@ -91,7 +106,7 @@ impl Queue {
         if recover {
            queue.recover();
         } else {
-           queue.checkpoint();
+           queue.checkpoint(false);
         }
         queue.tick();
         queue
@@ -106,10 +121,6 @@ impl Queue {
         self.state = new_state;
     }
 
-    pub fn tail(&self) -> u64 {
-        self.backend.tail()
-    }
-
     pub fn create_channel<S>(&mut self, channel_name: S) -> bool
             where String: From<S> {
         let channel_name: String = channel_name.into();
@@ -118,7 +129,8 @@ impl Queue {
             let channel = Channel {
                 last_touched: self.clock,
                 tail: 0,
-                in_flight: Default::default()
+                in_flight: Default::default(),
+                in_flight_heap: Default::default(),
             };
             debug!("creating channel {:?}", channel);
             vacant_entry.insert(Mutex::new(channel));
@@ -149,20 +161,22 @@ impl Queue {
                     let state = locked_channel.in_flight.get_refresh(&id).unwrap();
                     state.expiration = self.clock + self.config.time_to_live;
                     state.retry += 1;
-                    trace!("[{}] msg {} expired and will be sent again", self.config.name, id);
+                    debug!("[{}] msg {} expired and will be sent again", self.config.name, id);
                     return Some(Ok(self.backend.get(id).unwrap().1))
                 }
             }
 
             // fetch from the backend
             if let Some((new_tail, message)) = self.backend.get(locked_channel.tail) {
-                locked_channel.tail = new_tail;
+                debug!("[{}] fetched msg {} from backend", self.config.name, message.id());
                 let state = InFlightState {
                     expiration: self.clock + self.config.time_to_live,
                     retry: 0
                 };
                 locked_channel.in_flight.insert(message.id(), state);
-                trace!("[{}] fetched msg {} from backend", self.config.name, message.id());
+                locked_channel.in_flight_heap.push(Rev(message.id()));
+                locked_channel.tail = new_tail;
+                debug!("[{}] advancing tail to {}", self.config.name, new_tail);
                 return Some(Ok(message))
             }
             return Some(Err(locked_channel.tail))
@@ -183,9 +197,16 @@ impl Queue {
         if let Some(channel) = locked_channels.get(channel_name) {
             let mut locked_channel = channel.lock().unwrap();
             locked_channel.last_touched = self.clock;
+            // try to remove the id
             let removed_opt = locked_channel.in_flight.remove(&id);
             trace!("[{}] message {} deleted from channel: {}",
                 self.config.name, id, removed_opt.is_some());
+            // advance channel real tail
+            while locked_channel.in_flight_heap
+                    .peek()
+                    .map_or(false, |&Rev(id)| !locked_channel.in_flight.contains_key(&id)) {
+                locked_channel.in_flight_heap.pop();
+            }
             return Some(removed_opt.is_some())
         }
         None
@@ -196,7 +217,7 @@ impl Queue {
         let rlock = self.backend_rlock.write().unwrap();
         let wlock = self.backend_wlock.lock().unwrap();
         self.as_mut().set_state(QueueState::Purging);
-        self.as_mut().checkpoint();
+        self.as_mut().checkpoint(false);
         self.backend.purge();
         for (_, channel) in &mut*self.channels.write().unwrap() {
             let mut locked_channel = channel.lock().unwrap();
@@ -204,7 +225,7 @@ impl Queue {
             locked_channel.in_flight.clear();
         }
         self.as_mut().set_state(QueueState::Ready);
-        self.as_mut().checkpoint();
+        self.as_mut().checkpoint(false);
     }
 
     pub fn delete(&mut self) {
@@ -212,7 +233,7 @@ impl Queue {
         let rlock = self.backend_rlock.write().unwrap();
         let wlock = self.backend_wlock.lock().unwrap();
         self.as_mut().set_state(QueueState::Deleting);
-        self.as_mut().checkpoint();
+        self.as_mut().checkpoint(false);
         self.backend.delete();
         remove_dir_if_exist(&self.config.data_directory).unwrap();
     }
@@ -248,23 +269,19 @@ impl Queue {
             QueueState::Ready => {
                 let mut locked_channels = self.channels.write().unwrap();
                 for (channel_name, channel_checkpoint) in queue_checkpoint.channels {
-                    let mut in_flight: LinkedHashMap<_, _> = Default::default();
-                    for id in channel_checkpoint.in_flight {
-                        in_flight.insert(id, Default::default());
-                    }
-
                     locked_channels.insert(
                         channel_name,
                         Mutex::new(Channel {
                             last_touched: channel_checkpoint.last_touched,
                             tail: channel_checkpoint.tail,
-                            in_flight: in_flight,
+                            in_flight: Default::default(),
+                            in_flight_heap: Default::default()
                         })
                     );
                 }
             }
             QueueState::Purging => {
-                // just return as is
+                // TODO: resume purging
             }
             QueueState::Deleting => {
                 // TODO: return some sort of error
@@ -272,14 +289,14 @@ impl Queue {
         }
     }
 
-    fn checkpoint(&mut self) {
+    fn checkpoint(&mut self, full: bool) {
         let mut checkpoint = QueueCheckpoint {
             state: self.state,
             .. Default::default()
         };
 
         if self.state == QueueState::Ready {
-            self.backend.checkpoint();
+            self.backend.checkpoint(full);
             let locked_channels = self.channels.read().unwrap();
             for (channel_name, channel) in &*locked_channels {
                 let locked_channel = channel.lock().unwrap();
@@ -287,8 +304,7 @@ impl Queue {
                     channel_name.clone(),
                     ChannelCheckpoint {
                         last_touched: locked_channel.last_touched,
-                        tail: locked_channel.tail,
-                        in_flight: locked_channel.in_flight.keys().cloned().collect()
+                        tail: locked_channel.real_tail(),
                     }
                 );
             }
@@ -315,20 +331,25 @@ impl Queue {
     pub fn maintenance(&mut self) {
         let smallest_tail = {
             let locked_channels = self.channels.read().unwrap();
-            locked_channels.values().map(|ch| ch.lock().unwrap().tail).min().unwrap_or(0)
+            locked_channels.values().map(|channel| {
+                let locked_channel = channel.lock().unwrap();
+                if let Some(&Rev(tail)) = locked_channel.in_flight_heap.peek() {
+                    tail
+                } else {
+                    locked_channel.tail
+                }
+            }).min().unwrap_or(0)
         };
 
+        debug!("[{}] smallest_tail is {}", self.config.name, smallest_tail);
+
         let rlock = self.backend_rlock.read();
-        self.as_mut().checkpoint();
         self.backend.gc(smallest_tail);
+        self.as_mut().checkpoint(false);
     }
 
-    fn tick(&mut self) {
-        self.tick_to(precise_time_s() as u32);
-    }
-
-    pub fn tick_to(&mut self, clock: u32) {
-        self.clock = clock;
+    pub fn tick(&mut self) {
+        self.clock = precise_time_s() as u32;
         debug!("[{}] tick to {}", self.config.name, self.clock);
     }
 
@@ -341,7 +362,7 @@ impl Queue {
 impl Drop for Queue {
     fn drop(&mut self) {
         if self.state != QueueState::Deleting {
-            self.checkpoint()
+            self.checkpoint(true)
         }
     }
 }
@@ -355,7 +376,8 @@ mod tests {
     use test;
 
     fn get_queue_opt(name: &str, recover: bool) -> Queue {
-        let server_config = ServerConfig::read();
+        let mut server_config = ServerConfig::read();
+        server_config.segment_size = 4 * 1024 * 1024;
         let mut queue_config = server_config.new_queue_config(name);
         queue_config.time_to_live = 1;
         Queue::new(queue_config, recover)
@@ -408,12 +430,12 @@ mod tests {
     fn test_in_flight() {
         let mut q = get_queue();
         let message = gen_message(0);
-        assert!(q.get("test").is_none());
         assert!(q.put(&message).is_some());
+        assert!(q.get("test").is_none());
         assert!(q.create_channel("test") == true);
         assert!(q.create_channel("test") == false);
-        assert!(q.get("test").is_some());
-        assert!(q.get("test").is_none());
+        assert!(q.get("test").unwrap().is_ok());
+        assert!(q.get("test").unwrap().is_err());
         // TODO: check in flight count
     }
 
@@ -423,11 +445,11 @@ mod tests {
         let message = gen_message(0);
         assert!(q.create_channel("test") == true);
         assert!(q.put(&message).is_some());
-        assert!(q.get("test").is_some());
-        assert!(q.get("test").is_none());
+        assert!(q.get("test").unwrap().is_ok());
+        assert!(q.get("test").unwrap().is_err());
         thread::sleep_ms(1001);
         q.tick();
-        assert!(q.get("test").is_some());
+        assert!(q.get("test").unwrap().is_ok());
     }
 
     #[test]
@@ -439,13 +461,13 @@ mod tests {
             assert!(q.put(&message).is_some());
             put_msg_count += 1;
         }
-        q.backend.checkpoint();
+        q.backend.checkpoint(true);
 
         q = get_queue_opt("test_backend_recover", true);
         assert_eq!(q.backend.files_count(), 3);
         let mut get_msg_count = 0;
         assert!(q.create_channel("test") == true);
-        while let Some(_) = q.get("test") {
+        while let Some(Ok(_)) = q.get("test") {
             get_msg_count += 1;
         }
         assert_eq!(get_msg_count, put_msg_count);
@@ -458,25 +480,29 @@ mod tests {
         assert!(q.create_channel("test") == true);
         assert!(q.put(&message).is_some());
         assert!(q.put(&message).is_some());
-        assert!(q.get("test").is_some());
-        q.checkpoint();
+        assert!(q.get("test").unwrap().is_ok());
+        assert!(q.get("test").unwrap().is_ok());
+        assert!(q.get("test").unwrap().is_err());
+        q.checkpoint(true);
 
         q = get_queue_opt("test_queue_recover", true);
         assert!(q.create_channel("test") == false);
-        assert!(q.get("test").is_some());
-        assert!(q.get("test").is_some());
-        assert!(q.get("test").is_none());
+        assert!(q.get("test").unwrap().is_ok());
+        assert!(q.get("test").unwrap().is_ok());
+        assert!(q.get("test").unwrap().is_err());
     }
 
     #[test]
     fn test_gc() {
         let message = gen_message(0);
-        let mut q = get_queue_opt("test_reopen", false);
+        let mut q = get_queue_opt("test_gc", false);
         assert!(q.create_channel("test") == true);
 
         while q.backend.files_count() < 3 {
             assert!(q.put(&message).is_some());
-            assert!(q.get("test").is_some());
+            let get_result = q.get("test");
+            assert!(get_result.as_ref().unwrap().is_ok());
+            assert!(q.ack("test", get_result.unwrap().unwrap().id()).unwrap());
         }
         q.maintenance();
 
@@ -507,9 +533,10 @@ mod tests {
         b.bytes = (m.len() * n) as u64;
         b.iter(|| {
             for _ in (0..n) {
-                let p = q.put(m);
-                let r = q.get("test");
-                assert_eq!(p.unwrap(), r.unwrap().unwrap().id());
+                let p = q.put(m).unwrap();
+                let r = q.get("test").unwrap().unwrap().id();
+                q.ack("test", r);
+                assert_eq!(p, r);
             }
         });
     }

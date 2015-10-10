@@ -32,6 +32,9 @@ mod server;
 mod protocol;
 mod queue_backend;
 mod utils;
+mod rev;
+mod atom;
+mod cookie;
 
 use config::*;
 use queue::*;

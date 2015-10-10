@@ -20,10 +20,10 @@ use utils::*;
 
 #[derive(Debug)]
 struct InnerMessage {
-    id: u64,
-    len: u32,
     mmap_ptr: *mut u8,
     file_offset: u64,
+    id: u64,
+    len: u32,
 }
 
 #[derive(Debug)]
@@ -45,8 +45,12 @@ impl Message {
         unsafe { slice::from_raw_parts(self.inner.mmap_ptr, self.inner.len as usize) }
     }
 
-    pub fn file_info(&self) -> (RawFd, u64) {
-        (self.file.file.as_raw_fd(), self.inner.file_offset as u64)
+    pub fn fd(&self) -> RawFd {
+        self.file.file.as_raw_fd()
+    }
+
+    pub fn fd_offset(&self) -> u64 {
+        self.inner.file_offset
     }
 }
 
@@ -54,15 +58,18 @@ unsafe impl Send for Message {}
 
 #[repr(packed)]
 struct MessageHeader {
-    // TODO: needs a hash
     id: u64,
     len: u32,
+    // hash: u32,
+    // timestamp: u32,
 }
 
 #[derive(Debug, Default, Eq, PartialEq, RustcDecodable, RustcEncodable)]
 struct QueueFileCheckpoint {
+    tail: u64,
     head: u64,
-    closed: bool
+    sync_offset: u64,
+    closed: bool,
 }
 
 #[derive(Debug, Default, RustcDecodable, RustcEncodable)]
@@ -70,20 +77,28 @@ struct QueueBackendCheckpoint {
     files: BTreeMap<usize, QueueFileCheckpoint>
 }
 
+#[derive(Debug, Default)]
+struct QueueFileIndex {
+    offset: u64,
+    index: Vec<(u32, u32)>,
+}
+
 #[derive(Debug)]
 pub struct QueueFile {
-    base_path: PathBuf,
+    data_path: PathBuf,
     // TODO: move mmaped file abstraction
     file: File,
     file_size: u64,
     file_mmap: *mut u8,
     file_num: usize,
+    sync_offset: u64,
     // dirty_bytes: usize,
     // dirty_messages: usize,
     tail: u64,
     head: u64,
     closed: bool,
     deleted: bool,
+    index: QueueFileIndex,
 }
 
 #[derive(Debug)]
@@ -95,39 +110,37 @@ pub struct QueueBackend {
 }
 
 impl QueueFile {
-    fn gen_base_file_path(config: &QueueConfig, file_num: usize) -> PathBuf {
-        config.data_directory.join(format!("{:08}", file_num))
+    fn gen_data_file_path(config: &QueueConfig, file_num: usize) -> PathBuf {
+        config.data_directory.join(format!("{:019}.{}", file_num, DATA_EXTENSION))
     }
 
     fn create(config: &QueueConfig, file_num: usize) -> QueueFile {
-        let base_path = Self::gen_base_file_path(config, file_num);
-        let data_path = base_path.with_extension(DATA_EXTENSION);
+        let data_path = Self::gen_data_file_path(config, file_num);
         debug!("[{}] creating data file {:?}", config.name, data_path);
         let file = OpenOptions::new()
                 .read(true)
                 .write(true)
                 .create(true)
                 .truncate(true)
-                .open(data_path).unwrap();
+                .open(&data_path).unwrap();
         // hopefully the filesystem supports sparse files
         file.set_len(config.segment_size).unwrap();
-        Self::new(config, file, base_path, file_num)
+        Self::new(config, file, data_path, file_num)
     }
 
     fn open(config: &QueueConfig, file_num: usize, checkpoint: QueueFileCheckpoint) -> QueueFile {
-        let base_path = Self::gen_base_file_path(config, file_num);
-        let data_path = base_path.with_extension(DATA_EXTENSION);
+        let data_path = Self::gen_data_file_path(config, file_num);
         debug!("[{}] opening data file {:?}", config.name, data_path);
         let file = OpenOptions::new()
                 .read(true)
                 .write(true)
-                .open(data_path).unwrap();
-        let mut queue_file = Self::new(config, file, base_path, file_num);
+                .open(&data_path).unwrap();
+        let mut queue_file = Self::new(config, file, data_path, file_num);
         queue_file.recover(checkpoint);
         queue_file
     }
 
-    fn new(config: &QueueConfig, file: File, base_path: PathBuf, file_num: usize) -> QueueFile {
+    fn new(config: &QueueConfig, file: File, data_path: PathBuf, file_num: usize) -> QueueFile {
         let file_size = file.metadata().unwrap().len();
         assert_eq!(file_size, config.segment_size);
 
@@ -141,17 +154,19 @@ impl QueueFile {
             mman::MADV_SEQUENTIAL).unwrap();
 
         QueueFile {
-            base_path: base_path,
+            data_path: data_path,
             file: file,
             file_size: file_size as u64,
             file_mmap: file_mmap,
             file_num: file_num,
+            sync_offset: 0,
             tail: file_num as u64 * config.segment_size,
             head: file_num as u64 * config.segment_size,
             // dirty_messages: 0,
             // dirty_bytes: 0,
             closed: false,
             deleted: false,
+            index: Default::default()
         }
     }
     
@@ -218,25 +233,37 @@ impl QueueFile {
         Some(header.id)
     }
 
-    fn sync(&mut self, sync: bool) {
-        let flags = if sync { mman::MS_SYNC } else { mman::MS_ASYNC };
-        mman::msync(self.file_mmap as *mut c_void, self.file_size as u64, flags).unwrap();
+    fn sync(&mut self, full: bool) {
+        use std::cmp::max;
+        let file_offset = (self.head - self.tail) as i64;
+        let sync_offset = if full { file_offset } else { file_offset - 1024 * 1024 };
+        if sync_offset > 0 && sync_offset as u64 > self.sync_offset {
+            mman::msync(self.file_mmap as *mut c_void, sync_offset as u64, mman::MS_SYNC).unwrap();
+            self.sync_offset = sync_offset as u64;
+        }
     }
 
     fn recover(&mut self, checkpoint: QueueFileCheckpoint) {
         //debug!("[{:?}] checkpoint loaded: {:?}", self.base_path, checkpoint);
+        assert_eq!(self.tail, checkpoint.tail);
+        self.tail = checkpoint.tail;
         self.head = checkpoint.head;
+        self.sync_offset = checkpoint.sync_offset;
         self.closed = checkpoint.closed;
         // TODO: read forward checking the message hashes
     }
 
-    fn checkpoint(&mut self) -> QueueFileCheckpoint {
+    fn checkpoint(&mut self, full: bool) -> QueueFileCheckpoint {
         // FIXME: reset and log stats
-        let checkpoint = QueueFileCheckpoint {
+        let mut checkpoint = QueueFileCheckpoint {
+            tail: self.tail,
             head: self.head,
+            sync_offset: self.sync_offset,
             closed: self.closed,
         };
-        self.sync(true);
+        self.sync(full);
+        // update sync_offset
+        checkpoint.sync_offset = self.sync_offset;
         checkpoint
     }
 
@@ -250,7 +277,7 @@ impl Drop for QueueFile {
     fn drop(&mut self) {
         mman::munmap(self.file_mmap as *mut c_void, self.file_size as u64).unwrap();
         if self.deleted {
-            remove_file_if_exist(&self.base_path).unwrap();
+            remove_file_if_exist(&self.data_path).unwrap();
         }
     }
 }
@@ -410,10 +437,10 @@ impl QueueBackend {
         }
     }
 
-    pub fn checkpoint(&mut self) {
+    pub fn checkpoint(&mut self, full: bool) {
         let file_nums: Vec<_> = self.files.read().keys().collect();
         let file_checkpoints: BTreeMap<_, _> =  file_nums.into_iter().map(|file_num| {
-            (file_num, self.get_queue_file_mut(file_num).unwrap().checkpoint())
+            (file_num, self.get_queue_file_mut(file_num).unwrap().checkpoint(full))
         }).collect();
         let checkpoint = QueueBackendCheckpoint {
             files: file_checkpoints
@@ -431,10 +458,10 @@ impl QueueBackend {
 
         match result {
             Ok(_) => {
-                info!("[{:?}] checkpointed: {:?}", self.config.name, checkpoint.files);
+                info!("[{}] checkpointed: {:?}", self.config.name, checkpoint.files);
             }
             Err(error) => {
-                warn!("[{:?}] error writing checkpoint information: {}",
+                warn!("[{}] error writing checkpoint information: {}",
                     self.config.name, error);
             }
         }
@@ -442,12 +469,15 @@ impl QueueBackend {
 
     pub fn gc(&mut self, smallest_tail: u64) {
         let mut file_nums = Vec::new();
-        // collect files_nums until the first still open or with tail >= smallest_tail
+        // collect files_nums until the first still open or with head >= smallest_tail
         for (file_num, queue_file) in &*self.files.read() {
-            if ! queue_file.closed || queue_file.tail < smallest_tail {
+            if ! queue_file.closed || queue_file.head >= smallest_tail {
                 break
             }
             file_nums.push(file_num);
+        }
+        if !file_nums.is_empty() {
+            info!("[{}] {} files available for gc", self.config.name, file_nums.len());
         }
         // purge them
         for file_num in file_nums {

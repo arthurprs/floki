@@ -6,6 +6,8 @@ use std::str;
 use std::fmt;
 use std::os::unix::io::RawFd;
 
+use queue_backend::Message;
+
 const REQUEST_MAGIC: u8 = 0x80;
 const RESPONSE_MAGIC: u8 = 0x81;
 
@@ -177,7 +179,7 @@ pub struct RequestBuffer {
 pub struct ResponseBuffer {
     body: Vec<u8>,
     bytes_written: usize,
-    pub send_file_opt: Option<(RawFd, usize)>,
+    pub message: Option<Message>,
 }
 
 impl RequestBuffer {
@@ -305,7 +307,7 @@ impl ResponseBuffer {
         let mut response = ResponseBuffer {
             body: Vec::with_capacity(24),
             bytes_written: 0,
-            send_file_opt: None
+            message: None
         };
         unsafe { response.body.set_len(24) };
         *response.header_mut() = unsafe { mem::zeroed() };
@@ -319,7 +321,7 @@ impl ResponseBuffer {
         let mut response = ResponseBuffer {
             body: Vec::with_capacity(24),
             bytes_written: 0,
-            send_file_opt: None
+            message: None
         };
         unsafe { response.body.set_len(24) };
         *response.header_mut() = unsafe { mem::zeroed() };
@@ -328,44 +330,44 @@ impl ResponseBuffer {
         response
     }
 
-    pub fn new_get_response(request: &RequestBuffer, cas: u64, value: &[u8]) -> ResponseBuffer {
+    pub fn new_get_response(request: &RequestBuffer, message: Message) -> ResponseBuffer {
         let mut response = ResponseBuffer {
             body: Vec::with_capacity(4096),
             bytes_written: 0,
-            send_file_opt: None
+            message: None
         };
         unsafe { response.body.set_len(24) };
         *response.header_mut() = unsafe { mem::zeroed() };
         response.header_mut().magic = RESPONSE_MAGIC;
         response.header_mut().opcode = request.header().opcode;
-        response.header_mut().cas = cas.to_be();
+        response.header_mut().cas = message.id().to_be();
         let key: &[u8] = if request.opcode().include_key() {
             request.key_slice()
         } else {
             b""
         };
-        let total_body_len = 4 + key.len() + value.len();
+        let total_body_len = 4 + key.len() + message.body().len();
         response.header_mut().set_extras_len(4);
         response.header_mut().set_key_len(key.len());
         response.header_mut().set_total_body_len(total_body_len);
         response.body.reserve(total_body_len);
         response.body.write_all(b"\0\0\0\0").unwrap();
         response.body.write_all(key).unwrap();
-        response.body.write_all(value).unwrap();
+        response.body.write_all(message.body()).unwrap();
         response
     }
 
-    pub fn new_get_response_fd(request: &RequestBuffer, cas: u64, fd: RawFd, f_offset: usize, f_size: usize) -> ResponseBuffer {
+    pub fn new_get_response_fd(request: &RequestBuffer, message: Message) -> ResponseBuffer {
         let mut response = ResponseBuffer {
             body: Vec::with_capacity(128),
             bytes_written: 0,
-            send_file_opt: Some((fd, f_offset)),
+            message: None,
         };
         unsafe { response.body.set_len(24) };
         *response.header_mut() = unsafe { mem::zeroed() };
         response.header_mut().magic = RESPONSE_MAGIC;
         response.header_mut().opcode = request.header().opcode;
-        response.header_mut().cas = cas.to_be();
+        response.header_mut().cas = message.id().to_be();
         let key: &[u8] = if request.opcode().include_key() {
             request.key_slice()
         } else {
@@ -374,10 +376,11 @@ impl ResponseBuffer {
         let internal_body_len = 4 + key.len();
         response.header_mut().set_extras_len(4);
         response.header_mut().set_key_len(key.len());
-        response.header_mut().set_total_body_len(internal_body_len + f_size);
+        response.header_mut().set_total_body_len(internal_body_len + message.body().len());
         response.body.reserve(internal_body_len);
         response.body.write_all(b"\0\0\0\0").unwrap();
         response.body.write_all(key).unwrap();
+        response.message = Some(message);
         response
     }
 

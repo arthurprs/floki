@@ -1,8 +1,9 @@
 use std::str::{self, FromStr};
-use std::net::{SocketAddr, lookup_host, SocketAddrV4};
+use std::net::{SocketAddr, SocketAddrV4};
 use std::io::{Read, Write, Result as IoResult, Error as IoError};
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::mem;
+use std::collections::VecDeque;
 use std::thread::{self, Thread, JoinHandle};
 use std::sync::Arc;
 use spin::{Mutex as SpinLock, RwLock as SpinRwLock};
@@ -17,6 +18,9 @@ use queue_backend::Message;
 use config::*;
 use protocol::*;
 use utils::*;
+use rev::Rev;
+use atom::Atom;
+use cookie::Cookie;
 
 const SERVER: Token = Token(0);
 const FIRST_CLIENT: Token = Token(1);
@@ -24,38 +28,24 @@ const FIRST_CLIENT: Token = Token(1);
 #[derive(Debug)]
 pub enum NotifyMessage {
     Response{response: ResponseBuffer},
-    PutResponse{response: ResponseBuffer, queue: Arc<Queue>, new_tail: u64},
-    GetWouldBlock{request: RequestBuffer, queue: Arc<Queue>, required_tail: u64},
-    DeleteQueue{response: ResponseBuffer, queue_name: String},
+    PutResponse{response: ResponseBuffer, queue: Atom, new_tail: u64},
+    GetWouldBlock{request: RequestBuffer, queue: Atom, channel: Atom, required_tail: u64},
+    ChannelCreate{queue: Atom, channel: Atom},
+    ChannelDelete{queue: Atom, channel: Atom},
+    QueueCreate{queue: Atom},
+    QueueDelete{queue: Atom},
+    MaintenanceDone,
 }
 
 pub type NotifyType = (Cookie, NotifyMessage);
 
 #[derive(Debug)]
-pub enum TimeoutMessage {}
-
-pub type TimeoutType = (Token);
-
-#[derive(Copy, Clone, Eq, PartialEq, Debug)]
-struct Cookie(u64);
-
-impl Cookie {
-    fn new(token: Token, nonce: u64) -> Cookie {
-        Cookie((token.0 << 48) as u64 | (nonce & 0xFFFFFFFFFFFF))
-    }
-
-    fn token(self) -> Token {
-        Token((self.0 >> 48) as usize)
-    }
-
-    fn nonce(self) -> u64 {
-        self.0 & 0xFFFFFFFFFFFF
-    }
-
-    fn next(self) -> Cookie {
-        Self::new(self.token(), self.nonce().wrapping_add(1))
-    }
+pub enum TimeoutMessage {
+    Timeout,
+    Maintenance,
 }
+
+pub type TimeoutType = (Token, TimeoutMessage);
 
 struct Connection {
     token: Token,
@@ -75,16 +65,23 @@ struct Dispatch {
     cookie: Cookie,
     request: RequestBuffer,
     channel: Sender<NotifyType>,
-    queues: Arc<SpinRwLock<HashMap<String, Arc<Queue>>>>,
+    queues: Arc<SpinRwLock<HashMap<Atom, Arc<Queue>>>>,
+}
+
+#[derive(Default)]
+struct WaitingClients {
+    required_tail: u64,
+    cookies: VecDeque<Cookie>,
 }
 
 pub struct Server {
     config: Arc<ServerConfig>,
-    queues: Arc<SpinRwLock<HashMap<String, Arc<Queue>>>>,
-    waiting_clients: HashMap<String, (u64, Vec<Cookie>)>,
+    queues: Arc<SpinRwLock<HashMap<Atom, Arc<Queue>>>>,
+    waiting_clients: HashMap<Atom, HashMap<Atom, WaitingClients>>,
     awaking_clients: Vec<Cookie>,
     listener: TcpListener,
     thread_pool: ThreadPool,
+    maintenance_timeout: Timeout,
     nonce: u64,
 }
 
@@ -99,16 +96,8 @@ impl NotifyMessage {
     }
 
     fn from_message(request: &RequestBuffer, message: Message) -> NotifyMessage {
-        if message.len() <= 500 {
-            NotifyMessage::Response{
-                response: ResponseBuffer::new_get_response(request, message.id(), message.body())
-            }
-        } else {
-            let (fd, file_offset) = message.file_info();
-            NotifyMessage::Response{
-                response: ResponseBuffer::new_get_response_fd(
-                    request, message.id(), fd, file_offset as usize, message.len() as usize)
-            }
+        NotifyMessage::Response {
+            response: ResponseBuffer::new_get_response(request, message)
         }
     }
 }
@@ -119,12 +108,14 @@ impl Dispatch {
         self.queues.read().get(name).map(|sq| sq.clone())
     }
 
-    fn delete_queue(&self, name: &str) -> Option<Arc<Queue>> {
-        let result = self.queues.write().remove(name);
-        if let Some(ref q) = result {
-            q.as_mut().delete();
-        }
-        result
+    #[inline]
+    fn delete_queue(&self, name: &str) {
+        // TODO: aquire meta xlock
+        let q = self.queues.write().remove(name).unwrap();
+        self.notify_server(NotifyMessage::QueueDelete{
+            queue: name.into(),
+        });
+        q.as_mut().delete();
     }
 
     fn get_or_create_queue(&self, name: &str) -> Arc<Queue> {
@@ -132,13 +123,22 @@ impl Dispatch {
             return sq.clone()
         }
 
+        // TODO: aquire meta xlock
         self.queues.write().entry(name.into()).or_insert_with(|| {
             info!("Creating queue {:?}", name);
             let inner_queue = Queue::new(self.config.new_queue_config(name), true);
             trace!("done creating queue {:?}", name);
 
+            self.notify_server(NotifyMessage::QueueCreate{
+                queue: inner_queue.name().into(),
+            });
+
             Arc::new(inner_queue)
         }).clone()
+    }
+
+    fn notify_server(&self, notification: NotifyMessage) {
+        self.channel.send((Cookie::new(SERVER, 0), notification)).unwrap();
     }
 
     #[allow(mutable_transmutes)]
@@ -160,7 +160,8 @@ impl Dispatch {
                 debug!("queue {:?} channel {:?} has no messages", queue_name, channel_name);
                 NotifyMessage::GetWouldBlock{
                     request: mem::replace(unsafe{mem::transmute(&self.request)}, RequestBuffer::new()),
-                    queue: q,
+                    queue: q.name().into(),
+                    channel: channel_name.into(),
                     required_tail: required_tail,
                 }
             },
@@ -176,6 +177,10 @@ impl Dispatch {
         if let Some(channel_name) = channel_name_opt {
             info!("creating queue {:?} channel {:?}", queue_name, channel_name);
             q.as_mut().create_channel(channel_name);
+            self.notify_server(NotifyMessage::ChannelCreate{
+                queue: q.name().into(),
+                channel: channel_name.into(),
+            });
             NotifyMessage::from_status(&self.request, Status::NoError)
         } else {
             let value_slice = self.request.value_slice();
@@ -184,7 +189,7 @@ impl Dispatch {
             trace!("inserted message into {:?} with id {:?}", queue_name, id);
             NotifyMessage::PutResponse{
                 response: ResponseBuffer::new_set_response(),
-                queue: q,
+                queue: q.name().into(),
                 new_tail: id
             }
         }
@@ -213,16 +218,17 @@ impl Dispatch {
                 q.as_mut().purge();
             },
             (Some("_delete"), None) => {
-                q.as_mut().delete();
+                drop(q);
                 self.delete_queue(queue_name);
-                return NotifyMessage::DeleteQueue{
-                    response: ResponseBuffer::new(self.request.opcode(), Status::NoError),
-                    queue_name: q.name().into()
-                }
             },
-            (Some(channel), Some("_delete")) => {
-                debug!("deleting channel {:?}", channel);
-                if ! q.as_mut().delete_channel(channel) {
+            (Some(channel_name), Some("_delete")) => {
+                debug!("deleting channel {:?}", channel_name);
+                if q.as_mut().delete_channel(channel_name) {
+                    self.notify_server(NotifyMessage::ChannelDelete{
+                        queue: q.name().into(),
+                        channel: channel_name.into(),
+                    });
+                } else {
                     return NotifyMessage::from_status(&self.request, Status::KeyNotFound)
                 }
             },
@@ -264,8 +270,8 @@ fn write_response(stream: &mut TcpStream, response: &mut ResponseBuffer) -> IoRe
     let bytes = response.bytes();
     if bytes.is_empty() && response.remaining() != 0 {
         trace!("response.bytes().is_empty() && response.remaining() == {}", response.remaining());
-        if let Some((fd, fd_offset)) = response.send_file_opt {
-            let r = sendfile(stream.as_raw_fd(), fd, fd_offset, response.remaining());
+        if let Some(ref message) = response.message {
+            let r = sendfile(stream.as_raw_fd(), message.fd(), message.fd_offset() as usize, response.remaining());
             trace!("sendfile returned {}", r);
             if r == -1 {
                 Err(IoError::last_os_error())
@@ -358,27 +364,27 @@ impl Connection {
     }
 
     fn notify(&mut self, server: &mut Server, event_loop: &mut EventLoop<ServerHandler>, notification: NotifyType) -> bool {
+        assert!(self.processing);
+        assert!(!self.waiting);
+
+        let (cookie, msg) = notification;
+
         if self.hup {
             return false;
         }
-
-        let (cookie, msg) = notification;
 
         if cookie != self.cookie {
             return true
         }
 
-        assert!(self.processing);
-        assert!(!self.waiting);
-
         match msg {
-            NotifyMessage::GetWouldBlock{request, queue, required_tail} => {
+            NotifyMessage::GetWouldBlock{request, queue, channel, required_tail} => {
                 assert!(self.timeout.is_none());
                 self.processing = false;
                 self.waiting = true;
                 self.request = Some(request);
-                self.timeout = Some(event_loop.timeout_ms((self.token), 5000).unwrap());
-                server.wait_queue(queue, cookie, required_tail);
+                self.timeout = Some(event_loop.timeout_ms((self.token, TimeoutMessage::Timeout), 5000).unwrap());
+                server.wait_queue(queue, channel, cookie, required_tail);
             },
             NotifyMessage::PutResponse{response, queue, new_tail} => {
                 self.processing = false;
@@ -386,17 +392,12 @@ impl Connection {
                 self.interest = EventSet::all() - EventSet::readable();
                 server.notify_queue(queue, new_tail);
             },
-            NotifyMessage::DeleteQueue{response, queue_name} => {
-                self.processing = false;
-                self.response = Some(response);
-                self.interest = EventSet::all() - EventSet::readable();
-                server.notify_queue_deleted(&queue_name);
-            },
             NotifyMessage::Response{response} => {
                 self.processing = false;
                 self.response = Some(response);
                 self.interest = EventSet::all() - EventSet::readable();
             },
+            msg => panic!("can't handle msg {:?}", msg)
         }
 
         event_loop.reregister(&self.stream, self.token, self.interest, PollOpt::level()).unwrap();    
@@ -404,9 +405,30 @@ impl Connection {
         true
     }
 
+    fn timeout(&mut self, server: &Server, event_loop: &mut EventLoop<ServerHandler>, timeout: TimeoutMessage) -> bool {
+        match timeout {
+            TimeoutMessage::Timeout => {
+                assert!(self.waiting);
+                assert!(!self.processing);
+            }
+            // NotifyMessage::Awake(tokens) => {
+            //     for token in tokens {
+            //         let connection = &connections[token];
+            //         assert!(connection.processing);
+            //         assert!(connection.request.is_complete());
+            //         assert!(connection.response.is_none());
+            //         connection.dispatch_in_pool(self);
+            //     }
+            // }
+            to => panic!("can't handle to {:?}", to)
+        }
+        true
+    }
+
     fn dispatch(&mut self, request: RequestBuffer, server: &mut Server, event_loop: &mut EventLoop<ServerHandler>) {
-        server.nonce += 1;
+        server.nonce = server.nonce.wrapping_add(1);
         self.cookie = Cookie::new(self.token, server.nonce);
+        // FIXME: this not only allocates but clone 3 ARCs
         let mut dispatch = Dispatch {
             cookie: self.cookie,
             config: server.config.clone(),
@@ -430,27 +452,66 @@ impl Connection {
 
 impl Server {
 
-    fn wait_queue(&mut self, queue: Arc<Queue>, cookie: Cookie, required_tail: u64) {
-        if let Some(&mut (q_tail, ref mut w_list)) = self.waiting_clients.get_mut(queue.name()) {
-            if q_tail < required_tail {
-                w_list.push(cookie);
-                return
+    fn wait_queue(&mut self, queue: Atom, channel: Atom, cookie: Cookie, required_tail: u64) {
+        if let Some(channels) = self.waiting_clients.get_mut(&queue) {
+            if let Some(w)  = channels.get_mut(&channel) {
+                if w.required_tail < required_tail {
+                    w.cookies.push_back(cookie);
+                    return
+                }
+            } else {
+                unreachable!();
             }
-        }
-        self.waiting_clients.insert(queue.name().into(), (0, vec![cookie]));
-    }
-
-    fn notify_queue(&mut self, queue: Arc<Queue>, new_tail: u64) {
-        if let Some(&mut (q_tail, ref mut w_list)) = self.waiting_clients.get_mut(queue.name()) {
-            if new_tail >= q_tail {
-                self.awaking_clients.extend(w_list.drain(..));
-            }
+        } else {
+            unreachable!();
         }
     }
 
-    fn notify_queue_deleted(&mut self, queue_name: &str) {
-        if let Some((_, w_list)) = self.waiting_clients.remove(queue_name) {
-            self.awaking_clients.extend(w_list);
+    fn notify_queue(&mut self, queue: Atom, new_tail: u64) {
+        if let Some(channels) = self.waiting_clients.get_mut(&queue) {
+            for (_, w) in channels.iter_mut() {
+                if new_tail >= w.required_tail {
+                    self.awaking_clients.extend(w.cookies.drain());
+                }
+            }
+        } else {
+            unreachable!();
+        }
+    }
+
+    fn notify_queue_deleted(&mut self, queue: Atom) {
+        if let Some(channels) = self.waiting_clients.remove(&queue) {
+            for (_, w) in channels {
+                self.awaking_clients.extend(w.cookies);
+            }
+        } else {
+            unreachable!();
+        }
+    }
+
+    fn notify_queue_created(&mut self, queue: Atom) {
+        let prev = self.waiting_clients.insert(queue, Default::default());
+        assert!(prev.is_none());
+    }
+
+    fn notify_channel_deleted(&mut self, queue: Atom, channel: Atom) {
+        if let Some(channels) = self.waiting_clients.get_mut(&queue) {
+            if let Some(w)  = channels.remove(&channel) {
+                self.awaking_clients.extend(w.cookies);
+            } else {
+                unreachable!();
+            }
+        } else {
+            unreachable!();
+        }
+    }
+
+    fn notify_channel_created(&mut self, queue: Atom, channel: Atom) {
+        if let Some(channels) = self.waiting_clients.get_mut(&queue) {
+            let prev = channels.insert(channel, Default::default());
+            assert!(prev.is_none());
+        } else {
+            unreachable!();
         }
     }
 
@@ -461,8 +522,15 @@ impl Server {
         let listener = TcpListener::bind(&addr).unwrap();
 
         let num_cpus = get_num_cpus();
-        let num_threads = num_cpus + 2;
+        let num_threads = (num_cpus + 1) * 2;
         debug!("detected {} cpus, using {} threads", num_cpus, num_threads);
+
+        let mut event_loop = EventLoop::new().unwrap();
+        event_loop.register_opt(&listener, SERVER,
+            EventSet::all() - EventSet::writable(), PollOpt::level()).unwrap();
+
+        let maintenance_timeout = event_loop.timeout_ms(
+                (SERVER, TimeoutMessage::Maintenance), config.maintenance_timeout as u64).unwrap();
 
         let server = Server {
             listener: listener,
@@ -471,11 +539,9 @@ impl Server {
             thread_pool: ThreadPool::new(num_threads),
             waiting_clients: Default::default(),
             awaking_clients: Default::default(),
+            maintenance_timeout: maintenance_timeout,
             nonce: 0,
         };
-
-        let mut event_loop = EventLoop::new().unwrap();
-        event_loop.register_opt(&server.listener, SERVER, EventSet::all() - EventSet::writable(), PollOpt::level()).unwrap();
 
         let server_handler = ServerHandler {
             server: server,
@@ -522,17 +588,42 @@ impl Server {
     }
 
     fn notify(&mut self, connections: &mut Slab<Connection>, event_loop: &mut EventLoop<ServerHandler>, notification: NotifyType) -> bool {
-        match notification {
-            // NotifyMessage::Awake(tokens) => {
-            //     for token in tokens {
-            //         let connection = &connections[token];
-            //         assert!(connection.processing);
-            //         assert!(connection.request.is_complete());
-            //         assert!(connection.response.is_none());
-            //         connection.dispatch_in_pool(self);
-            //     }
-            // }
-            (_, msg) => panic!("can't handle msg {:?}", msg)
+        match notification.1 {
+            NotifyMessage::MaintenanceDone => {
+                self.maintenance_timeout = event_loop.timeout_ms(
+                    (SERVER, TimeoutMessage::Maintenance), self.config.maintenance_timeout as u64).unwrap();
+            }
+            NotifyMessage::QueueDelete{queue} => {
+                self.notify_queue_deleted(queue);
+            },
+            NotifyMessage::QueueCreate{queue} => {
+                self.notify_queue_created(queue);
+            },
+            NotifyMessage::ChannelDelete{queue, channel} => {
+                self.notify_channel_deleted(queue, channel);
+            },
+            NotifyMessage::ChannelCreate{queue, channel} => {
+                self.notify_channel_created(queue, channel);
+            },
+            msg => panic!("can't handle msg {:?}", msg)
+        }
+
+        true
+    }
+
+    fn timeout(&mut self, connections: &mut Slab<Connection>, event_loop: &mut EventLoop<ServerHandler>, timeout: TimeoutMessage) -> bool {
+        match timeout {
+            TimeoutMessage::Maintenance => {
+                let queues = self.queues.clone();
+                let channel = event_loop.channel();
+                self.thread_pool.execute(move || {
+                    for q in queues.read().values() {
+                        q.as_mut().maintenance();
+                    }
+                    channel.send((Cookie::new(SERVER, 0), NotifyMessage::MaintenanceDone)).unwrap();
+                });
+            }
+            to => panic!("can't handle to {:?}", to)
         }
         true
     }
@@ -587,10 +678,22 @@ impl Handler for ServerHandler {
     }
 
     fn timeout(&mut self, event_loop: &mut EventLoop<Self>, timeout: Self::Timeout) {
-        // match timeout {
-        //     TimeoutMessage::Awake => (),
-        //     TimeoutMessage::Maintenance => ()
-        // }
+        let token = timeout.0;
+        trace!("timeout event for token {:?} with {:?}", token, timeout.1);
+        let is_ok = match token {
+            SERVER => self.server.timeout(&mut self.connections, event_loop, timeout.1),
+            token => if let Some(connection) = self.connections.get_mut(token) {
+                connection.timeout(&mut self.server, event_loop, timeout.1)
+            } else {
+                trace!("token {:?} not found", token);
+                false
+            }
+        };
+        if !is_ok {
+            trace!("deregistering token {:?}", token);
+            self.connections.remove(token);
+        }
+        trace!("end timeout event for token {:?}", token);
     }
 
     fn interrupted(&mut self, event_loop: &mut EventLoop<Self>) {
