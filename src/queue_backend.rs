@@ -179,8 +179,7 @@ impl QueueFile {
         assert_eq!(header.id, id);
         assert!(file_offset + size_of::<MessageHeader>() as u32 + header.len as u32 <= self.file_offset);
 
-        let message_total_len = (size_of::<MessageHeader>() + header.len as usize) as u64;
-        let mmap_ptr = unsafe { self.file_mmap.offset((id - self.tail + size_of::<MessageHeader>() as u64) as isize) };
+        let mmap_ptr = unsafe { self.file_mmap.offset(file_offset as isize + size_of::<MessageHeader>() as isize) };
 
         let message = InnerMessage {
             id: id,
