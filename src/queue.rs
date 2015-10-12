@@ -172,14 +172,15 @@ impl Queue {
                     let state = locked_channel.in_flight.get_refresh(&id).unwrap();
                     state.expiration = self.clock + self.config.time_to_live;
                     state.retry += 1;
-                    debug!("[{}] msg {} expired and will be sent again", self.config.name, id);
+                    debug!("[{}:{}] msg {} expired and will be sent again",
+                        self.config.name, channel_name, id);
                     return Some(Ok(self.backend.get(id).unwrap()))
                 }
             }
 
             // fetch from the backend
             if let Some(message) = self.backend.get(locked_channel.tail) {
-                debug!("[{}] fetched msg {} from backend", self.config.name, message.id());
+                debug!("[{}:{}] fetched msg {} from backend", self.config.name, channel_name, message.id());
                 let state = InFlightState {
                     expiration: self.clock + self.config.time_to_live,
                     retry: 0
@@ -187,7 +188,7 @@ impl Queue {
                 locked_channel.in_flight.insert(message.id(), state);
                 locked_channel.in_flight_heap.push(Rev(message.id()));
                 locked_channel.tail += 1;
-                debug!("[{}] advancing tail to {}", self.config.name, locked_channel.tail);
+                debug!("[{}:{}] advancing tail to {}", self.config.name, channel_name, locked_channel.tail);
                 return Some(Ok(message))
             }
             return Some(Err(locked_channel.tail))
@@ -210,8 +211,8 @@ impl Queue {
             locked_channel.last_touched = self.clock;
             // try to remove the id
             let removed_opt = locked_channel.in_flight.remove(&id);
-            trace!("[{}] message {} deleted from channel: {}",
-                self.config.name, id, removed_opt.is_some());
+            trace!("[{}:{}] message {} deleted from channel: {}",
+                self.config.name, channel_name, id, removed_opt.is_some());
             // advance channel real tail
             while locked_channel.in_flight_heap
                     .peek()
