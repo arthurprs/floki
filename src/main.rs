@@ -6,6 +6,7 @@
 #![feature(libc)]
 #![feature(hashmap_hasher)]
 #![feature(drain)]
+#![feature(arc_counts)]
 #![cfg_attr(test, feature(test))]
 #![feature(str_match_indices)]
 
@@ -20,7 +21,6 @@ extern crate clock_ticks;
 extern crate rustc_serialize;
 extern crate toml;
 extern crate linked_hash_map;
-extern crate vec_map;
 extern crate fnv;
 extern crate spin;
 extern crate libc;
@@ -35,6 +35,7 @@ mod utils;
 mod rev;
 mod atom;
 mod cookie;
+mod offset_index;
 
 use config::*;
 use queue::*;

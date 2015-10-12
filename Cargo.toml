@@ -20,10 +20,6 @@ rand = "*"
 [dependencies.spin]
 git="https://github.com/arthurprs/spinlock-rs.git"
 
-[dependencies.vec_map]
-version="*"
-features=["nightly"]
-
 [profile.dev]
 opt-level = 0
 debug = true

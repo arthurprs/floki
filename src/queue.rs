@@ -124,11 +124,12 @@ impl Queue {
     pub fn create_channel<S>(&mut self, channel_name: S) -> bool
             where String: From<S> {
         let channel_name: String = channel_name.into();
+        let rlock = self.backend_rlock.read().unwrap();
         let mut locked_channel = self.channels.write().unwrap();
         if let Entry::Vacant(vacant_entry) = locked_channel.entry(channel_name) {
             let channel = Channel {
                 last_touched: self.clock,
-                tail: 0,
+                tail: self.backend.tail(), // should probably be the head instead
                 in_flight: Default::default(),
                 in_flight_heap: Default::default(),
             };
@@ -162,12 +163,12 @@ impl Queue {
                     state.expiration = self.clock + self.config.time_to_live;
                     state.retry += 1;
                     debug!("[{}] msg {} expired and will be sent again", self.config.name, id);
-                    return Some(Ok(self.backend.get(id).unwrap().1))
+                    return Some(Ok(self.backend.get(id).unwrap()))
                 }
             }
 
             // fetch from the backend
-            if let Some((new_tail, message)) = self.backend.get(locked_channel.tail) {
+            if let Some(message) = self.backend.get(locked_channel.tail) {
                 debug!("[{}] fetched msg {} from backend", self.config.name, message.id());
                 let state = InFlightState {
                     expiration: self.clock + self.config.time_to_live,
@@ -175,8 +176,8 @@ impl Queue {
                 };
                 locked_channel.in_flight.insert(message.id(), state);
                 locked_channel.in_flight_heap.push(Rev(message.id()));
-                locked_channel.tail = new_tail;
-                debug!("[{}] advancing tail to {}", self.config.name, new_tail);
+                locked_channel.tail += 1;
+                debug!("[{}] advancing tail to {}", self.config.name, locked_channel.tail);
                 return Some(Ok(message))
             }
             return Some(Err(locked_channel.tail))
@@ -185,10 +186,10 @@ impl Queue {
     }
 
     /// all calls are serialized internally
-    pub fn put(&mut self, message: &[u8]) -> Option<u64> {
+    pub fn push(&mut self, message: &[u8]) -> Option<u64> {
         let wlock = self.backend_wlock.lock().unwrap();
         trace!("[{}] putting message", self.config.name);
-        self.backend.put(message)
+        self.backend.push(self.clock, message)
     }
 
     /// ack access is suposed to be thread-safe, even while writing
@@ -221,7 +222,7 @@ impl Queue {
         self.backend.purge();
         for (_, channel) in &mut*self.channels.write().unwrap() {
             let mut locked_channel = channel.lock().unwrap();
-            locked_channel.tail = 0;
+            locked_channel.tail = 1;
             locked_channel.in_flight.clear();
         }
         self.as_mut().set_state(QueueState::Ready);
@@ -398,7 +399,7 @@ mod tests {
         let mut q = get_queue();
         let message = gen_message(0);
         for i in (0..100_000) {
-            let r = q.put(&message);
+            let r = q.push(&message);
             assert!(r.is_some());
         }
     }
@@ -409,7 +410,7 @@ mod tests {
         let message = gen_message(0);
         assert!(q.create_channel("test"));
         for i in (0..100_000) {
-            assert!(q.put(&message).is_some());
+            assert!(q.push(&message).is_some());
             let m = q.get("test");
             assert!(m.is_some());
         }
@@ -420,7 +421,7 @@ mod tests {
         let mut q = get_queue();
         let message = gen_message(0);
         assert!(q.get("test").is_none());
-        assert!(q.put(&message).is_some());
+        assert!(q.push(&message).is_some());
         assert!(q.create_channel("test") == true);
         assert!(q.create_channel("test") == false);
         assert!(q.get("test").is_some());
@@ -430,7 +431,7 @@ mod tests {
     fn test_in_flight() {
         let mut q = get_queue();
         let message = gen_message(0);
-        assert!(q.put(&message).is_some());
+        assert!(q.push(&message).is_some());
         assert!(q.get("test").is_none());
         assert!(q.create_channel("test") == true);
         assert!(q.create_channel("test") == false);
@@ -444,7 +445,7 @@ mod tests {
         let mut q = get_queue();
         let message = gen_message(0);
         assert!(q.create_channel("test") == true);
-        assert!(q.put(&message).is_some());
+        assert!(q.push(&message).is_some());
         assert!(q.get("test").unwrap().is_ok());
         assert!(q.get("test").unwrap().is_err());
         thread::sleep_ms(1001);
@@ -458,7 +459,7 @@ mod tests {
         let message = gen_message(0);
         let mut put_msg_count = 0;
         while q.backend.files_count() < 3 {
-            assert!(q.put(&message).is_some());
+            assert!(q.push(&message).is_some());
             put_msg_count += 1;
         }
         q.backend.checkpoint(true);
@@ -478,14 +479,18 @@ mod tests {
         let mut q = get_queue_opt("test_queue_recover", false);
         let message = gen_message(0);
         assert!(q.create_channel("test") == true);
-        assert!(q.put(&message).is_some());
-        assert!(q.put(&message).is_some());
+        assert!(q.push(&message).is_some());
+        assert!(q.push(&message).is_some());
         assert!(q.get("test").unwrap().is_ok());
         assert!(q.get("test").unwrap().is_ok());
         assert!(q.get("test").unwrap().is_err());
         q.checkpoint(true);
 
+        println!("{:#?}", &q);
+
         q = get_queue_opt("test_queue_recover", true);
+
+        println!("{:#?}", &q);
         assert!(q.create_channel("test") == false);
         assert!(q.get("test").unwrap().is_ok());
         assert!(q.get("test").unwrap().is_ok());
@@ -499,7 +504,7 @@ mod tests {
         assert!(q.create_channel("test") == true);
 
         while q.backend.files_count() < 3 {
-            assert!(q.put(&message).is_some());
+            assert!(q.push(&message).is_some());
             let get_result = q.get("test");
             assert!(get_result.as_ref().unwrap().is_ok());
             assert!(q.ack("test", get_result.unwrap().unwrap().id()).unwrap());
@@ -518,7 +523,7 @@ mod tests {
         b.bytes = (m.len() * n) as u64;
         b.iter(|| {
             for _ in (0..n) {
-                let r = q.put(m);
+                let r = q.push(m);
                 assert!(r.is_some());
             }
         });
@@ -533,7 +538,7 @@ mod tests {
         b.bytes = (m.len() * n) as u64;
         b.iter(|| {
             for _ in (0..n) {
-                let p = q.put(m).unwrap();
+                let p = q.push(m).unwrap();
                 let r = q.get("test").unwrap().unwrap().id();
                 q.ack("test", r);
                 assert_eq!(p, r);

@@ -5,7 +5,7 @@ use std::os::unix::io::{AsRawFd, RawFd};
 use std::mem;
 use std::collections::VecDeque;
 use std::thread::{self, Thread, JoinHandle};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use spin::{Mutex as SpinLock, RwLock as SpinRwLock};
 use mio::tcp::{TcpStream, TcpListener};
 use mio::util::Slab;
@@ -65,6 +65,7 @@ struct Dispatch {
     cookie: Cookie,
     request: RequestBuffer,
     channel: Sender<NotifyType>,
+    meta_lock: Arc<Mutex<()>>,
     queues: Arc<SpinRwLock<HashMap<Atom, Arc<Queue>>>>,
 }
 
@@ -76,6 +77,7 @@ struct WaitingClients {
 
 pub struct Server {
     config: Arc<ServerConfig>,
+    meta_lock: Arc<Mutex<()>>,
     queues: Arc<SpinRwLock<HashMap<Atom, Arc<Queue>>>>,
     waiting_clients: HashMap<Atom, HashMap<Atom, WaitingClients>>,
     awaking_clients: Vec<Cookie>,
@@ -108,12 +110,11 @@ impl Dispatch {
         self.queues.read().get(name).map(|sq| sq.clone())
     }
 
-    #[inline]
-    fn delete_queue(&self, name: &str) {
-        // TODO: aquire meta xlock
-        let q = self.queues.write().remove(name).unwrap();
+    fn delete_queue(&self, q: Arc<Queue>) {
+        let meta_lock = self.meta_lock.lock().unwrap();
+        let q = self.queues.write().remove(q.name()).unwrap();
         self.notify_server(NotifyMessage::QueueDelete{
-            queue: name.into(),
+            queue: q.name().into(),
         });
         q.as_mut().delete();
     }
@@ -123,7 +124,7 @@ impl Dispatch {
             return sq.clone()
         }
 
-        // TODO: aquire meta xlock
+        let meta_lock = self.meta_lock.lock().unwrap();
         self.queues.write().entry(name.into()).or_insert_with(|| {
             info!("Creating queue {:?}", name);
             let inner_queue = Queue::new(self.config.new_queue_config(name), true);
@@ -185,7 +186,7 @@ impl Dispatch {
         } else {
             let value_slice = self.request.value_slice();
             debug!("inserting into {:?} {:?}", queue_name, value_slice);
-            let id = q.as_mut().put(value_slice).unwrap();
+            let id = q.as_mut().push(value_slice).unwrap();
             trace!("inserted message into {:?} with id {:?}", queue_name, id);
             NotifyMessage::PutResponse{
                 response: ResponseBuffer::new_set_response(),
@@ -218,8 +219,7 @@ impl Dispatch {
                 q.as_mut().purge();
             },
             (Some("_delete"), None) => {
-                drop(q);
-                self.delete_queue(queue_name);
+                self.delete_queue(q);
             },
             (Some(channel_name), Some("_delete")) => {
                 debug!("deleting channel {:?}", channel_name);
@@ -428,12 +428,13 @@ impl Connection {
     fn dispatch(&mut self, request: RequestBuffer, server: &mut Server, event_loop: &mut EventLoop<ServerHandler>) {
         server.nonce = server.nonce.wrapping_add(1);
         self.cookie = Cookie::new(self.token, server.nonce);
-        // FIXME: this not only allocates but clone 3 ARCs
+        // FIXME: this not only allocates but clone 4 ARCs
         let mut dispatch = Dispatch {
             cookie: self.cookie,
             config: server.config.clone(),
             channel: event_loop.channel(),
             request: request,
+            meta_lock: server.meta_lock.clone(),
             queues: server.queues.clone(),
         };
         server.thread_pool.execute(move || dispatch.dispatch());
@@ -535,6 +536,7 @@ impl Server {
         let server = Server {
             listener: listener,
             config: Arc::new(config),
+            meta_lock: Arc::new(Mutex::new(())),
             queues: Default::default(),
             thread_pool: ThreadPool::new(num_threads),
             waiting_clients: Default::default(),
