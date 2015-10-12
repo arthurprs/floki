@@ -117,7 +117,17 @@ impl Queue {
     }
 
     fn set_state(&mut self, new_state: QueueState) {
-        // TODO: state machine check?
+        if self.state == new_state {
+            return
+        }
+        match self.state {
+            QueueState::Deleting => panic!("Deleting can't be reverted"),
+            QueueState::Purging => match new_state {
+                QueueState::Ready => (),
+                other => panic!("Can't go from {:?} to {:?}", self.state, new_state),
+            },
+            QueueState::Ready => (),
+        }
         self.state = new_state;
     }
 
