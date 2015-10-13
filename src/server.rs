@@ -332,6 +332,7 @@ impl Connection {
             if is_complete {
                 assert!(!self.processing);
                 assert!(!self.waiting);
+                assert!(self.timeout.is_none());
                 self.processing = true;
                 self.interest = EventSet::all() - EventSet::readable() - EventSet::writable();
                 event_loop.reregister(&self.stream, self.token, self.interest, PollOpt::level()).unwrap();
@@ -414,9 +415,11 @@ impl Connection {
             TimeoutMessage::Timeout{queue, channel} => {
                 assert!(self.waiting);
                 assert!(!self.processing);
-                server.notify_timeout(queue, channel, self.cookie);
                 self.waiting = false;
-                self.response = Some(ResponseBuffer::new(self.request.take().unwrap().opcode(), Status::KeyNotFound));                
+                self.timeout = None;
+                server.notify_timeout(queue, channel, self.cookie);
+                self.response = Some(ResponseBuffer::new(
+                    self.request.take().unwrap().opcode(), Status::KeyNotFound));                
                 self.interest = EventSet::all() - EventSet::readable();
                 event_loop.reregister(&self.stream, self.token, self.interest, PollOpt::level()).unwrap();    
             },
@@ -445,7 +448,7 @@ impl Connection {
         assert!(self.waiting);
         self.processing = true;
         self.waiting = false;
-        event_loop.clear_timeout(self.timeout.take().unwrap());
+        assert!(event_loop.clear_timeout(self.timeout.take().unwrap()));
         let request = self.request.take().unwrap();
         self.dispatch(request, server, event_loop);
     }
@@ -536,11 +539,12 @@ impl Server {
         }
     }
 
-    fn notify_connection_gone(&mut self, connection: &Connection) {
+    fn notify_connection_gone(&mut self, connection: &Connection,  event_loop: &mut EventLoop<ServerHandler>) {
         debug!("notify_connection_gone {:?} {:?}", connection.token, connection.cookie);
         if !connection.waiting {
             return
         }
+        assert!(event_loop.clear_timeout(connection.timeout.unwrap()));
         // FIXME: possibly expensive
         for (_, channels) in self.waiting_clients.iter_mut() {
             for (_, w) in channels.iter_mut() {
@@ -691,7 +695,7 @@ impl Handler for ServerHandler {
         };
         if !is_ok {
             trace!("deregistering token {:?}", token);
-            self.connections.remove(token).map(|c| self.server.notify_connection_gone(&c));
+            self.connections.remove(token).map(|c| self.server.notify_connection_gone(&c, event_loop));
         }
 
         trace!("done events {:?} for token {:?}", events, token);
@@ -712,7 +716,7 @@ impl Handler for ServerHandler {
         };
         if !is_ok {
             trace!("deregistering token {:?}", token);
-            self.connections.remove(token).map(|c| self.server.notify_connection_gone(&c));
+            self.connections.remove(token).map(|c| self.server.notify_connection_gone(&c, event_loop));
         }
         trace!("end notify event for token {:?}", token);
     }
@@ -737,7 +741,7 @@ impl Handler for ServerHandler {
         };
         if !is_ok {
             trace!("deregistering token {:?}", token);
-            self.connections.remove(token).map(|c| self.server.notify_connection_gone(&c));
+            self.connections.remove(token).map(|c| self.server.notify_connection_gone(&c, event_loop));
         }
         trace!("end timeout event for token {:?}", token);
     }
