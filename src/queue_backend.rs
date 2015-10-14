@@ -165,34 +165,39 @@ impl QueueFile {
     }
     
     fn get(&self, id: u64) -> Result<InnerMessage, ()> {
-        let file_offset = if let Some(file_offset) = self.index.get_offset(id) {
-            file_offset
+        let message_offset = if let Some(message_offset) = self.index.get_offset(id) {
+            message_offset
         } else {
             return Err(())
         };
 
         let header: &MessageHeader = unsafe {
-            mem::transmute(self.file_mmap.offset(file_offset as isize))
+            mem::transmute(self.file_mmap.offset(message_offset as isize))
         };
 
         // check id and possible overflow
-        assert_eq!(header.id, id);
-        assert!(file_offset + size_of::<MessageHeader>() as u32 + header.len as u32 <= self.file_offset);
+        assert!(message_offset <= self.file_offset,
+            "Corrupt file, message start offset {} is past file file offset {}", message_offset, self.file_offset);
+        let message_end_offset = message_offset + size_of::<MessageHeader>() as u32 + header.len as u32;
+        assert!(message_end_offset <= self.file_offset,
+            "Corrupt file, message end offset {} is past file file offset {}", message_end_offset, self.file_offset);
+        assert!(header.id == id,
+            "Corrupt file, ids don't match {} {}", header.id, id);
 
-        let mmap_ptr = unsafe { self.file_mmap.offset(file_offset as isize + size_of::<MessageHeader>() as isize) };
+        let mmap_ptr = unsafe { self.file_mmap.offset(message_offset as isize + size_of::<MessageHeader>() as isize) };
 
         let message = InnerMessage {
             id: id,
             len: header.len,
             mmap_ptr: mmap_ptr,
-            file_offset: file_offset + size_of::<MessageHeader>() as u32,
+            file_offset: message_offset + size_of::<MessageHeader>() as u32,
         };
 
         Ok(message)
     }
 
-    fn push(&mut self, timestamp: u32, message: &[u8]) -> Result<u64, ()> {
-        let message_total_len = size_of::<MessageHeader>() + message.len();
+    fn push(&mut self, timestamp: u32, body: &[u8]) -> Result<u64, ()> {
+        let message_total_len = size_of::<MessageHeader>() + body.len();
 
         if message_total_len as u32 > self.file_size - self.file_offset {
             self.closed = true;
@@ -203,7 +208,7 @@ impl QueueFile {
             hash: 0,
             id: self.head,
             timestamp: timestamp,
-            len: message.len() as u32
+            len: body.len() as u32
         };
 
         unsafe {
@@ -212,15 +217,15 @@ impl QueueFile {
                 self.file_mmap.offset(self.file_offset as isize),
                 size_of::<MessageHeader>());
             ptr::copy_nonoverlapping(
-                message.as_ptr(),
+                body.as_ptr(),
                 self.file_mmap.offset(self.file_offset as isize + size_of::<MessageHeader>() as isize),
-                message.len());
+                body.len());
         }
         // unsafe {
         //     self.file.write_all(slice::from_raw_parts::<u8>(
         //         mem::transmute(&header), size_of::<MessageHeader>()
         //     )).unwrap();
-        //     self.file.write_all(message.body).unwrap();
+        //     self.file.write_all(body.body).unwrap();
         // }
         self.index.push_offset(header.id, self.file_offset);
         self.head += 1;
@@ -251,7 +256,7 @@ impl QueueFile {
         self.file_offset = 0;
         let mut expected_id = self.tail;
         let header_size = size_of::<MessageHeader>() as u32;
-        while self.file_offset + header_size < self.file_size {
+        while self.file_offset + header_size <= self.file_size {
             let header: &MessageHeader = unsafe {
                 mem::transmute(self.file_mmap.offset(self.file_offset as isize))
             };
@@ -343,9 +348,9 @@ impl QueueBackend {
 
     /// Put a message at the end of the Queue, return the message id if succesfull
     /// Note: it's the caller responsability to serialize write calls
-    pub fn push(&mut self, timestamp: u32, message: &[u8]) -> Option<u64> {
+    pub fn push(&mut self, timestamp: u32, body: &[u8]) -> Option<u64> {
         let result = if let Some(q_file) = self.files.read().last() {
-            q_file.as_mut().push(timestamp, message).ok()
+            q_file.as_mut().push(timestamp, body).ok()
         } else {
             None
         };
@@ -364,7 +369,7 @@ impl QueueBackend {
             unsafe { mem::transmute(q_file_ptr) }
         };
 
-        let id = q_file.push(timestamp, message).expect("Can't write to a newly created file!");
+        let id = q_file.push(timestamp, body).expect("Can't write to a newly created file!");
         assert_eq!(id, self.head);
         self.head += 1;
         Some(id)

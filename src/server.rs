@@ -568,7 +568,7 @@ impl Server {
             EventSet::all() - EventSet::writable(), PollOpt::level()).unwrap();
 
         let maintenance_timeout = event_loop.timeout_ms(
-                (SERVER, TimeoutMessage::Maintenance), config.maintenance_timeout as u64).unwrap();
+            (SERVER, TimeoutMessage::Maintenance), config.maintenance_timeout as u64).unwrap();
         event_loop.timeout_ms((SERVER, TimeoutMessage::WallClock), 1000).unwrap();
 
         let server = Server {
