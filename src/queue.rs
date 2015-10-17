@@ -51,7 +51,9 @@ struct InFlightState {
 pub struct Channel {
     last_touched: u32,
     tail: u64,
+    // keeps track of the IDs in flight by id and FIFO order
     in_flight: LinkedHashMap<u64, InFlightState>,
+    // keeps track of the smallest id in flight
     in_flight_heap: BinaryHeap<Rev<u64>>,
 }
 
@@ -59,10 +61,8 @@ pub struct Channel {
 pub struct Queue {
     config: Rc<QueueConfig>,
     // backend writes don't block readers
-    // FIXME: queue_backend should handle it's concurrency access internally,
-    // both for simplicity and performance
-    backend_wlock: Mutex<()>,
-    backend_rlock: RwLock<()>,
+    w_lock: Mutex<()>, // write lock
+    r_lock: RwLock<()>, // read lock
     backend: QueueBackend,
     channels: RwLock<HashMap<String, Mutex<Channel>>>,
     clock: u32, // local copy of the internal clock
@@ -72,6 +72,7 @@ pub struct Queue {
 impl Channel {
     fn real_tail(&self) -> u64 {
         if let Some(&Rev(tail)) = self.in_flight_heap.peek() {
+            debug_assert!(tail < self.tail);
             tail
         } else {
             self.tail
@@ -83,10 +84,6 @@ unsafe impl Sync for Queue {}
 unsafe impl Send for Queue {}
 
 impl Queue {
-    pub fn discover(data_directory: &str) -> Vec<Result<Queue, ()>> {
-        Default::default()
-    }
-
     pub fn new(config: QueueConfig, recover: bool) -> Queue {
         if ! recover {
             remove_dir_if_exist(&config.data_directory).unwrap();
@@ -96,8 +93,8 @@ impl Queue {
         let rc_config = Rc::new(config);
         let mut queue = Queue {
             config: rc_config.clone(),
-            backend_wlock: Mutex::new(()),
-            backend_rlock: RwLock::new(()),
+            w_lock: Mutex::new(()),
+            r_lock: RwLock::new(()),
             backend: QueueBackend::new(rc_config.clone(), recover),
             channels: RwLock::new(Default::default()),
             clock: 0,
@@ -134,7 +131,7 @@ impl Queue {
     pub fn create_channel<S>(&mut self, channel_name: S) -> bool
             where String: From<S> {
         let channel_name: String = channel_name.into();
-        let rlock = self.backend_rlock.read().unwrap();
+        let r_lock = self.r_lock.read().unwrap();
         let mut locked_channel = self.channels.write().unwrap();
         if let Entry::Vacant(vacant_entry) = locked_channel.entry(channel_name) {
             let channel = Channel {
@@ -158,7 +155,7 @@ impl Queue {
 
     /// get access is suposed to be thread-safe, even while writing
     pub fn get(&mut self, channel_name: &str) -> Option<Result<Message, u64>> {
-        let rlock = self.backend_rlock.read().unwrap();
+        let r_lock = self.r_lock.read().unwrap();
         let locked_channels = self.channels.read().unwrap();
         if let Some(channel) = locked_channels.get(channel_name) {
             let mut locked_channel = channel.lock().unwrap();
@@ -198,7 +195,7 @@ impl Queue {
 
     /// all calls are serialized internally
     pub fn push(&mut self, message: &[u8]) -> Option<u64> {
-        let wlock = self.backend_wlock.lock().unwrap();
+        let w_lock = self.w_lock.lock().unwrap();
         trace!("[{}] putting message", self.config.name);
         self.backend.push(self.clock, message)
     }
@@ -224,10 +221,18 @@ impl Queue {
         None
     }
 
+    // TODO: NACK
+    // pub fn nack(arg: Type) -> RetType {
+    //     // add code here
+    // }
+
     pub fn purge(&mut self) {
+        // TODO:
+        // we should probably just advance the tails and let GC take care of any cleaning
+        // it's much faster and won't block incoming operations for long
         info!("[{}] purging", self.config.name);
-        let rlock = self.backend_rlock.write().unwrap();
-        let wlock = self.backend_wlock.lock().unwrap();
+        let r_lock = self.r_lock.write().unwrap();
+        let w_lock = self.w_lock.lock().unwrap();
         self.as_mut().set_state(QueueState::Purging);
         self.as_mut().checkpoint(false);
         self.backend.purge();
@@ -242,8 +247,8 @@ impl Queue {
 
     pub fn delete(&mut self) {
         info!("[{}] deleting", self.config.name);
-        let rlock = self.backend_rlock.write().unwrap();
-        let wlock = self.backend_wlock.lock().unwrap();
+        let r_lock = self.r_lock.write().unwrap();
+        let w_lock = self.w_lock.lock().unwrap();
         self.as_mut().set_state(QueueState::Deleting);
         self.as_mut().checkpoint(false);
         self.backend.delete();
@@ -355,7 +360,7 @@ impl Queue {
 
         debug!("[{}] smallest_tail is {}", self.config.name, smallest_tail);
 
-        let rlock = self.backend_rlock.read();
+        let r_lock = self.r_lock.read();
         self.backend.gc(smallest_tail);
         self.as_mut().checkpoint(false);
     }
@@ -389,6 +394,7 @@ mod tests {
 
     fn get_queue_opt(name: &str, recover: bool) -> Queue {
         let mut server_config = ServerConfig::read();
+        server_config.data_directory = "./test_data".into();
         server_config.segment_size = 4 * 1024 * 1024;
         let mut queue_config = server_config.new_queue_config(name);
         queue_config.time_to_live = 1;

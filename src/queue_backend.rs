@@ -117,6 +117,7 @@ impl QueueFile {
                 .create(true)
                 .truncate(true)
                 .open(&data_path).unwrap();
+        // TODO: try to use fallocate if present
         // hopefully the filesystem supports sparse files
         file.set_len(config.segment_size).unwrap();
         Self::new(config, file, data_path, start_id)

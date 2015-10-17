@@ -1,8 +1,9 @@
 use std::str::{self, FromStr};
-use std::net::{SocketAddr, SocketAddrV4};
+use std::net::SocketAddr;
 use std::io::{Read, Write, Result as IoResult, Error as IoError};
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::mem;
+use std::cmp;
 use std::collections::VecDeque;
 use std::thread::{self, Thread, JoinHandle};
 use std::sync::{Arc, Mutex};
@@ -128,8 +129,8 @@ impl Dispatch {
         let meta_lock = self.meta_lock.lock().unwrap();
         self.queues.write().entry(name.into()).or_insert_with(|| {
             info!("Creating queue {:?}", name);
-            let inner_queue = Queue::new(self.config.new_queue_config(name), true);
-            trace!("done creating queue {:?}", name);
+            let inner_queue = Queue::new(self.config.new_queue_config(name), false);
+            debug!("Done creating queue {:?}", name);
 
             self.notify_server(NotifyMessage::QueueCreate{
                 queue: inner_queue.name().into(),
@@ -178,12 +179,15 @@ impl Dispatch {
 
         if let Some(channel_name) = channel_name_opt {
             info!("creating queue {:?} channel {:?}", queue_name, channel_name);
-            q.as_mut().create_channel(channel_name);
-            self.notify_server(NotifyMessage::ChannelCreate{
-                queue: q.name().into(),
-                channel: channel_name.into(),
-            });
-            NotifyMessage::from_status(&self.request, Status::NoError)
+            if q.as_mut().create_channel(channel_name) {
+                self.notify_server(NotifyMessage::ChannelCreate{
+                    queue: q.name().into(),
+                    channel: channel_name.into(),
+                });
+                NotifyMessage::from_status(&self.request, Status::NoError)
+            } else {
+                NotifyMessage::from_status(&self.request, Status::KeyNotFound)
+            }
         } else {
             let value_slice = self.request.value_slice();
             debug!("inserting into {:?} {:?}", queue_name, value_slice);
@@ -385,6 +389,7 @@ impl Connection {
                 self.processing = false;
                 self.waiting = true;
                 self.request = Some(request);
+                // TODO: this timeout value should come with the message
                 self.timeout = Some(event_loop.timeout_ms(
                     (self.token, TimeoutMessage::Timeout{queue: queue.clone(), channel: channel.clone()}),
                     5000
@@ -455,6 +460,54 @@ impl Connection {
 }
 
 impl Server {
+
+    pub fn new(config: ServerConfig) -> (ServerHandler, EventLoop<ServerHandler>) {
+        let addr = SocketAddr::from_str(&config.bind_address).unwrap();
+
+        debug!("binding tcp socket to {:?}", addr);
+        let listener = TcpListener::bind(&addr).unwrap();
+
+        let num_cpus = get_num_cpus();
+        let num_threads = cmp::min(6, num_cpus * 2 + 1);
+        debug!("detected {} cpus, using {} threads", num_cpus, num_threads);
+
+        let mut event_loop = EventLoop::new().unwrap();
+        event_loop.register_opt(&listener, SERVER,
+            EventSet::all() - EventSet::writable(), PollOpt::level()).unwrap();
+
+        let maintenance_timeout = event_loop.timeout_ms(
+            (SERVER, TimeoutMessage::Maintenance), config.maintenance_timeout as u64).unwrap();
+        event_loop.timeout_ms((SERVER, TimeoutMessage::WallClock), 1000).unwrap();
+
+        let server = Server {
+            listener: listener,
+            config: Arc::new(config),
+            meta_lock: Arc::new(Mutex::new(())),
+            queues: Default::default(),
+            thread_pool: ThreadPool::new(num_threads),
+            waiting_clients: Default::default(),
+            awaking_clients: Default::default(),
+            maintenance_timeout: maintenance_timeout,
+            nonce: 0,
+        };
+
+        info!("Opening queues...");
+        for queue_config in ServerConfig::read_queue_configs(&server.config) {
+            info!("Opening queue {:?}", queue_config.name);
+            let inner_queue = Queue::new(queue_config, false /* true See comment bellow */);
+            // fill in server.waiting_clients structure
+            debug!("Done opening queue {:?}", inner_queue.name());
+            server.queues.write().insert(inner_queue.name().into(), Arc::new(inner_queue));
+        }
+        debug!("Opening complete!");
+
+        let server_handler = ServerHandler {
+            server: server,
+            connections: Slab::new_starting_at(FIRST_CLIENT, 1024)
+        };
+
+        (server_handler, event_loop)
+    }
 
     fn wait_queue(&mut self, queue: Atom, channel: Atom, cookie: Cookie, required_tail: u64) {
         debug!("wait_queue {:?} {:?} {:?} {:?}", queue, channel, cookie, required_tail);
@@ -533,7 +586,7 @@ impl Server {
         debug!("notify_channel_created {:?} {:?}", queue, channel);
         if let Some(channels) = self.waiting_clients.get_mut(&queue) {
             let prev = channels.insert(channel, Default::default());
-            assert!(prev.is_none());
+            debug_assert!(prev.is_none());
         } else {
             unreachable!();
         }
@@ -553,50 +606,12 @@ impl Server {
         }
     }
 
-    pub fn new(config: ServerConfig) -> (ServerHandler, EventLoop<ServerHandler>) {
-        let addr = SocketAddr::from_str(&config.bind_address).unwrap();
-
-        debug!("binding tcp socket to {:?}", addr);
-        let listener = TcpListener::bind(&addr).unwrap();
-
-        let num_cpus = get_num_cpus();
-        let num_threads = (num_cpus + 1) * 2;
-        debug!("detected {} cpus, using {} threads", num_cpus, num_threads);
-
-        let mut event_loop = EventLoop::new().unwrap();
-        event_loop.register_opt(&listener, SERVER,
-            EventSet::all() - EventSet::writable(), PollOpt::level()).unwrap();
-
-        let maintenance_timeout = event_loop.timeout_ms(
-            (SERVER, TimeoutMessage::Maintenance), config.maintenance_timeout as u64).unwrap();
-        event_loop.timeout_ms((SERVER, TimeoutMessage::WallClock), 1000).unwrap();
-
-        let server = Server {
-            listener: listener,
-            config: Arc::new(config),
-            meta_lock: Arc::new(Mutex::new(())),
-            queues: Default::default(),
-            thread_pool: ThreadPool::new(num_threads),
-            waiting_clients: Default::default(),
-            awaking_clients: Default::default(),
-            maintenance_timeout: maintenance_timeout,
-            nonce: 0,
-        };
-
-        let server_handler = ServerHandler {
-            server: server,
-            connections: Slab::new_starting_at(FIRST_CLIENT, 1024)
-        };
-
-        (server_handler, event_loop)
-    }
-
-     fn ready(&mut self, connections: &mut Slab<Connection>, event_loop: &mut EventLoop<ServerHandler>, events: EventSet) -> bool {
+    fn ready(&mut self, connections: &mut Slab<Connection>, event_loop: &mut EventLoop<ServerHandler>, events: EventSet) -> bool {
         assert_eq!(events, EventSet::readable());
 
         if let Some(stream) = self.listener.accept().unwrap() {
             let connection_addr = stream.peer_addr();
-            debug!("incomming connection from {:?}", connection_addr);
+            info!("incomming connection from {:?}", connection_addr);
 
             // Don't buffer output in TCP - kills latency sensitive benchmarks
             // TODO: use TCP_CORK
