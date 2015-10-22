@@ -497,7 +497,7 @@ impl Server {
             (SERVER, TimeoutMessage::Maintenance), config.maintenance_timeout as u64).unwrap();
         event_loop.timeout_ms((SERVER, TimeoutMessage::WallClock), 1000).unwrap();
 
-        let server = Server {
+        let mut server = Server {
             listener: listener,
             config: Arc::new(config),
             meta_lock: Arc::new(Mutex::new(())),
@@ -512,10 +512,24 @@ impl Server {
         info!("Opening queues...");
         for queue_config in ServerConfig::read_queue_configs(&server.config) {
             info!("Opening queue {:?}", queue_config.name);
-            let inner_queue = Queue::new(queue_config, false /* true See comment bellow */);
-            // fill in server.waiting_clients structure
-            debug!("Done opening queue {:?}", inner_queue.name());
-            server.queues.write().insert(inner_queue.name().into(), Arc::new(inner_queue));
+
+            let queue = Queue::new(queue_config, true);
+            // load state
+            let info = queue.info();
+            let mut waiting_clients: HashMap<_, _> = Default::default();
+            for (channel_name, channel_info) in info.channels {
+                waiting_clients.insert(
+                    channel_name.into(),
+                    WaitingClients {
+                        required_tail: channel_info.tail,
+                        .. Default::default()
+                    }
+                );
+            }
+            server.waiting_clients.insert(queue.name().into(), waiting_clients);
+
+            debug!("Done opening queue {:?}", queue.name());
+            server.queues.write().insert(queue.name().into(), Arc::new(queue));
         }
         debug!("Opening complete!");
 

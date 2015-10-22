@@ -29,6 +29,15 @@ impl Default for QueueState {
     }
 }
 
+pub struct ChannelInfo {
+    pub tail: u64,
+}
+
+pub struct QueueInfo {
+    pub head: u64,
+    pub channels: BTreeMap<String, ChannelInfo>
+}
+
 #[derive(Debug, Eq, PartialEq, RustcDecodable, RustcEncodable)]
 struct ChannelCheckpoint {
     last_touched: u32,
@@ -243,6 +252,22 @@ impl Queue {
         }
         self.as_mut().set_state(QueueState::Ready);
         self.as_mut().checkpoint(false);
+    }
+
+    pub fn info(&self) -> QueueInfo {
+        let r_lock = self.r_lock.write().unwrap();
+        let mut q_info = QueueInfo {
+            head: 1,
+            channels: Default::default()
+        };
+        for (channel_name, channel) in &*self.channels.write().unwrap() {
+            let locked_channel = channel.lock().unwrap();
+            q_info.channels.insert(channel_name.clone(), ChannelInfo{
+                tail: locked_channel.tail
+            });
+        }
+
+        q_info
     }
 
     pub fn delete(&mut self) {
