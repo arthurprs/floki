@@ -113,12 +113,41 @@ impl Dispatch {
     }
 
     fn delete_queue(&self, q: Arc<Queue>) {
+        debug!("deleting queue {:?}", q.name());
         let meta_lock = self.meta_lock.lock().unwrap();
         let q = self.queues.write().remove(q.name()).unwrap();
         self.notify_server(NotifyMessage::QueueDelete{
             queue: q.name().into(),
         });
         q.as_mut().delete();
+    }
+
+    fn delete_channel(&self, q: &Queue, channel_name: &str) -> bool {
+        debug!("deleting queue {:?} channel {:?}", q.name(), channel_name);
+        let meta_lock = self.meta_lock.lock().unwrap();
+        if q.as_mut().delete_channel(channel_name) {
+            self.notify_server(NotifyMessage::ChannelDelete{
+                queue: q.name().into(),
+                channel: channel_name.into(),
+            });
+            true
+        } else {
+            false
+        }
+    }
+
+    fn create_channel(&self, q: &Queue, channel_name: &str) -> bool {
+        info!("creating queue {:?} channel {:?}", q.name(), channel_name);
+        let meta_lock = self.meta_lock.lock().unwrap();
+        if q.as_mut().create_channel(channel_name) {
+            self.notify_server(NotifyMessage::ChannelCreate{
+                queue: q.name().into(),
+                channel: channel_name.into(),
+            });
+            true
+        } else {
+            false
+        }
     }
 
     fn get_or_create_queue(&self, name: &str) -> Arc<Queue> {
@@ -178,12 +207,7 @@ impl Dispatch {
         let q = self.get_or_create_queue(queue_name);
 
         if let Some(channel_name) = channel_name_opt {
-            info!("creating queue {:?} channel {:?}", queue_name, channel_name);
-            if q.as_mut().create_channel(channel_name) {
-                self.notify_server(NotifyMessage::ChannelCreate{
-                    queue: q.name().into(),
-                    channel: channel_name.into(),
-                });
+            if self.create_channel(&q, channel_name) {
                 NotifyMessage::from_status(&self.request, Status::NoError)
             } else {
                 NotifyMessage::from_status(&self.request, Status::KeyNotFound)
@@ -227,13 +251,7 @@ impl Dispatch {
                 self.delete_queue(q);
             },
             (Some(channel_name), Some("_delete")) => {
-                debug!("deleting channel {:?}", channel_name);
-                if q.as_mut().delete_channel(channel_name) {
-                    self.notify_server(NotifyMessage::ChannelDelete{
-                        queue: q.name().into(),
-                        channel: channel_name.into(),
-                    });
-                } else {
+                if ! self.delete_channel(&q, channel_name) {
                     return NotifyMessage::from_status(&self.request, Status::KeyNotFound)
                 }
             },
@@ -518,10 +536,12 @@ impl Server {
                     return
                 }
             } else {
-                unreachable!();
+                debug!("Race condition, queue {:?} channel {:?} is gone", queue, channel);
+                self.awaking_clients.push(cookie);
             }
         } else {
-            unreachable!();
+            debug!("Race condition, queue {:?} is gone", queue);
+            self.awaking_clients.push(cookie);
         }
     }
 
@@ -532,10 +552,10 @@ impl Server {
                 // FIXME: only need to delete the first ocurrence
                 w.cookies.retain(|&c| c != cookie);
             } else {
-                unreachable!();
+                debug!("Race condition, queue {:?} channel {:?} is gone", queue, channel);
             }
         } else {
-            unreachable!();
+            debug!("Race condition, queue {:?} is gone", queue);
         }
     }
 
@@ -548,7 +568,7 @@ impl Server {
                 }
             }
         } else {
-            unreachable!();
+            debug!("Race condition, queue {:?} is gone", queue);
         }
     }
 

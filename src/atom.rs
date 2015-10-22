@@ -5,7 +5,6 @@ use std::sync::Arc;
 #[derive(Hash, Eq, PartialEq, Debug, Clone)]
 pub struct Atom(Arc<String>);
 
-
 impl Borrow<str> for Atom {
     #[inline(always)]
     fn borrow(&self) -> &str {

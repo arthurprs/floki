@@ -332,7 +332,8 @@ impl Queue {
             .and_then(|mut file| {
                 write!(file, "{}", json::as_pretty_json(&checkpoint)).unwrap();
                 file.sync_data()
-            }).and_then(|_| {
+            })
+            .and_then(|_| {
                 let final_path = tmp_path.with_file_name(QUEUE_CHECKPOINT_FILE);
                 fs::rename(tmp_path, final_path)
             });
@@ -348,14 +349,10 @@ impl Queue {
     pub fn maintenance(&mut self) {
         let smallest_tail = {
             let locked_channels = self.channels.read().unwrap();
-            locked_channels.values().map(|channel| {
-                let locked_channel = channel.lock().unwrap();
-                if let Some(&Rev(tail)) = locked_channel.in_flight_heap.peek() {
-                    tail
-                } else {
-                    locked_channel.tail
-                }
-            }).min().unwrap_or(0)
+            locked_channels.values()
+                .map(|c| c.lock().unwrap().real_tail())
+                .min()
+                .unwrap_or(0)
         };
 
         debug!("[{}] smallest_tail is {}", self.config.name, smallest_tail);
