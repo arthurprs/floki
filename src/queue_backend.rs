@@ -105,7 +105,7 @@ pub struct QueueBackend {
 
 impl QueueFile {
     fn gen_file_path(config: &QueueConfig, start_id: u64, ext: &str) -> PathBuf {
-        config.data_directory.join(format!("{:019}.{}", start_id, ext))
+        config.data_directory.join(format!("{:015}.{}", start_id, ext))
     }
 
     fn create(config: &QueueConfig, start_id: u64) -> QueueFile {
