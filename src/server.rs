@@ -73,7 +73,7 @@ struct Dispatch {
 
 #[derive(Default)]
 struct WaitingClients {
-    required_tail: u64,
+    tail: u64,
     cookies: VecDeque<Cookie>,
 }
 
@@ -220,7 +220,7 @@ impl Dispatch {
             NotifyMessage::PutResponse{
                 response: ResponseBuffer::new_set_response(),
                 queue: q.name().into(),
-                new_tail: id
+                new_tail: id + 1
             }
         }
     }
@@ -345,7 +345,7 @@ impl Connection {
                     trace!("filled request with {} bytes, remaining: {}", bytes_read, request.remaining());
                     
                     if request.is_complete() {
-                        debug!("done reading request {:?} from token {:?}", request, self.token);
+                        trace!("done reading request from token {:?}", self.token);
                         break
                     }
                 }
@@ -371,7 +371,7 @@ impl Connection {
                     trace!("filled response with {} bytes, remaining: {}", bytes_written, response.remaining());
 
                     if response.is_complete() {
-                        debug!("done sending response {:?} to token {:?}", response, self.token);
+                        trace!("done sending response to token {:?}", self.token);
                         break
                     }
                 }
@@ -394,7 +394,7 @@ impl Connection {
         let (cookie, msg) = notification;
 
         if self.hup {
-            return false;
+            return false
         }
 
         if cookie != self.cookie {
@@ -429,7 +429,6 @@ impl Connection {
         }
 
         event_loop.reregister(&self.stream, self.token, self.interest, PollOpt::level()).unwrap();    
-
         true
     }
 
@@ -521,7 +520,7 @@ impl Server {
                 waiting_clients.insert(
                     channel_name.into(),
                     WaitingClients {
-                        required_tail: channel_info.tail,
+                        tail: channel_info.tail,
                         .. Default::default()
                     }
                 );
@@ -545,9 +544,11 @@ impl Server {
         debug!("wait_queue {:?} {:?} {:?} {:?}", queue, channel, cookie, required_tail);
         if let Some(channels) = self.waiting_clients.get_mut(&queue) {
             if let Some(w)  = channels.get_mut(&channel) {
-                if w.required_tail < required_tail {
+                if required_tail <= w.tail {
                     w.cookies.push_back(cookie);
-                    return
+                } else {
+                    debug!("Race condition, queue {:?} channel {:?} has new data", queue, channel);
+                    self.awaking_clients.push(cookie);
                 }
             } else {
                 debug!("Race condition, queue {:?} channel {:?} is gone", queue, channel);
@@ -566,10 +567,10 @@ impl Server {
                 // FIXME: only need to delete the first ocurrence
                 w.cookies.retain(|&c| c != cookie);
             } else {
-                debug!("Race condition, queue {:?} channel {:?} is gone", queue, channel);
+                unreachable!();
             }
         } else {
-            debug!("Race condition, queue {:?} is gone", queue);
+            unreachable!();
         }
     }
 
@@ -577,8 +578,11 @@ impl Server {
         debug!("notify_queue {:?} {:?}", queue, new_tail);
         if let Some(channels) = self.waiting_clients.get_mut(&queue) {
             for (_, w) in channels.iter_mut() {
-                if new_tail >= w.required_tail {
-                    self.awaking_clients.extend(w.cookies.drain());
+                if new_tail > w.tail {
+                    w.tail = new_tail;
+                    self.awaking_clients.extend(w.cookies.drain(..));
+                } else {
+                    debug!("Race condition, queue {:?} tail already advanced", queue);
                 }
             }
         } else {
