@@ -485,7 +485,7 @@ impl Server {
         let listener = TcpListener::bind(&addr).unwrap();
 
         let num_cpus = get_num_cpus();
-        let num_threads = cmp::min(6, num_cpus * 2 + 1);
+        let num_threads = cmp::max(6, num_cpus * 2 + 1);
         debug!("detected {} cpus, using {} threads", num_cpus, num_threads);
 
         let mut event_loop = EventLoop::new().unwrap();
