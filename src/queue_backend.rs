@@ -197,7 +197,7 @@ impl QueueFile {
         Ok(message)
     }
 
-    fn push(&mut self, timestamp: u32, body: &[u8]) -> Result<u64, ()> {
+    fn push(&mut self, body: &[u8], clock: u32) -> Result<u64, ()> {
         let message_total_len = size_of::<MessageHeader>() + body.len();
 
         if message_total_len as u32 > self.file_size - self.file_offset {
@@ -208,7 +208,7 @@ impl QueueFile {
         let header = MessageHeader {
             hash: 0,
             id: self.head,
-            timestamp: timestamp,
+            timestamp: clock,
             len: body.len() as u32
         };
 
@@ -349,9 +349,9 @@ impl QueueBackend {
 
     /// Put a message at the end of the Queue, return the message id if succesfull
     /// Note: it's the caller responsability to serialize write calls
-    pub fn push(&mut self, timestamp: u32, body: &[u8]) -> Option<u64> {
+    pub fn push(&mut self, body: &[u8], timestamp: u32) -> Option<u64> {
         let result = if let Some(q_file) = self.files.read().last() {
-            q_file.as_mut().push(timestamp, body).ok()
+            q_file.as_mut().push(body, timestamp).ok()
         } else {
             None
         };
@@ -370,7 +370,7 @@ impl QueueBackend {
             unsafe { mem::transmute(q_file_ptr) }
         };
 
-        let id = q_file.push(timestamp, body).expect("Can't write to a newly created file!");
+        let id = q_file.push(body, timestamp).expect("Can't write to a newly created file!");
         assert_eq!(id, self.head);
         self.head += 1;
         Some(id)

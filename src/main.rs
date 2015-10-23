@@ -17,7 +17,7 @@ extern crate nix;
 extern crate mio;
 extern crate num_cpus;
 extern crate threadpool;
-extern crate clock_ticks;
+extern crate time;
 extern crate rustc_serialize;
 extern crate toml;
 extern crate linked_hash_map;
@@ -41,7 +41,6 @@ use config::*;
 use queue::*;
 use queue_backend::Message;
 use server::*;
-
 
 // fn configure_log() {
 //  let logger_config = fern::DispatchConfig {

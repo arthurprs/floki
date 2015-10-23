@@ -22,6 +22,7 @@ use utils::*;
 use rev::Rev;
 use atom::Atom;
 use cookie::Cookie;
+use time;
 
 const SERVER: Token = Token(0);
 const FIRST_CLIENT: Token = Token(1);
@@ -54,6 +55,7 @@ struct Connection {
     cookie: Cookie,
     stream: TcpStream,
     interest: EventSet,
+    request_clock_ms: u64,
     request: Option<RequestBuffer>,
     response: Option<ResponseBuffer>,
     timeout: Option<Timeout>,
@@ -69,6 +71,7 @@ struct Dispatch {
     channel: Sender<NotifyType>,
     meta_lock: Arc<Mutex<()>>,
     queues: Arc<SpinRwLock<HashMap<Atom, Arc<Queue>>>>,
+    clock: u32,
 }
 
 #[derive(Default)]
@@ -87,6 +90,7 @@ pub struct Server {
     thread_pool: ThreadPool,
     maintenance_timeout: Timeout,
     nonce: u64,
+    clock_ms: u64,
 }
 
 pub struct ServerHandler {
@@ -139,7 +143,7 @@ impl Dispatch {
     fn create_channel(&self, q: &Queue, channel_name: &str) -> bool {
         info!("creating queue {:?} channel {:?}", q.name(), channel_name);
         let meta_lock = self.meta_lock.lock().unwrap();
-        if q.as_mut().create_channel(channel_name) {
+        if q.as_mut().create_channel(channel_name, self.clock) {
             self.notify_server(NotifyMessage::ChannelCreate{
                 queue: q.name().into(),
                 channel: channel_name.into(),
@@ -184,7 +188,7 @@ impl Dispatch {
             return NotifyMessage::from_status(&self.request, Status::KeyNotFound)
         };
 
-        match q.as_mut().get(channel_name) {
+        match q.as_mut().get(channel_name, self.clock) {
             Some(Ok(message)) => {
                 NotifyMessage::from_message(&self.request, message)
             },
@@ -215,7 +219,7 @@ impl Dispatch {
         } else {
             let value_slice = self.request.value_slice();
             debug!("inserting into {:?} {:?}", queue_name, value_slice);
-            let id = q.as_mut().push(value_slice).unwrap();
+            let id = q.as_mut().push(value_slice, self.clock).unwrap();
             trace!("inserted message into {:?} with id {:?}", queue_name, id);
             NotifyMessage::PutResponse{
                 response: ResponseBuffer::new_set_response(),
@@ -237,7 +241,7 @@ impl Dispatch {
 
         if let (Some(channel_name), Some(id)) = (channel_name_opt, self.request.arg_uint(2)) {
             debug!("deleting message {:?} from {:?} {:?}", id, queue_name, channel_name);
-            if q.as_mut().ack(channel_name, id).is_some() {
+            if q.as_mut().ack(channel_name, id, self.clock).is_some() {
                 return NotifyMessage::from_status(&self.request, Status::NoError)
             }
             return NotifyMessage::from_status(&self.request, Status::KeyNotFound)
@@ -317,6 +321,7 @@ impl Connection {
             cookie: Cookie::new(token, nonce),
             stream: stream,
             interest: EventSet::all() - EventSet::writable(),
+            request_clock_ms: 0,
             request: Some(RequestBuffer::new()),
             response: None,
             timeout: None,
@@ -405,14 +410,20 @@ impl Connection {
             NotifyMessage::GetWouldBlock{request, queue, channel, required_tail} => {
                 assert!(self.timeout.is_none());
                 self.processing = false;
-                self.waiting = true;
-                self.request = Some(request);
                 // TODO: this timeout value should come with the message
-                self.timeout = Some(event_loop.timeout_ms(
-                    (self.token, TimeoutMessage::Timeout{queue: queue.clone(), channel: channel.clone()}),
-                    5000
-                ).unwrap());
-                server.wait_queue(queue, channel, cookie, required_tail);
+                let deadline = self.request_clock_ms + 5000;
+                if server.clock_ms >= deadline {
+                    self.response = Some(ResponseBuffer::new(request.opcode(), Status::KeyNotFound));
+                    self.interest = EventSet::all() - EventSet::readable();
+                } else {
+                    self.waiting = true;
+                    self.request = Some(request);
+                    self.timeout = Some(event_loop.timeout_ms(
+                        (self.token, TimeoutMessage::Timeout{queue: queue.clone(), channel: channel.clone()}),
+                        (deadline - server.clock_ms) as u64
+                    ).unwrap());
+                    server.wait_queue(queue, channel, cookie, required_tail);
+                }
             },
             NotifyMessage::PutResponse{response, queue, new_tail} => {
                 self.processing = false;
@@ -461,6 +472,7 @@ impl Connection {
             request: request,
             meta_lock: server.meta_lock.clone(),
             queues: server.queues.clone(),
+            clock: (server.clock_ms / 1000) as u32
         };
         server.thread_pool.execute(move || dispatch.dispatch());
     }
@@ -506,6 +518,7 @@ impl Server {
             awaking_clients: Default::default(),
             maintenance_timeout: maintenance_timeout,
             nonce: 0,
+            clock_ms: Self::get_clock_ms(),
         };
 
         info!("Opening queues...");
@@ -717,16 +730,17 @@ impl Server {
                 });
             },
             TimeoutMessage::WallClock => {
-                // TODO: this is really bad
-                // we should probably update our clock and pass it to queues functions via a parameter
-                for queue in self.queues.read().values() {
-                    queue.as_mut().tick()
-                }
-                event_loop.timeout_ms((SERVER, TimeoutMessage::WallClock), 1000).unwrap();
+                self.clock_ms = Self::get_clock_ms();
+                event_loop.timeout_ms((SERVER, TimeoutMessage::WallClock), 100).unwrap();
             }
             to => panic!("can't handle to {:?}", to)
         }
         true
+    }
+
+    fn get_clock_ms() -> u64 {
+        let time::Timespec{sec, nsec} = time::get_time();
+        sec as u64 + (nsec / 1000 / 1000) as u64
     }
 }
 
