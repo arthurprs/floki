@@ -257,7 +257,7 @@ impl QueueFile {
         self.file_offset = 0;
         let mut expected_id = self.tail;
         let header_size = size_of::<MessageHeader>() as u32;
-        while self.file_offset + header_size <= self.file_size {
+        while self.file_offset + header_size < self.file_size {
             let header: &MessageHeader = unsafe {
                 mem::transmute(self.file_mmap.offset(self.file_offset as isize))
             };
@@ -448,9 +448,11 @@ impl QueueBackend {
     }
 
     pub fn checkpoint(&mut self, full: bool) {
-        let file_checkpoints: Vec<_> =  self.files.read().iter().map(|q_file| {
+        let files_copy = self.files.read().clone();
+        let file_checkpoints: Vec<_> = files_copy.into_iter().map(|q_file| {
             q_file.as_mut().checkpoint(full)
         }).collect();
+
         let checkpoint = QueueBackendCheckpoint {
             files: file_checkpoints
         };
@@ -478,9 +480,9 @@ impl QueueBackend {
 
     pub fn gc(&mut self, smallest_tail: u64) {
         let mut gc_index = 0;
-        // collect files_nums until the first still open or with head >= smallest_tail
+        // collect files_nums until the first still open or with head > smallest_tail
         for q_file in &*self.files.read() {
-            if ! q_file.closed || q_file.tail >= smallest_tail {
+            if ! q_file.closed || q_file.head > smallest_tail {
                 break
             }
             gc_index += 1;
