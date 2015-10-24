@@ -218,7 +218,7 @@ impl Dispatch {
             }
         } else {
             let value_slice = self.request.value_slice();
-            debug!("inserting into {:?} {:?}", queue_name, value_slice);
+            debug!("inserting into {:?} [{:?}]", queue_name, value_slice.len());
             let id = q.as_mut().push(value_slice, self.clock).unwrap();
             trace!("inserted message into {:?} with id {:?}", queue_name, id);
             NotifyMessage::PutResponse{
@@ -270,8 +270,8 @@ impl Dispatch {
     fn dispatch(&mut self) {
         let opcode = self.request.opcode();
 
-        debug!("dispatch {:?} {:?} {:?} {:?}",
-            self.cookie.token(), opcode, self.request.key_str(), self.request.value_slice());
+        debug!("dispatch {:?} {:?} {:?} [{:?}]",
+            self.cookie.token(), opcode, self.request.key_str(), self.request.value_slice().len());
 
         let notification = match opcode {
             OpCode::Get | OpCode::GetK | OpCode::GetQ | OpCode::GetKQ => {
@@ -329,6 +329,12 @@ impl Connection {
             waiting: false,
             hup: false,
         }
+    }
+
+    fn send_response(&mut self, response: ResponseBuffer, server: &mut Server, event_loop: &mut EventLoop<ServerHandler>) {
+        self.response = Some(response);
+        self.interest = EventSet::all() - EventSet::readable();
+        event_loop.reregister(&self.stream, self.token, self.interest, PollOpt::level()).unwrap();
     }
 
     fn ready(&mut self, server: &mut Server, event_loop: &mut EventLoop<ServerHandler>, events: EventSet) -> bool {
@@ -414,8 +420,11 @@ impl Connection {
                 // TODO: this timeout value should come with the message
                 let deadline = self.request_clock_ms + 5000;
                 if server.clock_ms >= deadline {
-                    self.response = Some(ResponseBuffer::new(request.opcode(), Status::KeyNotFound));
-                    self.interest = EventSet::all() - EventSet::readable();
+                    self.send_response(
+                        ResponseBuffer::new(request.opcode(), Status::KeyNotFound),
+                        server,
+                        event_loop
+                    );
                 } else {
                     self.waiting = true;
                     self.request = Some(request);
@@ -427,18 +436,15 @@ impl Connection {
                 }
             },
             NotifyMessage::PutResponse{response, queue, new_tail} => {
-                self.response = Some(response);
-                self.interest = EventSet::all() - EventSet::readable();
+                self.send_response(response, server, event_loop);
                 server.notify_queue(queue, new_tail);
             },
             NotifyMessage::Response{response} => {
-                self.response = Some(response);
-                self.interest = EventSet::all() - EventSet::readable();
+                self.send_response(response, server, event_loop);
             },
             msg => panic!("can't handle msg {:?}", msg)
         }
 
-        event_loop.reregister(&self.stream, self.token, self.interest, PollOpt::level()).unwrap();    
         true
     }
 
@@ -450,11 +456,13 @@ impl Connection {
                 assert!(self.timeout.is_some());
                 self.waiting = false;
                 self.timeout = None;
+                let request = self.request.take().unwrap();
                 server.notify_timeout(queue, channel, self.cookie);
-                self.response = Some(ResponseBuffer::new(
-                    self.request.take().unwrap().opcode(), Status::KeyNotFound));                
-                self.interest = EventSet::all() - EventSet::readable();
-                event_loop.reregister(&self.stream, self.token, self.interest, PollOpt::level()).unwrap();    
+                self.send_response(
+                    ResponseBuffer::new(request.opcode(), Status::KeyNotFound),
+                    server,
+                    event_loop
+                );
             },
             to => panic!("can't handle to {:?}", to)
         }
@@ -557,10 +565,10 @@ impl Server {
         debug!("wait_queue {:?} {:?} {:?} {:?}", queue, channel, cookie, required_tail);
         if let Some(channels) = self.waiting_clients.get_mut(&queue) {
             if let Some(w)  = channels.get_mut(&channel) {
-                if required_tail <= w.tail {
+                if required_tail > w.tail {
                     w.cookies.push_back(cookie);
                 } else {
-                    debug!("Race condition, queue {:?} channel {:?} has new data", queue, channel);
+                    debug!("Race condition, queue {:?} channel {:?} has new data {:?}", queue, channel, w.tail);
                     self.awaking_clients.push(cookie);
                 }
             } else {
@@ -570,20 +578,6 @@ impl Server {
         } else {
             debug!("Race condition, queue {:?} is gone", queue);
             self.awaking_clients.push(cookie);
-        }
-    }
-
-    fn notify_timeout(&mut self, queue: Atom, channel: Atom, cookie: Cookie) {
-        debug!("notify_timeout {:?} {:?} {:?}", queue, channel, cookie);
-        if let Some(channels) = self.waiting_clients.get_mut(&queue) {
-            if let Some(w)  = channels.get_mut(&channel) {
-                // FIXME: only need to delete the first ocurrence
-                w.cookies.retain(|&c| c != cookie);
-            } else {
-                unreachable!();
-            }
-        } else {
-            unreachable!();
         }
     }
 
@@ -600,6 +594,20 @@ impl Server {
             }
         } else {
             debug!("Race condition, queue {:?} is gone", queue);
+        }
+    }
+
+    fn notify_timeout(&mut self, queue: Atom, channel: Atom, cookie: Cookie) {
+        debug!("notify_timeout {:?} {:?} {:?}", queue, channel, cookie);
+        if let Some(channels) = self.waiting_clients.get_mut(&queue) {
+            if let Some(w)  = channels.get_mut(&channel) {
+                // FIXME: only need to delete the first ocurrence
+                w.cookies.retain(|&c| c != cookie);
+            } else {
+                unreachable!();
+            }
+        } else {
+            unreachable!();
         }
     }
 
