@@ -19,7 +19,7 @@ pub enum OpCode {
     Get = 0x0,
     Set = 0x1,
     Delete = 0x4,
-    Exit = 0x7,
+    Quit = 0x7,
     Flush = 0x8,
     GetQ = 0x9,
     Stat = 0x10,

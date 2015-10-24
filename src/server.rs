@@ -283,7 +283,7 @@ impl Dispatch {
             OpCode::Delete => {
                 self.delete()
             }
-            OpCode::NoOp => {
+            OpCode::NoOp | OpCode::Quit => {
                 NotifyMessage::from_status(&self.request, Status::NoError)
             }
             _ => NotifyMessage::from_status(&self.request, Status::InvalidArguments)
@@ -360,6 +360,7 @@ impl Connection {
                 assert!(!self.processing);
                 assert!(!self.waiting);
                 assert!(self.timeout.is_none());
+                self.request_clock_ms = server.clock_ms;
                 self.processing = true;
                 self.interest = EventSet::all() - EventSet::readable() - EventSet::writable();
                 event_loop.reregister(&self.stream, self.token, self.interest, PollOpt::level()).unwrap();
@@ -395,6 +396,8 @@ impl Connection {
     fn notify(&mut self, server: &mut Server, event_loop: &mut EventLoop<ServerHandler>, notification: NotifyType) -> bool {
         assert!(self.processing);
         assert!(!self.waiting);
+        assert!(self.timeout.is_none());
+        self.processing = false;
 
         let (cookie, msg) = notification;
 
@@ -408,8 +411,6 @@ impl Connection {
 
         match msg {
             NotifyMessage::GetWouldBlock{request, queue, channel, required_tail} => {
-                assert!(self.timeout.is_none());
-                self.processing = false;
                 // TODO: this timeout value should come with the message
                 let deadline = self.request_clock_ms + 5000;
                 if server.clock_ms >= deadline {
@@ -426,13 +427,11 @@ impl Connection {
                 }
             },
             NotifyMessage::PutResponse{response, queue, new_tail} => {
-                self.processing = false;
                 self.response = Some(response);
                 self.interest = EventSet::all() - EventSet::readable();
                 server.notify_queue(queue, new_tail);
             },
             NotifyMessage::Response{response} => {
-                self.processing = false;
                 self.response = Some(response);
                 self.interest = EventSet::all() - EventSet::readable();
             },
@@ -448,6 +447,7 @@ impl Connection {
             TimeoutMessage::Timeout{queue, channel} => {
                 assert!(self.waiting);
                 assert!(!self.processing);
+                assert!(self.timeout.is_some());
                 self.waiting = false;
                 self.timeout = None;
                 server.notify_timeout(queue, channel, self.cookie);
