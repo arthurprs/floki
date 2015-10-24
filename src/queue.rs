@@ -189,8 +189,8 @@ impl Queue {
                 };
                 locked_channel.in_flight.insert(message.id(), state);
                 locked_channel.in_flight_heap.push(Rev(message.id()));
-                locked_channel.tail += 1;
-                debug!("[{}:{}] advancing tail to {}", self.config.name, channel_name, locked_channel.tail);
+                locked_channel.tail = message.id() + 1;
+                trace!("[{}:{}] advancing tail to {}", self.config.name, channel_name, locked_channel.tail);
                 return Some(Ok(message))
             }
             return Some(Err(locked_channel.tail))
@@ -369,8 +369,7 @@ impl Queue {
 
     pub fn maintenance(&mut self) {
         let smallest_tail = {
-            let locked_channels = self.channels.read().unwrap();
-            locked_channels.values()
+            self.channels.read().unwrap().values()
                 .map(|c| c.lock().unwrap().real_tail())
                 .min()
                 .unwrap_or(0)
