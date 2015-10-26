@@ -20,9 +20,9 @@ impl Deref for Atom {
     }
 }
 
-impl<T: Into<String>> From<T> for Atom {
+impl<T: AsRef<str>> From<T> for Atom {
     #[inline(always)]
 	fn from(from: T) -> Atom {
-		Atom(Arc::new(from.into()))
+		Atom(Arc::new(from.as_ref().into()))
 	}
 }

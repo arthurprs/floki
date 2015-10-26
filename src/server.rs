@@ -5,7 +5,6 @@ use std::os::unix::io::{AsRawFd, RawFd};
 use std::mem;
 use std::cmp;
 use std::collections::VecDeque;
-use std::thread::{self, Thread, JoinHandle};
 use std::sync::{Arc, Mutex};
 use spin::{Mutex as SpinLock, RwLock as SpinRwLock};
 use mio::tcp::{TcpStream, TcpListener};
@@ -30,8 +29,8 @@ const FIRST_CLIENT: Token = Token(1);
 #[derive(Debug)]
 pub enum NotifyMessage {
     Response{response: ResponseBuffer},
-    PutResponse{response: ResponseBuffer, queue: Atom, new_tail: u64},
-    GetWouldBlock{request: RequestBuffer, queue: Atom, channel: Atom, required_tail: u64},
+    PutResponse{response: ResponseBuffer, queue: Atom, head: u64},
+    GetWouldBlock{request: RequestBuffer, queue: Atom, channel: Atom, required_head: u64},
     ChannelCreate{queue: Atom, channel: Atom},
     ChannelDelete{queue: Atom, channel: Atom},
     QueueCreate{queue: Atom},
@@ -76,15 +75,15 @@ struct Dispatch {
 
 #[derive(Default)]
 struct WaitingClients {
-    tail: u64,
-    cookies: VecDeque<Cookie>,
+    head: u64,
+    channels: HashMap<Atom, VecDeque<Cookie>>,
 }
 
 pub struct Server {
     config: Arc<ServerConfig>,
     meta_lock: Arc<Mutex<()>>,
     queues: Arc<SpinRwLock<HashMap<Atom, Arc<Queue>>>>,
-    waiting_clients: HashMap<Atom, HashMap<Atom, WaitingClients>>,
+    waiting_clients: HashMap<Atom, WaitingClients>,
     awaking_clients: Vec<Cookie>,
     listener: TcpListener,
     thread_pool: ThreadPool,
@@ -192,13 +191,13 @@ impl Dispatch {
             Some(Ok(message)) => {
                 NotifyMessage::from_message(&self.request, message)
             },
-            Some(Err(required_tail)) => {
+            Some(Err(required_head)) => {
                 debug!("queue {:?} channel {:?} has no messages", queue_name, channel_name);
                 NotifyMessage::GetWouldBlock{
                     request: mem::replace(unsafe{mem::transmute(&self.request)}, RequestBuffer::new()),
                     queue: q.name().into(),
                     channel: channel_name.into(),
-                    required_tail: required_tail,
+                    required_head: required_head,
                 }
             },
             _ => NotifyMessage::from_status(&self.request, Status::KeyNotFound)
@@ -224,7 +223,7 @@ impl Dispatch {
             NotifyMessage::PutResponse{
                 response: ResponseBuffer::new_set_response(),
                 queue: q.name().into(),
-                new_tail: id + 1
+                head: id + 1
             }
         }
     }
@@ -298,6 +297,7 @@ fn write_response(stream: &mut TcpStream, response: &mut ResponseBuffer) -> IoRe
     if bytes.is_empty() && response.remaining() != 0 {
         trace!("response.bytes().is_empty() && response.remaining() == {}", response.remaining());
         if let Some(ref message) = response.message {
+            // FIXME: offset is wrong
             let r = sendfile(stream.as_raw_fd(), message.fd(), message.fd_offset() as usize, response.remaining());
             trace!("sendfile returned {}", r);
             if r == -1 {
@@ -411,12 +411,13 @@ impl Connection {
             return false
         }
 
+        // FIXME: this is impossible in the current code
         if cookie != self.cookie {
             return true
         }
 
         match msg {
-            NotifyMessage::GetWouldBlock{request, queue, channel, required_tail} => {
+            NotifyMessage::GetWouldBlock{request, queue, channel, required_head} => {
                 // TODO: this timeout value should come with the message
                 let deadline = self.request_clock_ms + 5000;
                 if server.clock_ms >= deadline {
@@ -432,12 +433,12 @@ impl Connection {
                         (self.token, TimeoutMessage::Timeout{queue: queue.clone(), channel: channel.clone()}),
                         (deadline - server.clock_ms) as u64
                     ).unwrap());
-                    server.wait_queue(queue, channel, cookie, required_tail);
+                    server.wait_queue(queue, channel, cookie, required_head);
                 }
             },
-            NotifyMessage::PutResponse{response, queue, new_tail} => {
+            NotifyMessage::PutResponse{response, queue, head} => {
                 self.send_response(response, server, event_loop);
-                server.notify_queue(queue, new_tail);
+                server.notify_queue(queue, head);
             },
             NotifyMessage::Response{response} => {
                 self.send_response(response, server, event_loop);
@@ -536,15 +537,12 @@ impl Server {
             let queue = Queue::new(queue_config, true);
             // load state
             let info = queue.info();
-            let mut waiting_clients: HashMap<_, _> = Default::default();
-            for (channel_name, channel_info) in info.channels {
-                waiting_clients.insert(
-                    channel_name.into(),
-                    WaitingClients {
-                        tail: channel_info.tail,
-                        .. Default::default()
-                    }
-                );
+            let mut waiting_clients = WaitingClients {
+                head: info.head,
+                channels: Default::default(),
+            };
+            for channel_name in info.channels.keys() {
+                waiting_clients.channels.insert(channel_name.into(), Default::default());
             }
             server.waiting_clients.insert(queue.name().into(), waiting_clients);
 
@@ -561,14 +559,14 @@ impl Server {
         (server_handler, event_loop)
     }
 
-    fn wait_queue(&mut self, queue: Atom, channel: Atom, cookie: Cookie, required_tail: u64) {
-        debug!("wait_queue {:?} {:?} {:?} {:?}", queue, channel, cookie, required_tail);
-        if let Some(channels) = self.waiting_clients.get_mut(&queue) {
-            if let Some(w)  = channels.get_mut(&channel) {
-                if required_tail > w.tail {
-                    w.cookies.push_back(cookie);
+    fn wait_queue(&mut self, queue: Atom, channel: Atom, cookie: Cookie, required_head: u64) {
+        debug!("wait_queue {:?} {:?} {:?} {:?}", queue, channel, cookie, required_head);
+        if let Some(w) = self.waiting_clients.get_mut(&queue) {
+            if let Some(cookies)  = w.channels.get_mut(&channel) {
+                if required_head > w.head {
+                    cookies.push_back(cookie);
                 } else {
-                    debug!("Race condition, queue {:?} channel {:?} has new data {:?}", queue, channel, w.tail);
+                    debug!("Race condition, queue {:?} channel {:?} has new data {:?}", queue, channel, w.head);
                     self.awaking_clients.push(cookie);
                 }
             } else {
@@ -581,16 +579,17 @@ impl Server {
         }
     }
 
-    fn notify_queue(&mut self, queue: Atom, new_tail: u64) {
-        debug!("notify_queue {:?} {:?}", queue, new_tail);
-        if let Some(channels) = self.waiting_clients.get_mut(&queue) {
-            for (_, w) in channels.iter_mut() {
-                if new_tail > w.tail {
-                    w.tail = new_tail;
-                    self.awaking_clients.extend(w.cookies.drain(..));
-                } else {
-                    debug!("Race condition, queue {:?} tail already advanced", queue);
+    fn notify_queue(&mut self, queue: Atom, new_head: u64) {
+        debug!("notify_queue {:?} {:?}", queue, new_head);
+        if let Some(w) = self.waiting_clients.get_mut(&queue) {
+            if new_head > w.head {
+                w.head = new_head;
+                for (_, tokens) in w.channels.iter_mut() {
+                    // FIXME: it should be possible to awake only the necessary amout of clients
+                    self.awaking_clients.extend(tokens.drain(..));
                 }
+            } else {
+                debug!("Race condition, queue {:?} tail already advanced", queue);
             }
         } else {
             debug!("Race condition, queue {:?} is gone", queue);
@@ -599,10 +598,10 @@ impl Server {
 
     fn notify_timeout(&mut self, queue: Atom, channel: Atom, cookie: Cookie) {
         debug!("notify_timeout {:?} {:?} {:?}", queue, channel, cookie);
-        if let Some(channels) = self.waiting_clients.get_mut(&queue) {
-            if let Some(w)  = channels.get_mut(&channel) {
+        if let Some(w) = self.waiting_clients.get_mut(&queue) {
+            if let Some(cookies)  = w.channels.get_mut(&channel) {
                 // FIXME: only need to delete the first ocurrence
-                w.cookies.retain(|&c| c != cookie);
+                cookies.retain(|&c| c != cookie);
             } else {
                 unreachable!();
             }
@@ -613,9 +612,9 @@ impl Server {
 
     fn notify_queue_deleted(&mut self, queue: Atom) {
         debug!("notify_queue_deleted {:?}", queue);
-        if let Some(channels) = self.waiting_clients.remove(&queue) {
-            for (_, w) in channels {
-                self.awaking_clients.extend(w.cookies);
+        if let Some(w) = self.waiting_clients.remove(&queue) {
+            for (_, cookies) in w.channels {
+                self.awaking_clients.extend(cookies);
             }
         } else {
             unreachable!();
@@ -630,9 +629,9 @@ impl Server {
 
     fn notify_channel_deleted(&mut self, queue: Atom, channel: Atom) {
         debug!("notify_channel_deleted {:?} {:?}", queue, channel);
-        if let Some(channels) = self.waiting_clients.get_mut(&queue) {
-            if let Some(w)  = channels.remove(&channel) {
-                self.awaking_clients.extend(w.cookies);
+        if let Some(w) = self.waiting_clients.get_mut(&queue) {
+            if let Some(cookies)  = w.channels.remove(&channel) {
+                self.awaking_clients.extend(cookies);
             } else {
                 unreachable!();
             }
@@ -643,8 +642,8 @@ impl Server {
 
     fn notify_channel_created(&mut self, queue: Atom, channel: Atom) {
         debug!("notify_channel_created {:?} {:?}", queue, channel);
-        if let Some(channels) = self.waiting_clients.get_mut(&queue) {
-            let prev = channels.insert(channel, Default::default());
+        if let Some(w) = self.waiting_clients.get_mut(&queue) {
+            let prev = w.channels.insert(channel, Default::default());
             debug_assert!(prev.is_none());
         } else {
             unreachable!();
@@ -658,9 +657,9 @@ impl Server {
         }
         assert!(event_loop.clear_timeout(connection.timeout.unwrap()));
         // FIXME: possibly expensive
-        for (_, channels) in self.waiting_clients.iter_mut() {
-            for (_, w) in channels.iter_mut() {
-                w.cookies.retain(|&c| c != connection.cookie);
+        for (_, w) in self.waiting_clients.iter_mut() {
+            for (_, cookies) in w.channels.iter_mut() {
+                cookies.retain(|&c| c != connection.cookie);
             }
         }
     }
@@ -731,6 +730,7 @@ impl Server {
                 let queues = self.queues.clone();
                 let channel = event_loop.channel();
                 self.thread_pool.execute(move || {
+                    // FIXME: this aquires the shared lock for a long time
                     for q in queues.read().values() {
                         q.as_mut().maintenance();
                     }
