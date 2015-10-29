@@ -253,15 +253,14 @@ impl QueueFile {
         self.closed = checkpoint.closed;
 
         self.file_offset = 0;
-        let mut expected_id = self.tail;
         let header_size = size_of::<MessageHeader>() as u32;
         while self.file_offset + header_size < self.file_size {
             let header: &MessageHeader = unsafe {
                 mem::transmute(self.file_mmap.offset(self.file_offset as isize))
             };
-            if header.id != expected_id {
+            if header.id != self.head {
                 warn!("[{:?}] expected id {} got {} when recovering @{}",
-                    self.data_path, expected_id, header.id, self.file_offset);
+                    self.data_path, self.head, header.id, self.file_offset);
                 break
             }
             if self.file_offset + header_size + header.len < self.file_size {
@@ -270,14 +269,17 @@ impl QueueFile {
                         self.data_path, header.id, self.file_offset);
                     break
                 }
+            } else {
+                warn!("[{:?}] message with id {} would overflow file @{}",
+                    self.data_path, header.id, self.file_offset);
+                break
             }
             self.index.push_offset(header.id, self.file_offset);
             self.file_offset += header_size + header.len;
-            expected_id += 1;
+            self.head += 1;
         }
 
         self.sync_offset = self.file_offset;
-        self.head = expected_id;
     }
 
     fn checkpoint(&mut self, full: bool) -> QueueFileCheckpoint {
