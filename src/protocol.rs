@@ -1,10 +1,8 @@
 use mio::{Buf, MutBuf};
-use std::slice;
 use std::mem::{self, size_of};
 use std::io::Write;
 use std::str;
 use std::fmt;
-use std::os::unix::io::RawFd;
 
 use queue_backend::Message;
 

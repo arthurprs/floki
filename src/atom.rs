@@ -1,5 +1,5 @@
 use std::borrow::Borrow;
-use std::ops::{Deref, DerefMut};
+use std::ops::Deref;
 use std::sync::Arc;
 
 #[derive(Hash, Eq, PartialEq, Debug, Clone)]

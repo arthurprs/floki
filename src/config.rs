@@ -1,5 +1,5 @@
 use std::fs::{self, File};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::io::prelude::*;
 use toml::Parser as TomlParser;
 

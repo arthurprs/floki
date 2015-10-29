@@ -1,4 +1,4 @@
-use std::str::{self, FromStr};
+use std::str::FromStr;
 use std::net::SocketAddr;
 use std::io::{Read, Write, Result as IoResult, Error as IoError};
 use std::os::unix::io::{AsRawFd, RawFd};
@@ -6,7 +6,7 @@ use std::mem;
 use std::cmp;
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
-use spin::{Mutex as SpinLock, RwLock as SpinRwLock};
+use spin::RwLock as SpinRwLock;
 use mio::tcp::{TcpStream, TcpListener};
 use mio::util::Slab;
 use mio::{Buf, MutBuf, Token, EventLoop, EventSet, PollOpt, Timeout, Handler, Sender};
@@ -18,7 +18,6 @@ use queue_backend::Message;
 use config::*;
 use protocol::*;
 use utils::*;
-use rev::Rev;
 use atom::Atom;
 use cookie::Cookie;
 use time;
@@ -104,7 +103,11 @@ impl NotifyMessage {
 
     fn from_message(request: &RequestBuffer, message: Message) -> NotifyMessage {
         NotifyMessage::Response {
-            response: ResponseBuffer::new_get_response(request, message)
+            response: if message.len() >= 1024 {
+                ResponseBuffer::new_get_response_fd(request, message)
+            } else {
+                ResponseBuffer::new_get_response(request, message)
+            }
         }
     }
 }
@@ -292,14 +295,15 @@ impl Dispatch {
     }
 }
 
-fn write_response(stream: &mut TcpStream, response: &mut ResponseBuffer) -> IoResult<usize> {
+fn write_response(stream: &mut TcpStream, response: &ResponseBuffer) -> IoResult<usize> {
     let bytes = response.bytes();
     if bytes.is_empty() && response.remaining() != 0 {
-        trace!("response.bytes().is_empty() && response.remaining() == {}", response.remaining());
         if let Some(ref message) = response.message {
-            // FIXME: offset is wrong
-            let r = sendfile(stream.as_raw_fd(), message.fd(), message.fd_offset() as usize, response.remaining());
-            trace!("sendfile returned {}", r);
+            let r = sendfile(
+                stream.as_raw_fd(),
+                message.fd(),
+                (message.fd_offset() + message.len()) as isize - response.remaining() as isize,
+                response.remaining());
             if r == -1 {
                 Err(IoError::last_os_error())
             } else {
@@ -730,9 +734,13 @@ impl Server {
                 let queues = self.queues.clone();
                 let channel = event_loop.channel();
                 self.thread_pool.execute(move || {
-                    // FIXME: this aquires the shared lock for a long time
-                    for q in queues.read().values() {
-                        q.as_mut().maintenance();
+                    let queue_names: Vec<_> = queues.read().keys().cloned().collect();
+                    for queue_name in queue_names {
+                        // get the shared lock for a brief moment
+                        let q_opt = queues.read().get(&queue_name).cloned();
+                        if let Some(q) = q_opt {
+                            q.as_mut().maintenance();
+                        }
                     }
                     channel.send((Cookie::new(SERVER, 0), NotifyMessage::MaintenanceDone)).unwrap();
                 });
@@ -827,18 +835,15 @@ impl Handler for ServerHandler {
     }
 }
 
-use libc::{c_void, size_t, off_t, ssize_t};
 mod ffi {
     use std::os::unix::io::RawFd;
-    use libc::{c_void, size_t, off_t, ssize_t};
     extern {
-        pub fn sendfile(out_fd: RawFd, in_fd: RawFd, offset: *mut off_t, count: size_t) -> ssize_t;
+        pub fn sendfile(out_fd: RawFd, in_fd: RawFd, offset: *mut isize, count: usize) -> isize;
     }
 }
 
-fn sendfile(out_fd: RawFd, in_fd: RawFd, offset: usize, count: usize) -> isize {
+fn sendfile(out_fd: RawFd, in_fd: RawFd, mut offset: isize, count: usize) -> isize {
     unsafe {
-        let mut offset = offset as off_t;
-        ffi::sendfile(out_fd, in_fd, &mut offset, count as size_t) as isize
+        ffi::sendfile(out_fd, in_fd, &mut offset, count)
     }
 }

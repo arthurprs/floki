@@ -1,14 +1,11 @@
-use std::ops::{Deref, DerefMut};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Mutex, RwLock};
 use std::collections::{BTreeMap, BinaryHeap};
 use std::collections::hash_map::Entry;
-use std::io::{self, Read, Write};
+use std::io::{Read, Write};
 use std::fs::{self, File};
 use std::mem;
-use std::cmp;
 use std::rc::Rc;
 use rustc_serialize::json;
-use std::fmt;
 
 use config::*;
 use queue_backend::*;

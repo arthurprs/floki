@@ -5,8 +5,7 @@ use std::mem::{self, size_of};
 use std::io::prelude::*;
 use std::os::unix::io::{RawFd, AsRawFd};
 use std::fs::{self, File, OpenOptions};
-use std::path::{Path, PathBuf};
-use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
 use nix::c_void;
@@ -238,7 +237,6 @@ impl QueueFile {
     }
 
     fn sync(&mut self, full: bool) {
-        use std::cmp::max;
         let sync_offset = if full { self.file_offset } else { self.file_offset.saturating_sub(1024 * 1024) };
         if sync_offset > 0 && sync_offset > self.sync_offset {
             mman::msync(self.file_mmap as *mut c_void, sync_offset as u64, mman::MS_SYNC).unwrap();

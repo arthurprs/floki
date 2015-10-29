@@ -21,6 +21,7 @@ impl Cookie {
     }
 }
 
+#[cfg(test)]
 mod tests {
     use super::Cookie;
     use mio::Token;

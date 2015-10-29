@@ -1,5 +1,4 @@
-#![allow(unused_imports)]
-#![allow(dead_code)] 
+#![allow(dead_code)]
 #![allow(unused_variables)]
 #![allow(raw_pointer_derive)]
 #![feature(path_ext)]
@@ -38,25 +37,7 @@ mod cookie;
 mod offset_index;
 
 use config::*;
-use queue::*;
-use queue_backend::Message;
 use server::*;
-
-// fn configure_log() {
-//  let logger_config = fern::DispatchConfig {
-//      format: Box::new(|msg: &str, level: &log::LogLevel, location: &log::LogLocation| {
-//          format!("[{}]{}:{}: {}",
-//              time::now().strftime("%H:%M:%S.%f").unwrap(),
-//              level,
-//              location.module_path(),
-//              msg)
-//      }),
-//      output: vec![fern::OutputConfig::stderr()],
-//      level: log::LogLevelFilter::Trace,
-//  };
-
-//  fern::init_global_logger(logger_config, log::LogLevelFilter::Debug).unwrap();
-// }
 
 #[cfg(not(test))]
 fn main() {
