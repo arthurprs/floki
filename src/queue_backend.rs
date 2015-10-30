@@ -17,6 +17,8 @@ use config::*;
 use utils::*;
 use offset_index::*;
 
+const MAGIC_NUM: u32 = 0xF1031311u32;
+
 #[derive(Debug)]
 struct InnerMessage {
     mmap_ptr: *mut u8,
@@ -119,7 +121,13 @@ impl QueueFile {
         // TODO: try to use fallocate if present
         // hopefully the filesystem supports sparse files
         file.set_len(config.segment_size).unwrap();
-        Self::new(config, file, data_path, start_id)
+        let mut queue_file = Self::new(config, file, data_path, start_id);
+        unsafe {
+            let magic_num = queue_file.file_mmap as *mut u32;
+            *magic_num = MAGIC_NUM;
+        }
+        queue_file.file_offset = size_of::<u32>() as u32;
+        queue_file
     }
 
     fn open(config: &QueueConfig, checkpoint: QueueFileCheckpoint) -> QueueFile {
@@ -245,14 +253,24 @@ impl QueueFile {
     }
 
     fn recover(&mut self, checkpoint: QueueFileCheckpoint) {
-        //debug!("[{:?}] checkpoint loaded: {:?}", self.base_path, checkpoint);
+        debug!("[{:?}] checkpoint loaded: {:?}", self.data_path, checkpoint);
         assert_eq!(self.tail, checkpoint.tail);
         self.tail = checkpoint.tail;
-        self.head = checkpoint.head;
+        self.head = checkpoint.tail;
         self.sync_offset = checkpoint.sync_offset;
         self.closed = checkpoint.closed;
+        self.file_offset = size_of::<u32>() as u32;
+        self.sync_offset = self.file_offset;
 
-        self.file_offset = 0;
+        unsafe {
+            let magic_num = self.file_mmap as *mut u32;
+            if *magic_num != MAGIC_NUM {
+                warn!("[{:?}] incorrect magic number", self.data_path);
+                *magic_num = MAGIC_NUM;
+                return;
+            }
+        }
+
         let header_size = size_of::<MessageHeader>() as u32;
         while self.file_offset + header_size < self.file_size {
             let header: &MessageHeader = unsafe {
