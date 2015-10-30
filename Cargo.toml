@@ -14,11 +14,11 @@ threadpool = "*"
 time = "*"
 num_cpus = "*"
 fnv = "*"
-linked-hash-map = "*"
+spin = "*"
 rand = "*"
 
-[dependencies.spin]
-git="https://github.com/arthurprs/spinlock-rs.git"
+[dependencies.linked-hash-map]
+git="https://github.com/contain-rs/linked-hash-map.git"
 
 [profile.dev]
 opt-level = 0
@@ -30,7 +30,7 @@ codegen-units = 8
 
 [profile.release]
 opt-level = 3
-debug = true
+debug = false
 rpath = false
 lto = false
 debug-assertions = false
