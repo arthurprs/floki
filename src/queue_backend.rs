@@ -22,14 +22,14 @@ const MAGIC_NUM: u32 = 0xF1031311u32;
 #[derive(Debug)]
 struct InnerMessage {
     mmap_ptr: *mut u8,
-    file_offset: u32,
+    fd_offset: u32,
     id: u64,
     len: u32,
 }
 
 #[derive(Debug)]
 pub struct Message {
-    file: Arc<QueueFile>,
+    segment: Arc<Segment>,
     inner: InnerMessage,
 }
 
@@ -47,11 +47,11 @@ impl Message {
     }
 
     pub fn fd(&self) -> RawFd {
-        self.file.file.as_raw_fd()
+        self.segment.file.as_raw_fd()
     }
 
     pub fn fd_offset(&self) -> u32 {
-        self.inner.file_offset
+        self.inner.fd_offset
     }
 }
 
@@ -66,7 +66,7 @@ struct MessageHeader {
 }
 
 #[derive(Debug, Default, Eq, PartialEq, RustcDecodable, RustcEncodable)]
-struct QueueFileCheckpoint {
+struct SegmentCheckpoint {
     tail: u64,
     head: u64,
     sync_offset: u32,
@@ -75,11 +75,11 @@ struct QueueFileCheckpoint {
 
 #[derive(Debug, Default, RustcDecodable, RustcEncodable)]
 struct QueueBackendCheckpoint {
-    files: Vec<QueueFileCheckpoint>
+    segments: Vec<SegmentCheckpoint>
 }
 
 #[derive(Debug)]
-pub struct QueueFile {
+pub struct Segment {
     data_path: PathBuf,
     // TODO: move mmaped file abstraction
     file: File,
@@ -99,17 +99,17 @@ pub struct QueueFile {
 #[derive(Debug)]
 pub struct QueueBackend {
     config: Rc<QueueConfig>,
-    files: SpinRwLock<Vec<Arc<QueueFile>>>,
+    segments: SpinRwLock<Vec<Arc<Segment>>>,
     head: u64,
     tail: u64
 }
 
-impl QueueFile {
+impl Segment {
     fn gen_file_path(config: &QueueConfig, start_id: u64, ext: &str) -> PathBuf {
         config.data_directory.join(format!("{:015}.{}", start_id, ext))
     }
 
-    fn create(config: &QueueConfig, start_id: u64) -> QueueFile {
+    fn create(config: &QueueConfig, start_id: u64) -> Segment {
         let data_path = Self::gen_file_path(config, start_id, DATA_EXTENSION);
         debug!("[{}] creating data file {:?}", config.name, data_path);
         let file = OpenOptions::new()
@@ -119,30 +119,30 @@ impl QueueFile {
                 .truncate(true)
                 .open(&data_path).unwrap();
         // TODO: try to use fallocate if present
-        // hopefully the filesystem supports sparse files
+        // hopefully the filesystem supports sparse segments
         file.set_len(config.segment_size).unwrap();
-        let mut queue_file = Self::new(config, file, data_path, start_id);
+        let mut segment = Self::new(config, file, data_path, start_id);
         unsafe {
-            let magic_num = queue_file.file_mmap as *mut u32;
+            let magic_num = segment.file_mmap as *mut u32;
             *magic_num = MAGIC_NUM;
         }
-        queue_file.file_offset = size_of::<u32>() as u32;
-        queue_file
+        segment.file_offset = size_of::<u32>() as u32;
+        segment
     }
 
-    fn open(config: &QueueConfig, checkpoint: QueueFileCheckpoint) -> QueueFile {
+    fn open(config: &QueueConfig, checkpoint: SegmentCheckpoint) -> Segment {
         let data_path = Self::gen_file_path(config, checkpoint.tail, DATA_EXTENSION);
         debug!("[{}] opening data file {:?}", config.name, data_path);
         let file = OpenOptions::new()
                 .read(true)
                 .write(true)
                 .open(&data_path).unwrap();
-        let mut queue_file = Self::new(config, file, data_path, checkpoint.tail);
-        queue_file.recover(checkpoint);
-        queue_file
+        let mut segment = Self::new(config, file, data_path, checkpoint.tail);
+        segment.recover(checkpoint);
+        segment
     }
 
-    fn new(config: &QueueConfig, file: File, data_path: PathBuf, start_id: u64) -> QueueFile {
+    fn new(config: &QueueConfig, file: File, data_path: PathBuf, start_id: u64) -> Segment {
         let file_size = file.metadata().unwrap().len();
         assert_eq!(file_size, config.segment_size);
 
@@ -155,7 +155,7 @@ impl QueueFile {
             file_size,
             mman::MADV_SEQUENTIAL).unwrap();
 
-        QueueFile {
+        Segment {
             data_path: data_path,
             file: file,
             file_mmap: file_mmap,
@@ -198,7 +198,7 @@ impl QueueFile {
             id: id,
             len: header.len,
             mmap_ptr: mmap_ptr,
-            file_offset: message_offset + size_of::<MessageHeader>() as u32,
+            fd_offset: message_offset + size_of::<MessageHeader>() as u32,
         };
 
         Ok(message)
@@ -252,7 +252,7 @@ impl QueueFile {
         }
     }
 
-    fn recover(&mut self, checkpoint: QueueFileCheckpoint) {
+    fn recover(&mut self, checkpoint: SegmentCheckpoint) {
         debug!("[{:?}] checkpoint loaded: {:?}", self.data_path, checkpoint);
         assert_eq!(self.tail, checkpoint.tail);
         self.tail = checkpoint.tail;
@@ -300,9 +300,9 @@ impl QueueFile {
         self.sync_offset = self.file_offset;
     }
 
-    fn checkpoint(&mut self, full: bool) -> QueueFileCheckpoint {
+    fn checkpoint(&mut self, full: bool) -> SegmentCheckpoint {
         // FIXME: reset and log stats
-        let mut checkpoint = QueueFileCheckpoint {
+        let mut checkpoint = SegmentCheckpoint {
             tail: self.tail,
             head: self.head,
             sync_offset: self.sync_offset,
@@ -325,7 +325,7 @@ impl QueueFile {
     }
 }
 
-impl Drop for QueueFile {
+impl Drop for Segment {
     fn drop(&mut self) {
         mman::munmap(self.file_mmap as *mut c_void, self.file_size as u64).unwrap();
         if self.deleted {
@@ -338,7 +338,7 @@ impl QueueBackend {
     pub fn new(config: Rc<QueueConfig>, recover: bool) -> QueueBackend {
         let mut backend = QueueBackend {
             config: config,
-            files: SpinRwLock::new(Vec::new()),
+            segments: SpinRwLock::new(Vec::new()),
             head: 1,
             tail: 1
         };
@@ -348,18 +348,18 @@ impl QueueBackend {
         backend
     }
 
-    pub fn files_count(&self) -> usize {
-        self.files.read().len()
+    pub fn segments_count(&self) -> usize {
+        self.segments.read().len()
     }
 
     pub fn tail(&self) -> u64 {
         self.tail
     }
 
-    fn find_file(&self, id: u64) -> Option<Arc<QueueFile>> {
-        for q_file in  self.files.read().iter().rev() {
-            if q_file.tail <= id {
-                return Some(q_file.clone())
+    fn find_segment(&self, id: u64) -> Option<Arc<Segment>> {
+        for segment in  self.segments.read().iter().rev() {
+            if segment.tail <= id {
+                return Some(segment.clone())
             }
         }
         None
@@ -368,8 +368,8 @@ impl QueueBackend {
     /// Put a message at the end of the Queue, return the message id if succesfull
     /// Note: it's the caller responsability to serialize write calls
     pub fn push(&mut self, body: &[u8], timestamp: u32) -> Option<u64> {
-        let result = if let Some(q_file) = self.files.read().last() {
-            q_file.as_mut().push(body, timestamp).ok()
+        let result = if let Some(segment) = self.segments.read().last() {
+            segment.as_mut().push(body, timestamp).ok()
         } else {
             None
         };
@@ -380,15 +380,15 @@ impl QueueBackend {
             return result
         }
 
-        let q_file: &mut QueueFile = {
-            let queue_file = Arc::new(QueueFile::create(
+        let segment: &mut Segment = {
+            let segment = Arc::new(Segment::create(
                 &self.config, self.head));
-            let q_file_ptr = (&*queue_file) as *const QueueFile;
-            self.files.write().push(queue_file);
-            unsafe { mem::transmute(q_file_ptr) }
+            let segment_ptr = (&*segment) as *const Segment;
+            self.segments.write().push(segment);
+            unsafe { mem::transmute(segment_ptr) }
         };
 
-        let id = q_file.push(body, timestamp).expect("Can't write to a newly created file!");
+        let id = segment.push(body, timestamp).expect("Can't write to a newly created file!");
         assert_eq!(id, self.head);
         self.head += 1;
         Some(id)
@@ -396,11 +396,11 @@ impl QueueBackend {
 
     /// Get a new message with the specified id
     pub fn get(&mut self, id: u64) -> Option<Message> {
-        if let Some(q_file) = self.find_file(id) {
-            if let Ok(inner) = q_file.get(id) { 
+        if let Some(segment) = self.find_segment(id) {
+            if let Ok(inner) = segment.get(id) { 
                 return Some(Message {
                     inner: inner,
-                    file: q_file,
+                    segment: segment,
                 })
             }
         }
@@ -408,19 +408,19 @@ impl QueueBackend {
     }
 
     pub fn purge(&mut self) {
-        let mut locked_files = self.files.write();
-        for q_file in locked_files.drain(..) {
-            while Arc::strong_count(&q_file) > 1 {
+        let mut locked_segments = self.segments.write();
+        for segment in locked_segments.drain(..) {
+            while Arc::strong_count(&segment) > 1 {
                 thread::sleep_ms(100);
             }
-            q_file.as_mut().purge()
+            segment.as_mut().purge()
         }
         self.tail = 1;
         self.head = 1;
     }
 
     pub fn delete(&mut self) {
-        self.files.write().clear();
+        self.segments.write().clear();
         let path = self.config.data_directory.join(BACKEND_CHECKPOINT_FILE);
         remove_file_if_exist(&path).unwrap();
     }
@@ -450,29 +450,29 @@ impl QueueBackend {
 
         info!("[{}] checkpoint loaded: {:?}", self.config.name, backend_checkpoint);
 
-        let mut locked_files = self.files.write();
-        for file_checkpoint in backend_checkpoint.files {
-            let q_file = Arc::new(QueueFile::open(&self.config, file_checkpoint));
-            locked_files.push(q_file);
+        let mut locked_segments = self.segments.write();
+        for file_checkpoint in backend_checkpoint.segments {
+            let segment = Arc::new(Segment::open(&self.config, file_checkpoint));
+            locked_segments.push(segment);
         }
 
-        if let Some(first_file) = locked_files.first() {
+        if let Some(first_file) = locked_segments.first() {
             self.tail = first_file.tail
         }
 
-        if let Some(last_file) = locked_files.last() {
+        if let Some(last_file) = locked_segments.last() {
             self.head = last_file.head;
         }
     }
 
     pub fn checkpoint(&mut self, full: bool) {
-        let files_copy = self.files.read().clone();
-        let file_checkpoints: Vec<_> = files_copy.into_iter().map(|q_file| {
-            q_file.as_mut().checkpoint(full)
+        let segments_copy = self.segments.read().clone();
+        let file_checkpoints: Vec<_> = segments_copy.into_iter().map(|segment| {
+            segment.as_mut().checkpoint(full)
         }).collect();
 
         let checkpoint = QueueBackendCheckpoint {
-            files: file_checkpoints
+            segments: file_checkpoints
         };
 
         let tmp_path = self.config.data_directory.join(TMP_BACKEND_CHECKPOINT_FILE);
@@ -487,7 +487,7 @@ impl QueueBackend {
 
         match result {
             Ok(_) => {
-                info!("[{}] checkpointed: {:?}", self.config.name, checkpoint.files);
+                info!("[{}] checkpointed: {:?}", self.config.name, checkpoint.segments);
             }
             Err(error) => {
                 warn!("[{}] error writing checkpoint information: {}",
@@ -498,25 +498,25 @@ impl QueueBackend {
 
     pub fn gc(&mut self, smallest_tail: u64) {
         let mut gc_index = 0;
-        // collect files_nums until the first still open or with head > smallest_tail
-        for q_file in &*self.files.read() {
-            if ! q_file.closed || q_file.head > smallest_tail {
+        // collect until the first still open or with head > smallest_tail
+        for segment in &*self.segments.read() {
+            if ! segment.closed || segment.head > smallest_tail {
                 break
             }
             gc_index += 1;
         }
-        info!("[{}] {} files available for gc", self.config.name, gc_index);
+        info!("[{}] {} segments available for gc", self.config.name, gc_index);
         if gc_index != 0 {
             // purge them
-            let mut locked_files = self.files.write();
-            let gc_files: Vec<_> = locked_files.drain(..gc_index).collect();
-            drop(locked_files);
-            self.tail = gc_files.last().unwrap().head;
-            for q_file in gc_files {
-                while Arc::strong_count(&q_file) > 1 {
+            let mut locked_segments = self.segments.write();
+            let gc_segments: Vec<_> = locked_segments.drain(..gc_index).collect();
+            drop(locked_segments);
+            self.tail = gc_segments.last().unwrap().head;
+            for segment in gc_segments {
+                while Arc::strong_count(&segment) > 1 {
                     thread::sleep_ms(100);
                 }
-                q_file.as_mut().purge()
+                segment.as_mut().purge()
             }
         }
     }

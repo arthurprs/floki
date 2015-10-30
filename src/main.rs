@@ -36,16 +36,14 @@ mod atom;
 mod cookie;
 mod offset_index;
 
-use config::*;
-use server::*;
+use config::ServerConfig;
+use server::Server;
 
 #[cfg(not(test))]
 fn main() {
     env_logger::init().unwrap();
-    // configure_log();
     info!("starting up");
     let server_config = ServerConfig::read();
-    // let mut queue_configs = server_config.read_queue_configs();
     let (mut server_handler, mut ev_loop) = Server::new(server_config);
     info!("starting event loop");
     ev_loop.run(&mut server_handler).unwrap();

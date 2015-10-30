@@ -397,7 +397,6 @@ impl Drop for Queue {
 mod tests {
     use super::*;
     use config::*;
-    use queue_backend::Message;
     use std::thread;
     use test;
 
@@ -482,14 +481,14 @@ mod tests {
         let mut q = get_queue_opt("test_backend_recover", false);
         let message = gen_message(0);
         let mut put_msg_count = 0;
-        while q.backend.files_count() < 3 {
+        while q.backend.segments_count() < 3 {
             assert!(q.push(&message, 0).is_some());
             put_msg_count += 1;
         }
         q.backend.checkpoint(true);
 
         q = get_queue_opt("test_backend_recover", true);
-        assert_eq!(q.backend.files_count(), 3);
+        assert_eq!(q.backend.segments_count(), 3);
         let mut get_msg_count = 0;
         assert!(q.create_channel("test", 0) == true);
         while let Some(Ok(_)) = q.get("test", 0) {
@@ -527,7 +526,7 @@ mod tests {
         let mut q = get_queue_opt("test_gc", false);
         assert!(q.create_channel("test", 0) == true);
 
-        while q.backend.files_count() < 3 {
+        while q.backend.segments_count() < 3 {
             assert!(q.push(&message, 0).is_some());
             let get_result = q.get("test", 0);
             assert!(get_result.as_ref().unwrap().is_ok());
@@ -535,8 +534,8 @@ mod tests {
         }
         q.maintenance();
 
-        // gc should get rid of the first two files
-        assert_eq!(q.backend.files_count(), 1);
+        // gc should get rid of the first two segments
+        assert_eq!(q.backend.segments_count(), 1);
     }
 
     #[bench]
