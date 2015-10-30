@@ -1,4 +1,5 @@
 use mio::Token;
+use std::fmt;
 
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
 pub struct Cookie(u64);
@@ -18,6 +19,15 @@ impl Cookie {
     #[inline(always)]
     pub fn nonce(self) -> u64 {
         self.0 & 0xFFFFFFFFFFFF
+    }
+}
+
+impl fmt::Display for Cookie {
+    fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
+        f.debug_struct("Cookie")
+            .field("token", &self.token())
+            .field("nonce", &self.nonce())
+            .finish()
     }
 }
 
