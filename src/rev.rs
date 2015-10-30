@@ -29,3 +29,20 @@ impl<T: Ord + fmt::Display> fmt::Display for Rev<T> {
 		self.0.fmt(f)
 	}
 }
+
+#[cfg(test)]
+mod tests {
+	use super::Rev;
+
+	#[test]
+	fn test_eq() {
+	    assert!(Rev(1u32) == Rev(1u32));
+	    assert!(Rev(1u32) != Rev(0u32));
+	}
+
+	#[test]
+	fn test_rev_cmp() {
+	    assert!(Rev(1u32) < Rev(0u32));
+	    assert!(Rev(1u32) > Rev(2u32));
+	}
+}
