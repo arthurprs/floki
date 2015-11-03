@@ -36,11 +36,11 @@ mod atom;
 mod cookie;
 mod offset_index;
 
-use config::ServerConfig;
-use server::Server;
-
 #[cfg(not(test))]
 fn main() {
+    use config::ServerConfig;
+    use server::Server;
+
     env_logger::init().unwrap();
     info!("starting up");
     let server_config = ServerConfig::read();
