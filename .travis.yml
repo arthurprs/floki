@@ -1,3 +1,11 @@
+os:
+  - linux
+  - osx
+
+matrix:
+  allow_failures:
+    - os: osx
+
 language: rust
 rust:
     - nightly
