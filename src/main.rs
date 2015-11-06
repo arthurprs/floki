@@ -7,7 +7,6 @@
 #![feature(drain)]
 #![feature(arc_counts)]
 #![cfg_attr(test, feature(test))]
-#![feature(str_match_indices)]
 
 #[cfg(test)] extern crate test;
 extern crate env_logger;
@@ -24,10 +23,11 @@ extern crate fnv;
 extern crate spin;
 extern crate libc;
 extern crate rand;
+extern crate tendril;
 
 mod config;
 mod queue;
-mod server;
+#[cfg(not(test))]mod server;
 mod protocol;
 mod queue_backend;
 mod utils;

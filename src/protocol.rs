@@ -1,513 +1,348 @@
 use mio::{Buf, MutBuf};
-use std::mem::{self, size_of};
+use std::mem;
 use std::io::Write;
+use std::cmp;
 use std::str;
 use std::fmt;
-
+use tendril;
 use queue_backend::Message;
 
-const REQUEST_MAGIC: u8 = 0x80;
-const RESPONSE_MAGIC: u8 = 0x81;
+type ByteTendril = tendril::Tendril<tendril::fmt::Bytes, tendril::Atomic>;
+type StrTendril = tendril::Tendril<tendril::fmt::UTF8, tendril::Atomic>;
 
-const DATA_TYPE_RAW: u8 = 0x0;
-
-#[derive(Debug, PartialEq, Eq, Copy, Clone)]
-#[repr(u8)]
-pub enum OpCode {
-    Get = 0x0,
-    Set = 0x1,
-    Delete = 0x4,
-    Quit = 0x7,
-    Flush = 0x8,
-    GetQ = 0x9,
-    Stat = 0x10,
-    NoOp = 0xA,
-    Version = 0xB,
-    GetK = 0xC,
-    GetKQ = 0xD
+#[derive(Eq, PartialEq, Debug)]
+pub enum ProtocolError {
+    Incomplete,
+    Response(String),
+    Unknown(String),
 }
 
-impl OpCode {
-    pub fn include_key(&self) -> bool {
+impl<T: AsRef<str>> From<T> for ProtocolError {
+    fn from(from: T) -> ProtocolError {
+        ProtocolError::Unknown(from.as_ref().into())
+    }
+}
+
+pub type ProtocolResult<T> = Result<T, ProtocolError>;
+
+pub enum Value {
+    Nil,
+    Int(i64),
+    Message(Message),
+    Data(ByteTendril),
+    Bulk(Vec<Value>),
+    Status(StrTendril),
+    Okay,
+}
+
+impl fmt::Debug for Value {
+    fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
         match *self {
-            OpCode::GetK | OpCode::GetKQ => true,
-            _ => false
+            Value::Nil =>
+                write!(f, "Nil"),
+            Value::Int(v) =>
+                write!(f, "Int({:?})", v),
+            Value::Data(ref v) =>
+                match str::from_utf8(v) {
+                    Ok(s) => write!(f, "Data({:?})", s),
+                    Err(_) => write!(f, "Data({:?})", v.as_ref())
+                },
+            Value::Bulk(ref v) => {
+                try!(write!(f, "Bulk("));
+                try!(f.debug_list().entries(v).finish());
+                write!(f, ")")
+            },
+            Value::Status(ref v) =>
+                write!(f, "Status({:?})", v.as_ref()),
+            Value::Okay =>
+                write!(f, "Okay"),
+            Value::Message(_) =>
+                write!(f, "Message(..)"),
         }
     }
-    pub fn is_quiet(&self) -> bool {
-        match *self {
-            OpCode::GetQ | OpCode::GetKQ => true,
-            _ => false
-        }
-    }
-}
-
-#[derive(Debug, PartialEq, Eq, Copy, Clone)]
-#[repr(u16)]
-pub enum Status {
-    NoError = 0x0,
-    KeyNotFound = 0x1,
-    ValueTooLarge = 0x3,
-    InvalidArguments = 0x4,
-    UknownCommand = 0x81
-}
-
-#[repr(packed)]
-pub struct RequestHeader {
-    magic: u8,
-    opcode: u8,
-    key_len: u16,
-    extras_len: u8,
-    data_type: u8,
-    vbucket_id: u16,
-    total_body_len: u32,
-    opaque: u32,
-    cas: u64
-}
-
-#[repr(packed)]
-pub struct ResponseHeader {
-    magic: u8,
-    opcode: u8,
-    key_len: u16,
-    extras_len: u8,
-    data_type: u8,
-    status: u16,
-    total_body_len: u32,
-    opaque: u32,
-    cas: u64
-}
-
-impl fmt::Debug for RequestHeader {
-    fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
-        fmt.debug_struct("RequestHeader")
-            .field("magic", &self.magic.to_be())
-            .field("opcode", &self.opcode.to_be())
-            .field("key_len", &self.key_len.to_be())
-            .field("extras_len", &self.extras_len.to_be())
-            .field("data_type", &self.data_type.to_be())
-            .field("vbucket_id", &self.vbucket_id.to_be())
-            .field("total_body_len", &self.total_body_len.to_be())
-            .field("opaque", &self.opaque.to_be())
-            .field("cas", &self.cas.to_be())
-            .finish()
-    }
-}
-
-impl fmt::Debug for ResponseHeader {
-    fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
-        fmt.debug_struct("ResponseHeader")
-            .field("magic", &self.magic.to_be())
-            .field("opcode", &self.opcode.to_be())
-            .field("key_len", &self.key_len.to_be())
-            .field("extras_len", &self.extras_len.to_be())
-            .field("data_type", &self.data_type.to_be())
-            .field("status", &self.status.to_be())
-            .field("total_body_len", &self.total_body_len.to_be())
-            .field("opaque", &self.opaque.to_be())
-            .field("cas", &self.cas.to_be())
-            .finish()
-    }
-}
-
-impl RequestHeader {
-    pub fn get_total_len(&self) -> usize {
-        size_of::<Self>() + self.total_body_len.to_be() as usize
-    }
-
-    pub fn get_value_len(&self) -> usize {
-        self.total_body_len.to_be() as usize - self.extras_len.to_be() as usize - self.key_len.to_be() as usize
-    }
-
-    pub fn get_total_body_len(&self) -> usize {
-        self.total_body_len.to_be() as usize
-    }
-
-    pub fn get_key_len(&self) -> usize {
-        self.key_len.to_be() as usize
-    }
-
-    pub fn get_extras_len(&self) -> usize {
-        self.extras_len.to_be() as usize
-    }
-}
-
-impl ResponseHeader {
-    pub fn get_total_len(&self) -> usize {
-        size_of::<Self>() + self.total_body_len.to_be() as usize
-    }
-
-    pub fn get_value_len(&self) -> usize {
-        self.total_body_len.to_be() as usize - self.extras_len.to_be() as usize - self.key_len.to_be() as usize
-    }
-
-    pub fn get_total_body_len(&self) -> usize {
-        self.total_body_len.to_be() as usize
-    }
-
-    pub fn get_key_len(&self) -> usize {
-        self.key_len.to_be() as usize
-    }
-
-    pub fn get_extras_len(&self) -> usize {
-        self.extras_len.to_be() as usize
-    }
-
-    pub fn set_total_body_len(&mut self, value: usize) {
-        self.total_body_len = (value as u32).to_be()
-    }
-
-    pub fn set_key_len(&mut self, value: usize) {
-        self.key_len = (value as u16).to_be()
-    }
-
-    pub fn set_extras_len(&mut self, value: usize) {
-        self.extras_len = (value as u8).to_be()
-    }
-}
-
-#[derive(Debug)]
-pub struct RequestBuffer {
-    body: Vec<u8>,
-    bytes_read: u32,
-    arg_offsets: [(u16, u16); 3],
 }
 
 #[derive(Debug)]
 pub struct ResponseBuffer {
     body: Vec<u8>,
     bytes_written: usize,
-    pub message: Option<Message>,
+    root_value: Option<Value>,
+}
+
+#[derive(Debug)]
+pub struct RequestBuffer {
+    body: ByteTendril,
+    bytes_read: u32,
 }
 
 impl RequestBuffer {
     pub fn new() -> RequestBuffer {
-        let mut v = Vec::with_capacity(4096);
-        unsafe { v.set_len(4096) };
         RequestBuffer {
-            body: v,
+            body: ByteTendril::new(),
             bytes_read: 0,
-            arg_offsets: [(0xFFFF, 0xFFFF); 3],
         }
     }
 
-    fn parse_args(&mut self) {
-        let mut arg_count = 0;
-        let mut start = 0;
-        let mut arg_offsets = [(0xFFFF, 0xFFFF); 3];
-        for (colon_offset, _) in self.key_str().match_indices(':') {
-            arg_offsets[arg_count] = (start as u16, colon_offset as u16);
-            start = colon_offset + 1;
-            arg_count += 1;
-            if arg_count >= 2 {
-                break
-            }
+    fn parse(&mut self) -> ProtocolResult<Value> {
+        let mut parser = Parser {
+            body: self.body.subtendril(0, self.bytes_read),
+        };
+        let parsed = parser.parse();
+        if parsed.is_ok() {
+            self.body = parser.body;
+            self.bytes_read = self.body.len32();
         }
-        arg_offsets[arg_count] = (start as u16, self.key_str().len() as u16);
-        self.arg_offsets = arg_offsets;
+        parsed
     }
+}
 
-    #[inline(always)]
-    fn header(&self) -> &RequestHeader {
-        unsafe { mem::transmute(self.body.as_ptr()) }
-    }
-
-    #[inline(always)]
-    fn header_mut(&self) -> &mut RequestHeader {
-        unsafe { mem::transmute(self.body.as_ptr()) }
-    }
-
-    pub fn clear(&mut self) {
-        unsafe { self.body.set_len(4096) };
-        self.bytes_read = 0;
-    }
-
-    pub fn arg_count(&self) -> usize {
-        self.arg_offsets.len()
-    }
-
-    pub fn arg_str(&self, arg_number: usize) -> Option<&str> {
-        self.arg_offsets.get(arg_number).and_then(|&(start, end)| {
-            if start != 0xFFFF {
-                Some(unsafe { str::from_utf8_unchecked(&self.key_slice()[start as usize..end as usize]) })
-            } else {
-                None
-            }
-        })
-    }
-
-    pub fn arg_uint(&self, arg_number: usize) -> Option<u64> {
-        self.arg_str(arg_number).and_then(|s| s.parse::<u64>().ok())
-    }
-
-    pub fn key_str(&self) -> &str {
-        unsafe { str::from_utf8_unchecked(self.key_slice()) }
-    }
-    
-    pub fn key_slice(&self) -> &[u8] {
-        debug_assert!(self.is_complete());
-        &self.body[size_of::<RequestHeader>() + self.header().get_extras_len()..size_of::<RequestHeader>() + self.header().get_extras_len() + self.header().get_key_len()]
-    }
-
-    pub fn value_slice(&self) -> &[u8] {
-        debug_assert!(self.is_complete());
-        &self.body[size_of::<RequestHeader>() + self.header().get_extras_len() + self.header().get_key_len()..]
-    }
-
-    pub fn is_complete(&self) -> bool {
-        if (self.bytes_read as usize) < size_of::<RequestHeader>() {
-            false
-        } else {
-            (self.bytes_read as usize) == self.header().get_total_len()
+impl ResponseBuffer {
+    pub fn new() -> ResponseBuffer {
+        ResponseBuffer {
+            body: Vec::new(),
+            bytes_written: 0,
+            root_value: None
         }
-    }
-
-    pub fn is_too_large(&self) -> bool {
-        if (self.bytes_read as usize) <= size_of::<RequestHeader>() {
-            false
-        } else {
-            self.header().get_key_len() > 256 || self.header().get_total_body_len() > 256 * 1024
-        }
-    }
-
-    pub fn opcode(&self) -> OpCode {
-        unsafe { mem::transmute(self.header().opcode) }
     }
 }
 
 impl MutBuf for RequestBuffer {
     fn remaining(&self) -> usize {
-        self.body[self.bytes_read as usize..].len()
+        cmp::min(4 * 1024, self.body.len32() - self.bytes_read) as usize
     }
 
     fn advance(&mut self, cnt: usize) {
-        if (self.bytes_read as usize) < size_of::<RequestHeader>() &&
-                (self.bytes_read as usize) + cnt >= size_of::<RequestHeader>() {
-            let total_len = self.header().get_total_len();
-            if self.body.capacity() < total_len {
-                self.body.reserve_exact(total_len);
-            }
-            unsafe { self.body.set_len(total_len) };
-        }
-        self.bytes_read += cnt as u32;
-        if self.is_complete() {
-            self.parse_args();
-        }
+        self.bytes_read += cnt as u32
     }
 
     fn mut_bytes(&mut self) -> &mut [u8] {
+        if self.body.len32() - self.bytes_read < 4 * 1024 {
+            let cur_len = self.body.len32();
+            unsafe { self.body.set_len(cmp::max(4 * 1024, cur_len * 2)); }
+        }
         &mut self.body[self.bytes_read as usize..]
     }
 }
 
-impl ResponseBuffer {
-    pub fn new(opcode: OpCode, status: Status) -> ResponseBuffer {
-        let mut response = ResponseBuffer {
-            body: Vec::with_capacity(24),
-            bytes_written: 0,
-            message: None
-        };
-        unsafe { response.body.set_len(24) };
-        *response.header_mut() = unsafe { mem::zeroed() };
-        response.header_mut().magic = RESPONSE_MAGIC;
-        response.header_mut().opcode = opcode as u8;
-        response.header_mut().status = (status as u16).to_be();
-        response
-    }
 
-    pub fn new_set_response() -> ResponseBuffer {
-        let mut response = ResponseBuffer {
-            body: Vec::with_capacity(24),
-            bytes_written: 0,
-            message: None
-        };
-        unsafe { response.body.set_len(24) };
-        *response.header_mut() = unsafe { mem::zeroed() };
-        response.header_mut().magic = RESPONSE_MAGIC;
-        response.header_mut().opcode = OpCode::Set as u8;
-        response
-    }
-
-    pub fn new_get_response(request: &RequestBuffer, message: Message) -> ResponseBuffer {
-        let mut response = ResponseBuffer {
-            body: Vec::with_capacity(4096),
-            bytes_written: 0,
-            message: None
-        };
-        unsafe { response.body.set_len(24) };
-        *response.header_mut() = unsafe { mem::zeroed() };
-        response.header_mut().magic = RESPONSE_MAGIC;
-        response.header_mut().opcode = request.header().opcode;
-        response.header_mut().cas = message.id().to_be();
-        let key: &[u8] = if request.opcode().include_key() {
-            request.key_slice()
-        } else {
-            b""
-        };
-        let total_body_len = 4 + key.len() + message.body().len();
-        response.header_mut().set_extras_len(4);
-        response.header_mut().set_key_len(key.len());
-        response.header_mut().set_total_body_len(total_body_len);
-        response.body.reserve(total_body_len);
-        response.body.write_all(b"\0\0\0\0").unwrap();
-        response.body.write_all(key).unwrap();
-        response.body.write_all(message.body()).unwrap();
-        response
-    }
-
-    pub fn new_get_response_fd(request: &RequestBuffer, message: Message) -> ResponseBuffer {
-        let mut response = ResponseBuffer {
-            body: Vec::with_capacity(128),
-            bytes_written: 0,
-            message: None,
-        };
-        unsafe { response.body.set_len(24) };
-        *response.header_mut() = unsafe { mem::zeroed() };
-        response.header_mut().magic = RESPONSE_MAGIC;
-        response.header_mut().opcode = request.header().opcode;
-        response.header_mut().cas = message.id().to_be();
-        let key: &[u8] = if request.opcode().include_key() {
-            request.key_slice()
-        } else {
-            b""
-        };
-        let internal_body_len = 4 + key.len();
-        response.header_mut().set_extras_len(4);
-        response.header_mut().set_key_len(key.len());
-        response.header_mut().set_total_body_len(internal_body_len + message.body().len());
-        response.body.reserve(internal_body_len);
-        response.body.write_all(b"\0\0\0\0").unwrap();
-        response.body.write_all(key).unwrap();
-        response.message = Some(message);
-        response
-    }
-
-
-    #[inline(always)]
-    fn header(&self) -> &ResponseHeader {
-        unsafe { mem::transmute(self.body.as_ptr()) }
-    }
-
-    #[inline(always)]
-    fn header_mut(&self) -> &mut ResponseHeader {
-        unsafe { mem::transmute(self.body.as_ptr()) }
-    }
-
-    pub fn clear(&mut self) {
-        self.body.clear();
-        self.bytes_written = 0;
-    }
-
-    pub fn is_complete(&self) -> bool {
-        self.bytes_written == self.header().get_total_len()
-    }
-
-    pub fn opcode(&self) -> OpCode {
-        unsafe { mem::transmute(self.header().opcode) }
-    }
+/// The internal redis response parser.
+struct Parser {
+    body: ByteTendril,
 }
 
-impl Buf for ResponseBuffer {
-    
-    fn remaining(&self) -> usize {
-        self.header().get_total_len() - self.bytes_written
+impl Parser {
+    fn new<T: Into<ByteTendril>>(body: T) -> Parser {
+        Parser {
+            body: body.into()
+        }
     }
 
-    fn bytes(&self) -> &[u8] {
-        &self.body[self.bytes_written..]
+    /// parses a single value out of the stream.  If there are multiple
+    /// values you can call this multiple times.
+    fn parse(&mut self) -> ProtocolResult<Value> {
+        match try!(self.read_byte()) {
+            b'+' => self.parse_status(),
+            b':' => self.parse_int(),
+            b'$' => self.parse_data(),
+            b'*' => self.parse_bulk(),
+            b'-' => self.parse_error(),
+            _ => Err("Invalid response when parsing value".into()),
+        }
     }
 
-    fn advance(&mut self, cnt: usize) {
-        self.bytes_written += cnt;
+    #[inline]
+    fn read_byte(&mut self) -> ProtocolResult<u8> {
+        if self.body.len() >= 1 {
+            let byte = self.body[0];
+            self.body.pop_front(1);
+            return Ok(byte)
+        } else {
+            Err(ProtocolError::Incomplete)
+        }
+    }
+
+    #[inline]
+    fn read(&mut self, bytes: usize) -> ProtocolResult<ByteTendril> {
+        if self.body.len() >= bytes {
+            let (first_part, second_part) = Self::split_at(self.body.clone(), bytes);
+            self.body = second_part;
+            return Ok(first_part)
+        } else {
+            Err(ProtocolError::Incomplete)
+        }
+    }
+
+    fn split_at(mut tendril: ByteTendril, position: usize) -> (ByteTendril, ByteTendril) {
+        let offset = position as u32;
+        let len = tendril.len32() - offset;
+        let second_part = tendril.subtendril(offset, len);
+        tendril.pop_back(len);
+        (tendril, second_part)
+    }
+
+    fn read_line(&mut self) -> ProtocolResult<ByteTendril> {
+        let nl_pos = match self.body.iter().position(|&b| b == b'\r') {
+            Some(nl_pos) => nl_pos,
+            None => return Err("Missing line separator".into()),
+        };
+        let (first_part, second_part) = Self::split_at(try!(self.read(nl_pos + 2)), nl_pos);
+        if second_part.as_ref() != b"\r\n" {
+            return Err("Invalid line separator".into())
+        }
+
+        Ok(first_part)
+    }
+
+    fn read_string_line(&mut self) -> ProtocolResult<StrTendril> {
+        let line = try!(self.read_line());
+        match str::from_utf8(line.as_ref()) {
+            Ok(_) => Ok(unsafe { mem::transmute(line) }),
+            Err(_) => Err("Expected valid string, got garbage".into())
+        }
+    }
+
+    fn read_int_line(&mut self) -> ProtocolResult<i64> {
+        let line = try!(self.read_string_line());
+        match line.parse::<i64>() {
+            Err(_) => Err("Expected integer, got garbage".into()),
+            Ok(value) => Ok(value)
+        }
+    }
+
+    fn parse_status(&mut self) -> ProtocolResult<Value> {
+        let line = try!(self.read_string_line());
+        if line.as_ref() == "OK" {
+            Ok(Value::Okay)
+        } else {
+            Ok(Value::Status(line))
+        }
+    }
+
+    fn parse_int(&mut self) -> ProtocolResult<Value> {
+        Ok(Value::Int(try!(self.read_int_line())))
+    }
+
+    fn parse_data(&mut self) -> ProtocolResult<Value> {
+        let length = try!(self.read_int_line());
+        if length < 0 {
+            Ok(Value::Nil)
+        } else {
+            let length = length as usize;
+            let (data, line_sep) = Self::split_at(try!(self.read(length + 2)), length);
+            if line_sep.as_ref() != b"\r\n" {
+                return Err("Invalid line separator".into())
+            }
+            Ok(Value::Data(data))
+        }
+    }
+
+    fn parse_bulk(&mut self) -> ProtocolResult<Value> {
+        let length = try!(self.read_int_line());
+        if length < 0 {
+            Ok(Value::Nil)
+        } else {
+            let length = length as usize;
+            let mut rv = Vec::with_capacity(length);
+            for _ in 0..length {
+                let value = try!(self.parse());
+                rv.push(value);
+            }
+            Ok(Value::Bulk(rv))
+        }
+    }
+
+    fn parse_error(&mut self) -> ProtocolResult<Value> {
+        let desc = "An error was signalled by the server";
+        let line = try!(self.read_string_line());
+        Err(ProtocolError::Response(line.into()))
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use mio::{Buf, MutBuf};
+    use super::{RequestBuffer, ProtocolResult, ProtocolError, Parser, Value};
     use std::io::Write;
-    use std::slice;
-    use std::mem::{self, size_of};
+    use mio::MutBuf;
+
+    fn parse(slice: &[u8]) -> ProtocolResult<Value> {
+        Parser::new(slice).parse()
+    }
+
+    macro_rules! assert_eq_repr {
+        ($left:expr , $right:expr) => ({
+            match (format!("{:?}", &$left), format!("{:?}", &$right)) {
+                (left_val, right_val) => {
+                    if !(left_val == right_val) {
+                        panic!("repr assertion failed: `(debug(left) == debug(right))` \
+                               (left: `{:?}`, right: `{:?}`)", left_val, right_val)
+                    }
+                }
+            }
+        })
+    }
 
     #[test]
-    fn test_fill_clear_loop() {
-        let req_header_sample = RequestHeader {
-            magic: 0,
-            opcode: 0,
-            key_len: 2u16.to_be(),
-            extras_len: 2u8.to_be(),
-            data_type: 0,
-            vbucket_id: 0,
-            total_body_len: 10u32.to_be(),
-            opaque: 0,
-            cas: 0
-        };
+    fn parse_incomplete() {
+        let r = parse(b"*2\r\n$3\r\nfoo");
+        assert_eq_repr!(r.unwrap_err(), ProtocolError::Incomplete);
+    }
 
-        let mut buf = RequestBuffer::new();
-        for _ in (0..3) {
-            assert!(!buf.is_complete());
-            assert!(buf.remaining() > 0);
-            buf.mut_bytes().write_all(unsafe {
-                slice::from_raw_parts(
-                    mem::transmute(&req_header_sample), size_of::<RequestHeader>())
-            }).unwrap();
-            buf.advance(size_of::<RequestHeader>());
+    #[test]
+    fn parse_error() {
+        let r = parse(b"-foo\r\n");
+        assert_eq_repr!(r.unwrap_err(), ProtocolError::Response("foo".into()));
 
-            assert!(!buf.is_complete());
-            assert_eq!(buf.remaining(), 10);
-            buf.mut_bytes().write_all(&[0u8, 1, 2, 3, 4, 5, 6, 7, 8, 9]).unwrap();
-            buf.advance(10);
-            assert_eq!(buf.remaining(), 0);
-            assert!(buf.is_complete());
+        let r = parse(b"-invalid line sep\r\r");
+        assert!(if let ProtocolError::Unknown(_) = r.unwrap_err() {true} else {false});
+    }
 
-            assert_eq!(buf.key_slice(), &[2u8, 3]);
-            assert_eq!(buf.value_slice(), &[4u8, 5, 6, 7, 8, 9]);
-            buf.clear();
+    #[test]
+    fn parse_valid_bulk() {
+        let r = parse(b"*2\r\n$3\r\nfoo\r\n$4\r\nbarz\r\n");
+        assert!(r.is_ok(), "{:?} not ok", r.unwrap_err());
+        assert_eq_repr!(
+            r.unwrap(),
+            Value::Bulk(vec![
+                Value::Data(b"foo".as_ref().into()),
+                Value::Data(b"barz".as_ref().into())
+            ])
+        );
+    }
+
+    #[test]
+    fn parser_multiple2() {
+        let mut parser = Parser::new(
+            b"*2\r\n$3\r\nfoo\r\n$4\r\nbarz\r\n*2\r\n$3\r\nfoo\r\n$4\r\nbarz\r\n".as_ref(),
+        );
+        for _ in 0..2 {
+            let r = parser.parse();
+            assert!(r.is_ok(), "{:?} not ok", r.unwrap_err());
+            assert_eq_repr!(
+                r.unwrap(),
+                Value::Bulk(vec![
+                    Value::Data(b"foo".as_ref().into()),
+                    Value::Data(b"barz".as_ref().into())
+                ])
+            );
         }
+        let r = parser.parse();
+        assert_eq_repr!(r.unwrap_err(), ProtocolError::Incomplete);
     }
 
     #[test]
-    fn test_partial_fill() {
-        let req_header_sample = RequestHeader {
-            magic: 0,
-            opcode: 0,
-            key_len: 2u16.to_be(),
-            extras_len: 2u8.to_be(),
-            data_type: 0,
-            vbucket_id: 0,
-            total_body_len: 10u32.to_be(),
-            opaque: 0,
-            cas: 0
-        };
-
-        let mut buf = RequestBuffer::new();
-        let sample_ptr = &req_header_sample as *const RequestHeader as *const u8;
-        buf.mut_bytes().write_all(unsafe {
-            slice::from_raw_parts(sample_ptr, size_of::<RequestHeader>() - 12)
-        }).unwrap();
-        buf.advance(size_of::<RequestHeader>() - 12);
-        assert!(buf.remaining() >= 12);
-
-        buf.mut_bytes().write_all(unsafe {
-            slice::from_raw_parts(sample_ptr.offset(size_of::<RequestHeader>() as isize - 12), 12)
-        }).unwrap();
-        buf.advance(12);
-        assert_eq!(buf.remaining(), 10);
-
-
-        buf.mut_bytes().write_all(&[0u8, 1, 2, 3, 4]).unwrap();
-        buf.advance(5);
-        assert_eq!(buf.remaining(), 5);
-
-
-        buf.mut_bytes().write_all(&[5u8, 6, 7, 8, 9]).unwrap();
-        buf.advance(5);
-        assert_eq!(buf.remaining(), 0);
-
-        assert_eq!(buf.key_slice(), &[2u8, 3]);
-        assert_eq!(buf.value_slice(), &[4u8, 5, 6, 7, 8, 9]);
-        assert!(buf.is_complete());
+    fn request_parse() {
+        let mut req = RequestBuffer::new();
+        req.mut_bytes().write_all(b"+OK\r").unwrap();
+        req.advance(4);
+        let r = req.parse();
+        assert_eq_repr!(r.unwrap_err(), ProtocolError::Incomplete);
+        req.mut_bytes().write_all(b"\n:100\r\n").unwrap();
+        req.advance(7);
+        let r = req.parse();
+        assert!(r.is_ok(), "{:?} not ok", r.unwrap_err());
+        assert_eq_repr!(r.unwrap(), Value::Okay);
+        let r = req.parse();
+        assert!(r.is_ok(), "{:?} not ok", r.unwrap_err());
+        assert_eq_repr!(r.unwrap(), Value::Int(100));
     }
-
 }
