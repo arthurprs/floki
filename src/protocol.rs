@@ -7,19 +7,18 @@ use std::fmt;
 use tendril;
 use queue_backend::Message;
 
-type ByteTendril = tendril::Tendril<tendril::fmt::Bytes, tendril::Atomic>;
-type StrTendril = tendril::Tendril<tendril::fmt::UTF8, tendril::Atomic>;
+pub type ByteTendril = tendril::Tendril<tendril::fmt::Bytes, tendril::Atomic>;
+pub type StrTendril = tendril::Tendril<tendril::fmt::UTF8, tendril::Atomic>;
 
 #[derive(Eq, PartialEq, Debug)]
 pub enum ProtocolError {
     Incomplete,
-    Response(String),
-    Unknown(String),
+    Invalid(&'static str),
 }
 
-impl<T: AsRef<str>> From<T> for ProtocolError {
-    fn from(from: T) -> ProtocolError {
-        ProtocolError::Unknown(from.as_ref().into())
+impl From<&'static str> for ProtocolError {
+    fn from(from: &'static str) -> ProtocolError {
+        ProtocolError::Invalid(from)
     }
 }
 
@@ -28,11 +27,41 @@ pub type ProtocolResult<T> = Result<T, ProtocolError>;
 pub enum Value {
     Nil,
     Int(i64),
-    Message(Message),
     Data(ByteTendril),
     Bulk(Vec<Value>),
     Status(StrTendril),
-    Okay,
+    Error(StrTendril),
+    Message(Message),
+}
+
+impl Value {
+    fn serialize_to(self, f: &mut Vec<u8>) {
+        match self {
+            Value::Nil =>
+                write!(f, "$-1\r\n"),
+            Value::Int(v) =>
+                write!(f, ":{}\r\n", v),
+            Value::Data(v) => {
+                write!(f, "${}\r\n", v.len32()).unwrap();
+                f.write_all(v.as_ref()).unwrap();
+                write!(f, "\r\n")
+            }
+            Value::Bulk(b) => {
+                write!(f, "${}\r\n", b.len()).unwrap();
+                for v in b {
+                    v.serialize_to(f);
+                }
+                write!(f, "\r\n")
+            },
+            Value::Status(v) =>
+                write!(f, "+{}\r\n", v.as_ref()),
+            Value::Error(v) =>
+                write!(f, "-{}\r\n", v.as_ref()),
+            Value::Message(_) => {
+                unreachable!();
+            }
+        }.unwrap()
+    }
 }
 
 impl fmt::Debug for Value {
@@ -47,15 +76,15 @@ impl fmt::Debug for Value {
                     Ok(s) => write!(f, "Data({:?})", s),
                     Err(_) => write!(f, "Data({:?})", v.as_ref())
                 },
-            Value::Bulk(ref v) => {
+            Value::Bulk(ref b) => {
                 try!(write!(f, "Bulk("));
-                try!(f.debug_list().entries(v).finish());
+                try!(f.debug_list().entries(b).finish());
                 write!(f, ")")
             },
             Value::Status(ref v) =>
                 write!(f, "Status({:?})", v.as_ref()),
-            Value::Okay =>
-                write!(f, "Okay"),
+            Value::Error(ref v) =>
+                write!(f, "Error({:?})", v.as_ref()),
             Value::Message(_) =>
                 write!(f, "Message(..)"),
         }
@@ -66,7 +95,38 @@ impl fmt::Debug for Value {
 pub struct ResponseBuffer {
     body: Vec<u8>,
     bytes_written: usize,
-    root_value: Option<Value>,
+}
+
+impl ResponseBuffer {
+    pub fn new() -> ResponseBuffer {
+        ResponseBuffer {
+            body: Vec::new(),
+            bytes_written: 0,
+        }
+    }
+
+    pub fn push_value(&mut self, value: Value) {
+        value.serialize_to(&mut self.body);
+    }
+}
+
+impl Buf for ResponseBuffer {
+    fn remaining(&self) -> usize {
+        self.body.len() - self.bytes_written
+    }
+
+    fn advance(&mut self, cnt: usize) {
+        self.bytes_written += cnt;
+        // FIXME: poor mans vecdeque
+        if self.bytes_written == self.body.len() {
+            self.body.clear();
+            self.bytes_written = 0;
+        }
+    }
+
+    fn bytes(&self) -> &[u8] {
+        &self.body[self.bytes_written..]
+    }
 }
 
 #[derive(Debug)]
@@ -83,26 +143,14 @@ impl RequestBuffer {
         }
     }
 
-    fn parse(&mut self) -> ProtocolResult<Value> {
-        let mut parser = Parser {
-            body: self.body.subtendril(0, self.bytes_read),
-        };
+    pub fn pop_value(&mut self) -> ProtocolResult<Value> {
+        let mut parser = Parser::new(self.body.subtendril(0, self.bytes_read));
         let parsed = parser.parse();
         if parsed.is_ok() {
             self.body = parser.body;
             self.bytes_read = self.body.len32();
         }
         parsed
-    }
-}
-
-impl ResponseBuffer {
-    pub fn new() -> ResponseBuffer {
-        ResponseBuffer {
-            body: Vec::new(),
-            bytes_written: 0,
-            root_value: None
-        }
     }
 }
 
@@ -116,14 +164,13 @@ impl MutBuf for RequestBuffer {
     }
 
     fn mut_bytes(&mut self) -> &mut [u8] {
-        if self.body.len32() - self.bytes_read < 4 * 1024 {
-            let cur_len = self.body.len32();
+        let cur_len = self.body.len32();
+        if cur_len - self.bytes_read < 4 * 1024 {
             unsafe { self.body.set_len(cmp::max(4 * 1024, cur_len * 2)); }
         }
         &mut self.body[self.bytes_read as usize..]
     }
 }
-
 
 /// The internal redis response parser.
 struct Parser {
@@ -202,8 +249,9 @@ impl Parser {
     }
 
     fn read_int_line(&mut self) -> ProtocolResult<i64> {
-        let line = try!(self.read_string_line());
-        match line.parse::<i64>() {
+        let line = try!(self.read_line());
+        let line_str = unsafe { str::from_utf8_unchecked(line.as_ref()) };
+        match line_str.parse::<i64>() {
             Err(_) => Err("Expected integer, got garbage".into()),
             Ok(value) => Ok(value)
         }
@@ -211,11 +259,7 @@ impl Parser {
 
     fn parse_status(&mut self) -> ProtocolResult<Value> {
         let line = try!(self.read_string_line());
-        if line.as_ref() == "OK" {
-            Ok(Value::Okay)
-        } else {
-            Ok(Value::Status(line))
-        }
+        Ok(Value::Status(line))
     }
 
     fn parse_int(&mut self) -> ProtocolResult<Value> {
@@ -241,8 +285,7 @@ impl Parser {
         if length < 0 {
             Ok(Value::Nil)
         } else {
-            let length = length as usize;
-            let mut rv = Vec::with_capacity(length);
+            let mut rv = Vec::with_capacity(length as usize);
             for _ in 0..length {
                 let value = try!(self.parse());
                 rv.push(value);
@@ -252,9 +295,8 @@ impl Parser {
     }
 
     fn parse_error(&mut self) -> ProtocolResult<Value> {
-        let desc = "An error was signalled by the server";
         let line = try!(self.read_string_line());
-        Err(ProtocolError::Response(line.into()))
+        Ok(Value::Error(line))
     }
 }
 
@@ -290,10 +332,10 @@ mod tests {
     #[test]
     fn parse_error() {
         let r = parse(b"-foo\r\n");
-        assert_eq_repr!(r.unwrap_err(), ProtocolError::Response("foo".into()));
+        assert_eq_repr!(r.unwrap(), Value::Error("foo".into()));
 
         let r = parse(b"-invalid line sep\r\r");
-        assert!(if let ProtocolError::Unknown(_) = r.unwrap_err() {true} else {false});
+        assert!(if let ProtocolError::Invalid(_) = r.unwrap_err() {true} else {false});
     }
 
     #[test]
@@ -334,14 +376,14 @@ mod tests {
         let mut req = RequestBuffer::new();
         req.mut_bytes().write_all(b"+OK\r").unwrap();
         req.advance(4);
-        let r = req.parse();
+        let r = req.pop_value();
         assert_eq_repr!(r.unwrap_err(), ProtocolError::Incomplete);
         req.mut_bytes().write_all(b"\n:100\r\n").unwrap();
         req.advance(7);
-        let r = req.parse();
+        let r = req.pop_value();
         assert!(r.is_ok(), "{:?} not ok", r.unwrap_err());
-        assert_eq_repr!(r.unwrap(), Value::Okay);
-        let r = req.parse();
+        assert_eq_repr!(r.unwrap(), Value::Status("OK".into()));
+        let r = req.pop_value();
         assert!(r.is_ok(), "{:?} not ok", r.unwrap_err());
         assert_eq_repr!(r.unwrap(), Value::Int(100));
     }

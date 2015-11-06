@@ -423,7 +423,7 @@ mod tests {
     fn test_fill() {
         let mut q = get_queue();
         let message = gen_message(0);
-        for i in (0..100_000) {
+        for i in 0..100_000 {
             let r = q.push(&message, 0);
             assert!(r.is_some());
         }
@@ -434,7 +434,7 @@ mod tests {
         let mut q = get_queue();
         let message = gen_message(0);
         assert!(q.create_channel("test", 0));
-        for i in (0..100_000) {
+        for i in 0..100_000 {
             assert!(q.push(&message, 0).is_some());
             let m = q.get("test", 0);
             assert!(m.is_some());
@@ -545,7 +545,7 @@ mod tests {
         let n = 10000;
         b.bytes = (m.len() * n) as u64;
         b.iter(|| {
-            for _ in (0..n) {
+            for _ in 0..n {
                 let r = q.push(m, 0);
                 assert!(r.is_some());
             }
@@ -560,7 +560,7 @@ mod tests {
         q.create_channel("test", 0);
         b.bytes = (m.len() * n) as u64;
         b.iter(|| {
-            for _ in (0..n) {
+            for _ in 0..n {
                 let p = q.push(m, 0).unwrap();
                 let r = q.get("test", 0).unwrap().unwrap().id();
                 q.ack("test", r, 0);
