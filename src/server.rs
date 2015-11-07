@@ -110,6 +110,10 @@ impl NotifyMessage {
     fn with_nil() -> NotifyMessage {
         Self::with_value(Value::Nil)
     }
+
+    fn with_int(int: i64) -> NotifyMessage {
+        Self::with_value(Value::Int(int))
+    }
 }
 
 fn assume_str(possibly_str: &[u8]) -> &str {
@@ -187,7 +191,7 @@ impl Dispatch {
         self.channel.send((self.cookie, notification)).unwrap();
     }
 
-    fn get(&self, args: &[&[u8]]) -> NotifyMessage {
+    fn mget(&self, args: &[&[u8]]) -> NotifyMessage {
         if args.len() < 3 {
             return NotifyMessage::with_error("MPA Queue or Channel Missing")
         }
@@ -217,13 +221,12 @@ impl Dispatch {
         }
     }
 
-    fn mput(&self, args: &[&[u8]]) -> NotifyMessage {
+    fn mset(&self, args: &[&[u8]]) -> NotifyMessage {
         if args.len() < 3 {
             return NotifyMessage::with_error("MPA Queue or Channel Missing")
         }
         let queue_name = assume_str(args[1]);
         let channel_name = assume_str(args[2]);
-        let value_opt = args.get(3);
         let q = self.get_or_create_queue(queue_name);
 
         if self.create_channel(&q, channel_name) {
@@ -233,7 +236,7 @@ impl Dispatch {
         }
     }
 
-    fn put(&self, args: &[&[u8]]) -> NotifyMessage {
+    fn set(&self, args: &[&[u8]]) -> NotifyMessage {
         if args.len() < 3 {
             return NotifyMessage::with_error("MPA Queue or Value Missing")
         }
@@ -257,42 +260,49 @@ impl Dispatch {
         }
         let queue_name = assume_str(args[1]);
         let channel_name = assume_str(args[2]);
+        let q = if let Some(q) = self.get_queue(queue_name) {
+            q
+        } else {
+            return NotifyMessage::with_error("QNF Queue Not Found");
+        };
         if let Ok(id) = assume_str(args[3]).parse::<u64>() {
-            let q = self.get_or_create_queue(queue_name);
             if q.as_mut().ack(channel_name, id, self.clock).is_some() {
-                NotifyMessage::with_ok()
+                NotifyMessage::with_int(1)
             } else {
-                NotifyMessage::with_nil()
+                NotifyMessage::with_int(0)
             }
         } else {
             NotifyMessage::with_error("IID Invalid Id")
         }
     }
 
-    fn _del(&self, args: &[&[u8]]) -> NotifyMessage {
+    fn del(&self, args: &[&[u8]]) -> NotifyMessage {
         if args.len() < 2 {
             return NotifyMessage::with_error("MPA Queue Missing")
         }
         let queue_name = assume_str(args[1]);
         let channel_name_opt = args.get(2).map(|s| assume_str(s));
-        let q = self.get_or_create_queue(queue_name);
+        let q = if let Some(q) = self.get_queue(queue_name) {
+            q
+        } else {
+            return NotifyMessage::with_int(0);
+        };
 
-        match (assume_str(args[0]), channel_name_opt) {
-            ("DEL", None) => {
+        match channel_name_opt {
+            None => {
                 q.as_mut().purge();
             },
-            ("MDEL", None) => {
+            Some("_purge") => {
                 self.delete_queue(q);
             },
-            ("MDEL", Some(channel_name)) => {
+            Some(channel_name) => {
                 if ! self.delete_channel(&q, channel_name) {
-                    return NotifyMessage::with_error("CNF Channel Not Found")
+                    return NotifyMessage::with_int(0);
                 }
             },
-            (_, _) => unreachable!()
         }
 
-        return NotifyMessage::with_ok()
+        NotifyMessage::with_int(1)
     }
 
     fn dispatch(&self) {
@@ -303,7 +313,7 @@ impl Dispatch {
         match self.request {
             Value::Bulk(ref b) if b.len() > 0 && b.len() <= 50 => {
                 for v in b {
-                    if let Value::Data(ref d) = b[0] {
+                    if let &Value::Data(ref d) = v {
                         args[argc] = d.as_ref();
                         argc += 1;
                     } else {
@@ -315,12 +325,11 @@ impl Dispatch {
         }
 
         let notification = match assume_str(args[0]) {
-            "PUT" => self.put(&args[..argc]),
-            "MPUT" => self.mput(&args[..argc]),
+            "SET" => self.set(&args[..argc]),
+            "MSET" => self.mset(&args[..argc]),
             "HDEL" => self.hdel(&args[..argc]),
-            "DEL" |
-            "MDEL" => self._del(&args[..argc]),
-            "GET" => self.get(&args[..argc]),
+            "DEL" => self.del(&args[..argc]),
+            "MGET" => self.mget(&args[..argc]),
             _ => NotifyMessage::with_error("UCOM Unknown Command")
         };
 
@@ -388,6 +397,9 @@ impl Connection {
 
         if events.is_writable() {
             while let Ok(bytes_written) = self.stream.write(self.response.bytes()) {
+                if bytes_written == 0 {
+                    break
+                }
                 self.response.advance(bytes_written);
                 trace!("filled response with {} bytes, remaining: {}", bytes_written, self.response.remaining());
             }
@@ -469,7 +481,7 @@ impl Connection {
         server.nonce = server.nonce.wrapping_add(1);
         self.cookie = Cookie::new(self.token, server.nonce);
         // FIXME: this not only allocates but clone 4 ARCs
-        let mut dispatch = Dispatch {
+        let dispatch = Dispatch {
             cookie: self.cookie,
             config: server.config.clone(),
             channel: event_loop.channel(),
@@ -557,7 +569,7 @@ impl Server {
         debug!("wait_queue {:?} {:?} {:?} {:?}", queue, channel, cookie, required_head);
         if let Some(w) = self.waiting_clients.get_mut(&queue) {
             if let Some(cookies)  = w.channels.get_mut(&channel) {
-                if required_head > w.head {
+                if required_head >= w.head {
                     cookies.push_back((cookie, request));
                 } else {
                     debug!("Race condition, queue {:?} channel {:?} has new data {:?}", queue, channel, w.head);

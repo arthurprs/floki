@@ -48,7 +48,7 @@ impl Value {
                 write!(f, "\r\n")
             }
             Value::Bulk(b) => {
-                write!(f, "${}\r\n", b.len()).unwrap();
+                write!(f, "*{}\r\n", b.len()).unwrap();
                 for v in b {
                     v.serialize_to(f);
                 }
@@ -58,8 +58,11 @@ impl Value {
                 write!(f, "+{}\r\n", v.as_ref()),
             Value::Error(v) =>
                 write!(f, "-{}\r\n", v.as_ref()),
-            Value::Message(_) => {
-                unreachable!();
+            Value::Message(message) => {
+                write!(f, "*2\r\n").unwrap();
+                write!(f, ":{}\r\n${}\r\n", message.id(), message.len()).unwrap();
+                f.write(message.body()).unwrap();
+                write!(f, "\r\n")
             }
         }.unwrap()
     }
