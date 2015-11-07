@@ -19,7 +19,7 @@ use offset_index::*;
 
 const MAGIC_NUM: u32 = 0xF1031311u32;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct InnerMessage {
     mmap_ptr: *mut u8,
     fd_offset: u32,
@@ -27,7 +27,7 @@ struct InnerMessage {
     len: u32,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Message {
     segment: Arc<Segment>,
     inner: InnerMessage,

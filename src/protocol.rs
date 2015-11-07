@@ -24,6 +24,7 @@ impl From<&'static str> for ProtocolError {
 
 pub type ProtocolResult<T> = Result<T, ProtocolError>;
 
+#[derive(Clone)]
 pub enum Value {
     Nil,
     Int(i64),

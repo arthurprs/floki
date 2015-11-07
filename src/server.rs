@@ -1,4 +1,4 @@
-use std::str::FromStr;
+use std::str::{self, FromStr};
 use std::net::SocketAddr;
 use std::io::{Read, Write};
 use std::mem;
@@ -112,6 +112,10 @@ impl NotifyMessage {
     }
 }
 
+fn assume_str(possibly_str: &[u8]) -> &str {
+    unsafe { str::from_utf8_unchecked(possibly_str) }
+}
+
 impl Dispatch {
     #[inline]
     fn get_queue(&self, name: &str) -> Option<Arc<Queue>> {
@@ -179,115 +183,148 @@ impl Dispatch {
         self.channel.send((Cookie::new(SERVER, 0), notification)).unwrap();
     }
 
-    // #[allow(mutable_transmutes)]
-    // fn get(&mut self) -> NotifyMessage {
-    //     let queue_name = self.request.arg_str(0).unwrap(); 
-    //     let channel_name = self.request.arg_str(1).unwrap(); 
-    //     let q = if let Some(q) = self.get_queue(queue_name) {
-    //         q
-    //     } else {
-    //         debug!("queue {:?} not found", queue_name);
-    //         return NotifyMessage::with_error("QNF")
-    //     };
+    fn notify_client(&self, notification: NotifyMessage) {
+        self.channel.send((self.cookie, notification)).unwrap();
+    }
 
-    //     match q.as_mut().get(channel_name, self.clock) {
-    //         Some(Ok(message)) => {
-    //             NotifyMessage::from_message(&self.request, message)
-    //         },
-    //         Some(Err(required_head)) => {
-    //             debug!("queue {:?} channel {:?} has no messages", queue_name, channel_name);
-    //             NotifyMessage::GetWouldBlock{
-    //                 request: mem::replace(unsafe{mem::transmute(&self.request)}, RequestBuffer::new()),
-    //                 queue: q.name().into(),
-    //                 channel: channel_name.into(),
-    //                 required_head: required_head,
-    //             }
-    //         },
-    //         _ => NotifyMessage::with_error("CNF")
-    //     }
-    // }
+    fn get(&self, args: &[&[u8]]) -> NotifyMessage {
+        if args.len() < 3 {
+            return NotifyMessage::with_error("MPA Queue or Channel Missing")
+        }
+        let queue_name = assume_str(args[1]);
+        let channel_name = assume_str(args[2]);
+        let q = if let Some(q) = self.get_queue(queue_name) {
+            q
+        } else {
+            debug!("queue {:?} not found", queue_name);
+            return NotifyMessage::with_error("QNF")
+        };
 
-    // fn put(&mut self) -> NotifyMessage {
-    //     let queue_name = self.request.arg_str(0).unwrap(); 
-    //     let channel_name_opt = self.request.arg_str(1); 
-    //     let q = self.get_or_create_queue(queue_name);
+        match q.as_mut().get(channel_name, self.clock) {
+            Some(Ok(message)) => {
+                NotifyMessage::with_value(Value::Message(message))
+            },
+            Some(Err(required_head)) => {
+                debug!("queue {:?} channel {:?} has no messages", queue_name, channel_name);
+                NotifyMessage::GetWouldBlock{
+                    request: self.request.clone(),
+                    queue: q.name().into(),
+                    channel: channel_name.into(),
+                    required_head: required_head,
+                }
+            },
+            _ => NotifyMessage::with_error("CNF")
+        }
+    }
 
-    //     if let Some(channel_name) = channel_name_opt {
-    //         if self.create_channel(&q, channel_name) {
-    //             NotifyMessage::with_ok()
-    //         } else {
-    //             NotifyMessage::with_error("CAA")
-    //         }
-    //     } else {
-    //         let value_slice = self.request.value_slice();
-    //         debug!("inserting into {:?} [{:?}]", queue_name, value_slice.len());
-    //         let id = q.as_mut().push(value_slice, self.clock).unwrap();
-    //         trace!("inserted message into {:?} with id {:?}", queue_name, id);
-    //         NotifyMessage::PutResponse{
-    //             queue: q.name().into(),
-    //             head: id + 1
-    //         }
-    //     }
-    // }
+    fn mput(&self, args: &[&[u8]]) -> NotifyMessage {
+        if args.len() < 3 {
+            return NotifyMessage::with_error("MPA Queue or Channel Missing")
+        }
+        let queue_name = assume_str(args[1]);
+        let channel_name = assume_str(args[2]);
+        let value_opt = args.get(3);
+        let q = self.get_or_create_queue(queue_name);
 
-    // fn delete(&mut self) -> NotifyMessage {
-    //     let queue_name = self.request.arg_str(0).unwrap();
-    //     let channel_name_opt = self.request.arg_str(1);
-    //     let q = if let Some(q) = self.get_queue(queue_name) {
-    //         q
-    //     } else {
-    //         debug!("queue {:?} not found", queue_name);
-    //         return NotifyMessage::with_error("QNF")
-    //     };
+        if self.create_channel(&q, channel_name) {
+            NotifyMessage::with_ok()
+        } else {
+            NotifyMessage::with_error("CAE Channel Already Exists")
+        }
+    }
 
-    //     if let (Some(channel_name), Some(id)) = (channel_name_opt, self.request.arg_uint(2)) {
-    //         debug!("deleting message {:?} from {:?} {:?}", id, queue_name, channel_name);
-    //         if q.as_mut().ack(channel_name, id, self.clock).is_some() {
-    //             return NotifyMessage::with_ok()
-    //         }
-    //         return return NotifyMessage::with_nil()
-    //     }
+    fn put(&self, args: &[&[u8]]) -> NotifyMessage {
+        if args.len() < 3 {
+            return NotifyMessage::with_error("MPA Queue or Value Missing")
+        }
+        let queue_name = assume_str(args[1]);
+        let value = args[2];
+        let q = self.get_or_create_queue(queue_name);
 
-    //     match (channel_name_opt, self.request.arg_str(2)) {
-    //         (Some("_purge"), None) => {
-    //             q.as_mut().purge();
-    //         },
-    //         (Some("_delete"), None) => {
-    //             self.delete_queue(q);
-    //         },
-    //         (Some(channel_name), Some("_delete")) => {
-    //             if ! self.delete_channel(&q, channel_name) {
-    //                 return NotifyMessage::with_error("CNE")
-    //             }
-    //         },
-    //         _ => {
-    //             warn!("unknown delete command {:?}", self.request.key_str());
-    //         }
-    //     }
+        debug!("inserting into {:?} [{:?}]", queue_name, value.len());
+        let id = q.as_mut().push(value, self.clock).unwrap();
+        trace!("inserted message into {:?} with id {:?}", queue_name, id);
+        NotifyMessage::PutResponse{
+            response: Value::Nil,
+            queue: q.name().into(),
+            head: id + 1
+        }
+    }
 
-    //     return NotifyMessage::with_ok()
-    // }
+    fn hdel(&self, args: &[&[u8]]) -> NotifyMessage {
+        if args.len() < 4 {
+            return NotifyMessage::with_error("MPA Queue, Channel or Id Missing")
+        }
+        let queue_name = assume_str(args[1]);
+        let channel_name = assume_str(args[2]);
+        if let Ok(id) = assume_str(args[3]).parse::<u64>() {
+            let q = self.get_or_create_queue(queue_name);
+            if q.as_mut().ack(channel_name, id, self.clock).is_some() {
+                NotifyMessage::with_ok()
+            } else {
+                NotifyMessage::with_nil()
+            }
+        } else {
+            NotifyMessage::with_error("IID Invalid Id")
+        }
+    }
 
-    fn dispatch(&mut self) {
+    fn _del(&self, args: &[&[u8]]) -> NotifyMessage {
+        if args.len() < 2 {
+            return NotifyMessage::with_error("MPA Queue Missing")
+        }
+        let queue_name = assume_str(args[1]);
+        let channel_name_opt = args.get(2).map(|s| assume_str(s));
+        let q = self.get_or_create_queue(queue_name);
+
+        match (assume_str(args[0]), channel_name_opt) {
+            ("DEL", None) => {
+                q.as_mut().purge();
+            },
+            ("MDEL", None) => {
+                self.delete_queue(q);
+            },
+            ("MDEL", Some(channel_name)) => {
+                if ! self.delete_channel(&q, channel_name) {
+                    return NotifyMessage::with_error("CNF Channel Not Found")
+                }
+            },
+            (_, _) => unreachable!()
+        }
+
+        return NotifyMessage::with_ok()
+    }
+
+    fn dispatch(&self) {
         debug!("dispatch {:?} {:?}", self.cookie.token(), self.request);
+        let mut args: [&[u8]; 50] = [b""; 50];
+        let mut argc: usize = 0;
 
-        // let notification = match opcode {
-        //     OpCode::Get | OpCode::GetK | OpCode::GetQ | OpCode::GetKQ => {
-        //         self.get()
-        //     }
-        //     OpCode::Set => {
-        //         self.put()
-        //     }
-        //     OpCode::Delete => {
-        //         self.delete()
-        //     }
-        //     OpCode::NoOp | OpCode::Quit => {
-        //         NotifyMessage::from_status(&self.request, Status::NoError)
-        //     }
-        //     _ => NotifyMessage::from_status(&self.request, Status::InvalidArguments)
-        // };
+        match self.request {
+            Value::Bulk(ref b) if b.len() > 0 && b.len() <= 50 => {
+                for v in b {
+                    if let Value::Data(ref d) = b[0] {
+                        args[argc] = d.as_ref();
+                        argc += 1;
+                    } else {
+                        return self.notify_client(NotifyMessage::with_error("ICOM Invalid Type"))
+                    };
+                }
+            }
+            _ => return self.notify_client(NotifyMessage::with_error("ICOM Invalid Command"))
+        }
 
-        // self.channel.send((self.cookie, notification)).unwrap();
+        let notification = match assume_str(args[0]) {
+            "PUT" => self.put(&args[..argc]),
+            "MPUT" => self.mput(&args[..argc]),
+            "HDEL" => self.hdel(&args[..argc]),
+            "DEL" |
+            "MDEL" => self._del(&args[..argc]),
+            "GET" => self.get(&args[..argc]),
+            _ => NotifyMessage::with_error("UCOM Unknown Command")
+        };
+
+        return self.notify_client(notification);
     }
 }
 

@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 #![allow(unused_variables)]
 #![allow(raw_pointer_derive)]
+#![feature(slice_patterns)]
 #![feature(libc)]
 #![feature(hashmap_hasher)]
 #![feature(drain)]
