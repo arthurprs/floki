@@ -202,6 +202,17 @@ impl Queue {
         self.backend.push(message, clock)
     }
 
+    /// all calls are serialized internally
+    pub fn push_many(&mut self, messages: &[&[u8]], clock: u32) -> Option<u64> {
+        let w_lock = self.w_lock.lock().unwrap();
+        trace!("[{}] putting {} messages", self.config.name, messages.len());
+        assert!(messages.len() > 0);
+        for message in &messages[..messages.len() - 1] {
+            self.backend.push(message, clock);
+        }
+        self.backend.push(messages[messages.len() - 1], clock)
+    }
+
     /// ack access is suposed to be thread-safe, even while writing
     pub fn ack(&mut self, channel_name: &str, id: u64, clock: u32) -> Option<bool> {
         let locked_channels = self.channels.read().unwrap();

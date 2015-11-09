@@ -236,7 +236,7 @@ impl Dispatch {
         }
     }
 
-    fn set(&self, args: &[&[u8]]) -> NotifyMessage {
+    fn lpush_(&self, args: &[&[u8]]) -> NotifyMessage {
         if args.len() < 3 {
             return NotifyMessage::with_error("MPA Queue or Value Missing")
         }
@@ -244,13 +244,16 @@ impl Dispatch {
         let value = args[2];
         let q = self.get_or_create_queue(queue_name);
 
-        debug!("inserting into {:?} [{:?}]", queue_name, value.len());
-        let id = q.as_mut().push(value, self.clock).unwrap();
-        trace!("inserted message into {:?} with id {:?}", queue_name, id);
+        debug!("inserting {} msgs into {:?} [{:?}]",
+            args[2..].len(), queue_name, value.len());
+        let last_id = q.as_mut().push_many(args[2..], self.clock).unwrap();
+        trace!("inserted {} messages into {:?} with last id {:?}",
+            args[2..].len(), queue_name, last_id);
+
         NotifyMessage::PutResponse{
             response: Value::Nil,
             queue: q.name().into(),
-            head: id + 1
+            head: last_id + 1
         }
     }
 
@@ -329,7 +332,7 @@ impl Dispatch {
         }
 
         let notification = match assume_str(args[0]) {
-            "SET" => self.set(&args[..argc]),
+            "LPUSH" | "LPUSHX" => self.lpush_(&args[..argc]),
             "MSET" => self.mset(&args[..argc]),
             "HDEL" => self.hdel(&args[..argc]),
             "DEL" => self.del(&args[..argc]),
