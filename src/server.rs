@@ -391,7 +391,10 @@ impl Connection {
                     self.dispatch(value, server, event_loop);
                 },
                 Err(ProtocolError::Incomplete) => (),
-                Err(ProtocolError::Invalid(error)) => (),
+                Err(ProtocolError::Invalid(error)) => {
+                    error!("{:?} protocol is invalid {:?}", self.token, error);
+                    return false
+                },
             }
         }
 
