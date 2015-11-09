@@ -21,7 +21,8 @@ rand = "*"
 git="https://github.com/contain-rs/linked-hash-map.git"
 
 [dependencies.tendril]
-path="../tendril"
+git="https://github.com/arthurprs/tendril.git"
+commit="d8c86398743c7e885fa6dcc1af9485bdf79b5a51"
 
 [profile.dev]
 opt-level = 0
