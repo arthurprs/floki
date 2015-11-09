@@ -265,15 +265,19 @@ impl Dispatch {
         } else {
             return NotifyMessage::with_error("QNF Queue Not Found");
         };
-        if let Ok(id) = assume_str(args[3]).parse::<u64>() {
-            if q.as_mut().ack(channel_name, id, self.clock).is_some() {
-                NotifyMessage::with_int(1)
+
+        let mut successfully = 0;
+        for id_arg in &args[3..] {
+            if let Ok(id) = assume_str(id_arg).parse::<u64>() {
+                if q.as_mut().ack(channel_name, id, self.clock).is_some() {
+                    successfully += 1
+                }
             } else {
-                NotifyMessage::with_int(0)
+                return NotifyMessage::with_error("IID Invalid Id")
             }
-        } else {
-            NotifyMessage::with_error("IID Invalid Id")
         }
+
+        NotifyMessage::with_int(successfully)
     }
 
     fn del(&self, args: &[&[u8]]) -> NotifyMessage {
