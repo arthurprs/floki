@@ -356,6 +356,10 @@ impl QueueBackend {
         self.tail
     }
 
+    pub fn head(&self) -> u64 {
+        self.head
+    }
+
     fn find_segment(&self, id: u64) -> Option<Arc<Segment>> {
         for segment in  self.segments.read().iter().rev() {
             if segment.tail <= id {
@@ -380,15 +384,11 @@ impl QueueBackend {
             return result
         }
 
-        let segment: &mut Segment = {
-            let segment = Arc::new(Segment::create(
-                &self.config, self.head));
-            let segment_ptr = (&*segment) as *const Segment;
-            self.segments.write().push(segment);
-            unsafe { mem::transmute(segment_ptr) }
-        };
+        // create a new segment
+        let segment = Arc::new(Segment::create(&self.config, self.head));
+        self.segments.write().push(segment.clone());
 
-        let id = segment.push(body, timestamp).expect("Can't write to a newly created file!");
+        let id = segment.as_mut().push(body, timestamp).expect("Can't write to a newly created file!");
         assert_eq!(id, self.head);
         self.head += 1;
         Some(id)
@@ -408,21 +408,24 @@ impl QueueBackend {
     }
 
     pub fn purge(&mut self) {
-        let mut locked_segments = self.segments.write();
-        for segment in locked_segments.drain(..) {
-            while Arc::strong_count(&segment) > 1 {
-                thread::sleep_ms(100);
-            }
-            segment.as_mut().purge()
+        self.tail = self.head;
+        self.segments.write().last_mut().map(|last| last.as_mut().closed = true);
+    }
+
+    fn wait_delete_segment(segment: Arc<Segment>) {
+        while Arc::strong_count(&segment) > 1 {
+            thread::sleep_ms(100);
         }
-        self.tail = 1;
-        self.head = 1;
+        segment.as_mut().purge()
     }
 
     pub fn delete(&mut self) {
-        self.segments.write().clear();
         let path = self.config.data_directory.join(BACKEND_CHECKPOINT_FILE);
         remove_file_if_exist(&path).unwrap();
+        let mut locked_segments = self.segments.write();
+        for segment in locked_segments.drain(..) {
+            Self::wait_delete_segment(segment);
+        }
     }
 
     fn recover(&mut self) {
@@ -513,10 +516,7 @@ impl QueueBackend {
             drop(locked_segments);
             self.tail = gc_segments.last().unwrap().head;
             for segment in gc_segments {
-                while Arc::strong_count(&segment) > 1 {
-                    thread::sleep_ms(100);
-                }
-                segment.as_mut().purge()
+                Self::wait_delete_segment(segment)
             }
         }
     }

@@ -240,9 +240,6 @@ impl Queue {
     // }
 
     pub fn purge(&mut self) {
-        // TODO:
-        // we should probably just advance the tails and let GC take care of any cleaning
-        // it's much faster and won't block incoming operations for long
         info!("[{}] purging", self.config.name);
         let r_lock = self.r_lock.write().unwrap();
         let w_lock = self.w_lock.lock().unwrap();
@@ -251,7 +248,7 @@ impl Queue {
         self.backend.purge();
         for (_, channel) in &mut*self.channels.write().unwrap() {
             let mut locked_channel = channel.lock().unwrap();
-            locked_channel.tail = 1;
+            locked_channel.tail = self.backend.tail();
             locked_channel.in_flight.clear();
         }
         self.as_mut().set_state(QueueState::Ready);
