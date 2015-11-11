@@ -363,7 +363,7 @@ impl QueueBackend {
     }
 
     fn find_segment(&self, id: u64) -> Option<Arc<Segment>> {
-        for segment in  self.segments.read().iter().rev() {
+        for segment in self.segments.read().iter().rev() {
             if segment.tail <= id {
                 return Some(segment.clone())
             }

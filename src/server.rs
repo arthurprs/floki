@@ -246,6 +246,7 @@ impl Dispatch {
             return NotifyMessage::with_error("QNF")
         };
 
+        // get one by one, this contributes for fairness avoiding starving consumers
         match q.as_mut().get(channel_name, self.clock) {
             Some(Ok(message)) => {
                 NotifyMessage::with_value(Value::Message(message))
