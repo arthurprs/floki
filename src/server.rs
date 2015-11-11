@@ -41,7 +41,6 @@ pub type NotifyType = (Cookie, NotifyMessage);
 pub enum TimeoutMessage {
     Timeout{queue: Atom, channel: Atom},
     Maintenance,
-    WallClock,
 }
 
 pub type TimeoutType = (Token, TimeoutMessage);
@@ -86,7 +85,7 @@ pub struct Server {
     thread_pool: ThreadPool,
     maintenance_timeout: Timeout,
     nonce: u64,
-    clock_ms: u64,
+    internal_clock_ms: u64,
 }
 
 pub struct ServerHandler {
@@ -294,7 +293,7 @@ impl Dispatch {
             messages.len(), queue_name, last_id);
 
         NotifyMessage::PutResponse{
-            response: Value::Nil,
+            response: Value::Int(messages.len() as i64),
             queue: q.name().into(),
             head: last_id + 1
         }
@@ -436,7 +435,7 @@ impl Connection {
                     assert!(!self.processing);
                     assert!(!self.waiting);
                     assert!(self.timeout.is_none());
-                    self.request_clock_ms = server.clock_ms;
+                    self.request_clock_ms = server.clock_ms();
                     self.processing = true;
                     self.interest = EventSet::all() - EventSet::readable() - EventSet::writable();
                     event_loop.reregister(&self.stream, self.token, self.interest, PollOpt::level()).unwrap();
@@ -488,7 +487,8 @@ impl Connection {
             NotifyMessage::GetWouldBlock{request, queue, channel, required_head} => {
                 // TODO: this timeout value should come with the message
                 let deadline = self.request_clock_ms + 5000;
-                if server.clock_ms >= deadline {
+                let clock = server.clock_ms();
+                if clock >= deadline {
                     self.send_response(Value::Nil, server, event_loop);
                 } else {
                     self.waiting = true;
@@ -498,7 +498,7 @@ impl Connection {
                     };
                     self.timeout = Some(event_loop.timeout_ms(
                         (self.token, timeout_m),
-                        (deadline - server.clock_ms) as u64
+                        (deadline - clock) as u64
                     ).unwrap());
                     server.wait_queue(request, queue, channel, cookie, required_head);
                 }
@@ -543,7 +543,7 @@ impl Connection {
             request: request,
             meta_lock: server.meta_lock.clone(),
             queues: server.queues.clone(),
-            clock: (server.clock_ms / 1000) as u32
+            clock: (server.clock_ms() / 1000) as u32
         };
         server.thread_pool.execute(move || dispatch.dispatch());
     }
@@ -576,7 +576,6 @@ impl Server {
 
         let maintenance_timeout = event_loop.timeout_ms(
             (SERVER, TimeoutMessage::Maintenance), config.maintenance_timeout as u64).unwrap();
-        event_loop.timeout_ms((SERVER, TimeoutMessage::WallClock), 1000).unwrap();
 
         let mut server = Server {
             listener: listener,
@@ -588,7 +587,7 @@ impl Server {
             awaking_clients: Default::default(),
             maintenance_timeout: maintenance_timeout,
             nonce: 0,
-            clock_ms: Self::get_clock_ms(),
+            internal_clock_ms: 0,
         };
 
         info!("Opening queues...");
@@ -759,6 +758,8 @@ impl Server {
             }
             self.awaking_clients = awaking_clients;
         }
+        // invalidate clock cache
+        self.internal_clock_ms = 0;
     }
 
     fn notify(&mut self, connections: &mut Slab<Connection>, event_loop: &mut EventLoop<ServerHandler>, notification: NotifyType) -> bool {
@@ -802,13 +803,17 @@ impl Server {
                     channel.send((Cookie::new(SERVER, 0), NotifyMessage::MaintenanceDone)).unwrap();
                 });
             },
-            TimeoutMessage::WallClock => {
-                self.clock_ms = Self::get_clock_ms();
-                event_loop.timeout_ms((SERVER, TimeoutMessage::WallClock), 100).unwrap();
-            }
             to => panic!("can't handle to {:?}", to)
         }
         true
+    }
+
+    #[inline]
+    fn clock_ms(&mut self) -> u64 {
+        if self.internal_clock_ms == 0 {
+            self.internal_clock_ms = Self::get_clock_ms();
+        }
+        self.internal_clock_ms
     }
 
     fn get_clock_ms() -> u64 {
