@@ -374,13 +374,14 @@ impl Dispatch {
             _ => return self.notify_client(NotifyMessage::with_error("ICOM Invalid Command"))
         }
 
+        let args_slice = &args[..argc];
         let notification = match assume_str(args[0]) {
-            "RPUSH" | "RPUSHX" => self.rpush_(&args[..argc]),
-            "HGET" => self.hget(&args[..argc]),
-            "HMGET" => self.hmget(&args[..argc]),
-            "HDEL" => self.hdel(&args[..argc]),
-            "MSET" => self.mset(&args[..argc]),
-            "DEL" => self.del(&args[..argc]),
+            "RPUSH" | "RPUSHX" => self.rpush_(args_slice),
+            "HGET" => self.hget(args_slice),
+            "HMGET" => self.hmget(args_slice),
+            "HDEL" => self.hdel(args_slice),
+            "MSET" => self.mset(args_slice),
+            "DEL" => self.del(args_slice),
             _ => NotifyMessage::with_error("UCOM Unknown Command")
         };
 
