@@ -191,7 +191,50 @@ impl Dispatch {
         self.channel.send((self.cookie, notification)).unwrap();
     }
 
-    fn mget(&self, args: &[&[u8]]) -> NotifyMessage {
+
+    fn hmget(&self, args: &[&[u8]]) -> NotifyMessage {
+        if args.len() < 4 {
+            return NotifyMessage::with_error("MPA Queue or Channel or Count Missing")
+        }
+        let queue_name = assume_str(args[1]);
+        let channel_name = assume_str(args[2]);
+        let count = if let Ok(count) = assume_str(args[3]).parse::<usize>() {
+            count
+        } else {
+            return NotifyMessage::with_error("IPA Invalid count value")
+        };
+        let q = if let Some(q) = self.get_queue(queue_name) {
+            q
+        } else {
+            debug!("queue {:?} not found", queue_name);
+            return NotifyMessage::with_error("QNF")
+        };
+
+        let mut results = Vec::new();
+        for _ in 0..count {
+            match q.as_mut().get(channel_name, self.clock) {
+                Some(Ok(message)) => {
+                    results.push(Value::Message(message));
+                },
+                Some(Err(required_head)) => {
+                    debug!("queue {:?} channel {:?} has no messages", queue_name, channel_name);
+                    if results.is_empty() {
+                        return NotifyMessage::GetWouldBlock{
+                            request: self.request.clone(),
+                            queue: q.name().into(),
+                            channel: channel_name.into(),
+                            required_head: required_head,
+                        }
+                    }
+                    break
+                },
+                _ => return NotifyMessage::with_error("CNF")
+            }
+        }
+        NotifyMessage::with_value(Value::Bulk(results))
+    }
+
+    fn hget(&self, args: &[&[u8]]) -> NotifyMessage {
         if args.len() < 3 {
             return NotifyMessage::with_error("MPA Queue or Channel Missing")
         }
@@ -236,19 +279,19 @@ impl Dispatch {
         }
     }
 
-    fn lpush_(&self, args: &[&[u8]]) -> NotifyMessage {
+    fn rpush_(&self, args: &[&[u8]]) -> NotifyMessage {
         if args.len() < 3 {
             return NotifyMessage::with_error("MPA Queue or Value Missing")
         }
         let queue_name = assume_str(args[1]);
-        let value = args[2];
+        let messages = &args[2..];
         let q = self.get_or_create_queue(queue_name);
 
-        debug!("inserting {} msgs into {:?} [{:?}]",
-            args[2..].len(), queue_name, value.len());
-        let last_id = q.as_mut().push_many(args[2..], self.clock).unwrap();
+        debug!("inserting {} msgs into {:?}",
+            messages.len(), queue_name);
+        let last_id = q.as_mut().push_many(messages, self.clock).unwrap();
         trace!("inserted {} messages into {:?} with last id {:?}",
-            args[2..].len(), queue_name, last_id);
+            messages.len(), queue_name, last_id);
 
         NotifyMessage::PutResponse{
             response: Value::Nil,
@@ -276,7 +319,7 @@ impl Dispatch {
                     successfully += 1
                 }
             } else {
-                return NotifyMessage::with_error("IID Invalid Id")
+                return NotifyMessage::with_error("IPA Invalid Id")
             }
         }
 
@@ -332,11 +375,12 @@ impl Dispatch {
         }
 
         let notification = match assume_str(args[0]) {
-            "LPUSH" | "LPUSHX" => self.lpush_(&args[..argc]),
-            "MSET" => self.mset(&args[..argc]),
+            "RPUSH" | "RPUSHX" => self.rpush_(&args[..argc]),
+            "HGET" => self.hget(&args[..argc]),
+            "HMGET" => self.hmget(&args[..argc]),
             "HDEL" => self.hdel(&args[..argc]),
+            "MSET" => self.mset(&args[..argc]),
             "DEL" => self.del(&args[..argc]),
-            "MGET" => self.mget(&args[..argc]),
             _ => NotifyMessage::with_error("UCOM Unknown Command")
         };
 

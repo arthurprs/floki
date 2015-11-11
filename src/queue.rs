@@ -246,7 +246,7 @@ impl Queue {
         self.as_mut().set_state(QueueState::Purging);
         self.as_mut().checkpoint(false);
         self.backend.purge();
-        for (_, channel) in &mut*self.channels.write().unwrap() {
+        for (_, channel) in self.channels.write().unwrap().iter_mut() {
             let mut locked_channel = channel.lock().unwrap();
             locked_channel.tail = self.backend.tail();
             locked_channel.in_flight.clear();
@@ -261,7 +261,7 @@ impl Queue {
             head: 1,
             channels: Default::default()
         };
-        for (channel_name, channel) in &*self.channels.write().unwrap() {
+        for (channel_name, channel) in self.channels.write().unwrap().iter() {
             let locked_channel = channel.lock().unwrap();
             q_info.channels.insert(channel_name.clone(), ChannelInfo{
                 tail: locked_channel.tail
@@ -341,7 +341,7 @@ impl Queue {
         if self.state == QueueState::Ready {
             self.backend.checkpoint(full);
             let locked_channels = self.channels.read().unwrap();
-            for (channel_name, channel) in &*locked_channels {
+            for (channel_name, channel) in locked_channels.iter() {
                 let locked_channel = channel.lock().unwrap();
                 checkpoint.channels.insert(
                     channel_name.clone(),

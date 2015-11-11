@@ -388,7 +388,8 @@ impl QueueBackend {
         let segment = Arc::new(Segment::create(&self.config, self.head));
         self.segments.write().push(segment.clone());
 
-        let id = segment.as_mut().push(body, timestamp).expect("Can't write to a newly created file!");
+        let id = segment.as_mut().push(body, timestamp)
+            .expect("Can't write to a newly created file!");
         assert_eq!(id, self.head);
         self.head += 1;
         Some(id)
