@@ -327,7 +327,9 @@ impl Segment {
 
 impl Drop for Segment {
     fn drop(&mut self) {
-        mman::munmap(self.file_mmap as *mut c_void, self.file_size as u64).unwrap();
+        let mmap = self.file_mmap as *mut c_void;
+        mman::madvise(mmap, self.file_size as u64, mman::MADV_DONTNEED).unwrap();
+        mman::munmap(mmap, self.file_size as u64).unwrap();
         if self.deleted {
             remove_file_if_exist(&self.data_path).unwrap();
         }
