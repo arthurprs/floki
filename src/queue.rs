@@ -25,12 +25,17 @@ impl Default for QueueState {
     }
 }
 
+#[derive(Debug, PartialEq, RustcDecodable, RustcEncodable)]
 pub struct ChannelInfo {
+    pub last_touched: u32,
+    pub in_flight_count: u32,
     pub tail: u64,
 }
 
+#[derive(Debug, RustcDecodable, RustcEncodable)]
 pub struct QueueInfo {
     pub head: u64,
+    pub tail: u64,
     pub channels: BTreeMap<String, ChannelInfo>
 }
 
@@ -46,19 +51,14 @@ struct QueueCheckpoint {
     channels: BTreeMap<String, ChannelCheckpoint>,
 }
 
-#[derive(Debug, Default)]
-struct InFlightState {
-    expiration: u32,
-    retry: u32,
-}
-
 #[derive(Debug)]
 pub struct Channel {
     last_touched: u32,
+    expired_count: u32,
     tail: u64,
-    // keeps track of the IDs in flight by id and FIFO order
-    in_flight: LinkedHashMap<u64, InFlightState>,
-    // keeps track of the smallest id in flight
+    // keeps track of the IDs in flight (possibly expired) by id and LRU order
+    in_flight_map: LinkedHashMap<u64, u32>,
+    // keeps track of the smallest in flight ids (possibly expired)
     in_flight_heap: BinaryHeap<Rev<u64>>,
 }
 
@@ -66,6 +66,7 @@ pub struct Channel {
 pub struct Queue {
     config: Rc<QueueConfig>,
     // backend writes don't block readers
+    // TODO: create a new lock type
     w_lock: Mutex<()>, // write lock
     r_lock: RwLock<()>, // read lock
     backend: QueueBackend,
@@ -81,6 +82,21 @@ impl Channel {
         } else {
             self.tail
         }
+    }
+
+    fn in_flight_count(&mut self, clock: u32) -> u32 {
+        // first, adjust expired_count accordingly
+        // FIXME: may be expensive
+        for (_, expiration) in self.in_flight_map.iter_mut().skip(self.expired_count as usize) {
+            if clock >= *expiration {
+                self.expired_count += 1;
+                *expiration = 0;
+            } else {
+                break
+            }
+        }
+
+        self.in_flight_map.len() as u32 - self.expired_count
     }
 }
 
@@ -132,14 +148,14 @@ impl Queue {
 
     pub fn create_channel<S>(&mut self, channel_name: S, clock: u32) -> bool
             where String: From<S> {
-        let channel_name: String = channel_name.into();
         let r_lock = self.r_lock.read().unwrap();
         let mut locked_channel = self.channels.write().unwrap();
-        if let Entry::Vacant(vacant_entry) = locked_channel.entry(channel_name) {
+        if let Entry::Vacant(vacant_entry) = locked_channel.entry(channel_name.into()) {
             let channel = Channel {
                 last_touched: clock,
-                tail: self.backend.tail(), // should probably be the head instead
-                in_flight: Default::default(),
+                expired_count: 0,
+                tail: self.backend.head(),
+                in_flight_map: Default::default(),
                 in_flight_heap: Default::default(),
             };
             debug!("creating channel {:?}", channel);
@@ -164,13 +180,15 @@ impl Queue {
 
             locked_channel.last_touched = clock;
 
-            // check in flight queue for timeouts
-            if let Some((&id, &InFlightState { expiration, ..} )) = locked_channel.in_flight.front() {
+            if let Some((&id, &expiration)) = locked_channel.in_flight_map.front() {
+                // check in flight queue for timeouts
                 if clock >= expiration {
-                    // FIXME: double get bellow, not ideal
-                    let state = locked_channel.in_flight.get_refresh(&id).unwrap();
-                    state.expiration = clock + self.config.time_to_live;
-                    state.retry += 1;
+                    if expiration == 0 {
+                        locked_channel.expired_count -= 1;
+                    }
+                    // FIXME: double get bellow, not ideal, need entry api
+                    let new_expiration = locked_channel.in_flight_map.get_refresh(&id).unwrap();
+                    *new_expiration = clock + self.config.time_to_live;
                     debug!("[{}:{}] msg {} expired and will be sent again",
                         self.config.name, channel_name, id);
                     return Some(Ok(self.backend.get(id).unwrap()))
@@ -180,11 +198,7 @@ impl Queue {
             // fetch from the backend
             if let Some(message) = self.backend.get(locked_channel.tail) {
                 debug!("[{}:{}] fetched msg {} from backend", self.config.name, channel_name, message.id());
-                let state = InFlightState {
-                    expiration: clock + self.config.time_to_live,
-                    retry: 0
-                };
-                locked_channel.in_flight.insert(message.id(), state);
+                locked_channel.in_flight_map.insert(message.id(), clock + self.config.time_to_live);
                 locked_channel.in_flight_heap.push(Rev(message.id()));
                 locked_channel.tail = message.id() + 1;
                 trace!("[{}:{}] advancing tail to {}", self.config.name, channel_name, locked_channel.tail);
@@ -219,25 +233,26 @@ impl Queue {
         if let Some(channel) = locked_channels.get(channel_name) {
             let mut locked_channel = channel.lock().unwrap();
             locked_channel.last_touched = clock;
-            // try to remove the id
-            let removed_opt = locked_channel.in_flight.remove(&id);
-            trace!("[{}:{}] message {} deleted from channel: {}",
-                self.config.name, channel_name, id, removed_opt.is_some());
+
+            // try to remove the id if not expired
+            let expiration = match locked_channel.in_flight_map.get(&id) {
+                Some(&expiration) if clock < expiration => expiration,
+                _ => return Some(false),
+            };
+
+            locked_channel.in_flight_map.remove(&id).unwrap();
+            trace!("[{}:{}] message {} deleted from channel", self.config.name, channel_name, id);
             // advance channel real tail
             while locked_channel.in_flight_heap
                     .peek()
-                    .map_or(false, |&Rev(id)| !locked_channel.in_flight.contains_key(&id)) {
+                    .map_or(false, |&Rev(id)| !locked_channel.in_flight_map.contains_key(&id)) {
                 locked_channel.in_flight_heap.pop();
             }
-            return Some(removed_opt.is_some())
+            Some(true)
+        } else {
+            None
         }
-        None
     }
-
-    // TODO: NACK
-    // pub fn nack(arg: Type) -> RetType {
-    //     // add code here
-    // }
 
     pub fn purge(&mut self) {
         info!("[{}] purging", self.config.name);
@@ -249,22 +264,26 @@ impl Queue {
         for (_, channel) in self.channels.write().unwrap().iter_mut() {
             let mut locked_channel = channel.lock().unwrap();
             locked_channel.tail = self.backend.tail();
-            locked_channel.in_flight.clear();
+            locked_channel.in_flight_map.clear();
+            locked_channel.expired_count = 0;
         }
         self.as_mut().set_state(QueueState::Ready);
         self.as_mut().checkpoint(false);
     }
 
-    pub fn info(&self) -> QueueInfo {
+    pub fn info(&self, clock: u32) -> QueueInfo {
         let r_lock = self.r_lock.write().unwrap();
         let mut q_info = QueueInfo {
-            head: 1,
+            tail: self.backend.tail(),
+            head: self.backend.head(),
             channels: Default::default()
         };
         for (channel_name, channel) in self.channels.write().unwrap().iter() {
-            let locked_channel = channel.lock().unwrap();
+            let mut locked_channel = channel.lock().unwrap();
             q_info.channels.insert(channel_name.clone(), ChannelInfo{
-                tail: locked_channel.tail
+                last_touched: locked_channel.last_touched,
+                in_flight_count: locked_channel.in_flight_count(clock),
+                tail: locked_channel.tail,
             });
         }
 
@@ -316,8 +335,9 @@ impl Queue {
                         channel_name,
                         Mutex::new(Channel {
                             last_touched: channel_checkpoint.last_touched,
+                            expired_count: 0,
                             tail: channel_checkpoint.tail,
-                            in_flight: Default::default(),
+                            in_flight_map: Default::default(),
                             in_flight_heap: Default::default()
                         })
                     );
@@ -456,21 +476,19 @@ mod tests {
         assert!(q.get("test", 0).is_none());
         assert!(q.push(&message, 0).is_some());
         assert!(q.create_channel("test", 0) == true);
-        assert!(q.create_channel("test", 0) == false);
         assert!(q.get("test", 0).is_some());
     }
 
     #[test]
     fn test_in_flight() {
         let mut q = get_queue();
-        let message = gen_message(0);
-        assert!(q.push(&message, 0).is_some());
-        assert!(q.get("test", 0).is_none());
         assert!(q.create_channel("test", 0) == true);
-        assert!(q.create_channel("test", 0) == false);
-        assert!(q.get("test", 0).unwrap().is_ok());
+        let message = gen_message(0);
+        assert!(q.push(&message, 1).is_some());
+        assert!(q.get("test", 1).unwrap().is_ok());
         assert!(q.get("test", 0).unwrap().is_err());
-        // TODO: check in flight count
+        assert_eq!(q.info(1).channels["test"].in_flight_count, 1);
+        assert_eq!(q.info(2).channels["test"].in_flight_count, 0);
     }
 
     #[test]
@@ -487,18 +505,19 @@ mod tests {
     #[test]
     fn test_backend_recover() {
         let mut q = get_queue_opt("test_backend_recover", false);
+        assert!(q.create_channel("test", 0) == true);
         let message = gen_message(0);
         let mut put_msg_count = 0;
         while q.backend.segments_count() < 3 {
             assert!(q.push(&message, 0).is_some());
             put_msg_count += 1;
         }
-        q.backend.checkpoint(true);
+        q.checkpoint(true);
 
         q = get_queue_opt("test_backend_recover", true);
+        assert!(q.create_channel("test", 1) == false);
         assert_eq!(q.backend.segments_count(), 3);
         let mut get_msg_count = 0;
-        assert!(q.create_channel("test", 0) == true);
         while let Some(Ok(_)) = q.get("test", 0) {
             get_msg_count += 1;
         }
@@ -517,11 +536,7 @@ mod tests {
         assert!(q.get("test", 0).unwrap().is_err());
         q.checkpoint(true);
 
-        println!("{:#?}", &q);
-
         q = get_queue_opt("test_queue_recover", true);
-
-        println!("{:#?}", &q);
         assert!(q.create_channel("test", 0) == false);
         assert!(q.get("test", 0).unwrap().is_ok());
         assert!(q.get("test", 0).unwrap().is_ok());
