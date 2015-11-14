@@ -27,7 +27,7 @@ const FIRST_CLIENT: Token = Token(1);
 pub enum NotifyMessage {
     Response{response: Value},
     PutResponse{response: Value, queue: Atom, head: u64},
-    GetWouldBlock{request: Value, queue: Atom, channel: Atom, required_head: u64},
+    GetWouldBlock{request: Value, queue: Atom, channel: Atom, required_head: u64, timeout: u32},
     ChannelCreate{queue: Atom, channel: Atom},
     ChannelDelete{queue: Atom, channel: Atom},
     QueueCreate{queue: Atom},
@@ -91,6 +91,24 @@ pub struct Server {
 pub struct ServerHandler {
     server: Server,
     connections: Slab<Connection>,
+}
+
+macro_rules! try_or_error {
+    ($try: expr, $error: expr) => (
+        match $try {
+            Ok(ok) => ok,
+            _ => return NotifyMessage::with_error($error),
+        }
+    )
+}
+
+macro_rules! try_or_int {
+    ($try: expr, $int: expr) => (
+        match $try {
+            Ok(ok) => ok,
+            _ => return NotifyMessage::with_int($int),
+        }
+    )
 }
 
 impl NotifyMessage {
@@ -197,19 +215,15 @@ impl Dispatch {
         }
         let queue_name = assume_str(args[1]);
         let channel_name = assume_str(args[2]);
-        let count = if let Ok(count) = assume_str(args[3]).parse::<usize>() {
-            count
+        let count = try_or_error!(assume_str(args[3]).parse::<usize>(), "IPA Invalid count value");
+        let timeout = if let Some(arg) = args.get(4) {
+            try_or_error!(assume_str(arg).parse::<u32>(), "IPA Invalid timeout value")
         } else {
-            return NotifyMessage::with_error("IPA Invalid count value")
+            0
         };
-        let q = if let Some(q) = self.get_queue(queue_name) {
-            q
-        } else {
-            debug!("queue {:?} not found", queue_name);
-            return NotifyMessage::with_error("QNF")
-        };
+        let q = try_or_error!(self.get_queue(queue_name).ok_or(()), "QNF Queue Not Found");
 
-        let mut results = Vec::new();
+        let mut results = Vec::with_capacity(count);
         for _ in 0..count {
             match q.as_mut().get(channel_name, self.clock) {
                 Some(Ok(message)) => {
@@ -217,17 +231,19 @@ impl Dispatch {
                 },
                 Some(Err(required_head)) => {
                     debug!("queue {:?} channel {:?} has no messages", queue_name, channel_name);
+                    // block only if we have no results
                     if results.is_empty() {
                         return NotifyMessage::GetWouldBlock{
                             request: self.request.clone(),
                             queue: q.name().into(),
                             channel: channel_name.into(),
                             required_head: required_head,
+                            timeout: timeout,
                         }
                     }
                     break
                 },
-                _ => return NotifyMessage::with_error("CNF")
+                _ => return NotifyMessage::with_error("CNF Channel Not Found")
             }
         }
         NotifyMessage::with_value(Value::Bulk(results))
@@ -239,12 +255,12 @@ impl Dispatch {
         }
         let queue_name = assume_str(args[1]);
         let channel_name = assume_str(args[2]);
-        let q = if let Some(q) = self.get_queue(queue_name) {
-            q
+        let timeout = if let Some(arg) = args.get(3) {
+            try_or_error!(assume_str(arg).parse::<u32>(), "IPA Invalid timeout value")
         } else {
-            debug!("queue {:?} not found", queue_name);
-            return NotifyMessage::with_error("QNF")
+            0
         };
+        let q = try_or_error!(self.get_queue(queue_name).ok_or(()), "QNF Queue Not Found");
 
         // get one by one, this contributes for fairness avoiding starving consumers
         match q.as_mut().get(channel_name, self.clock) {
@@ -258,9 +274,10 @@ impl Dispatch {
                     queue: q.name().into(),
                     channel: channel_name.into(),
                     required_head: required_head,
+                    timeout: timeout,
                 }
             },
-            _ => NotifyMessage::with_error("CNF")
+            _ => NotifyMessage::with_error("CNF Channel Not Found")
         }
     }
 
@@ -273,9 +290,9 @@ impl Dispatch {
         let q = self.get_or_create_queue(queue_name);
 
         if self.create_channel(&q, channel_name) {
-            NotifyMessage::with_ok()
+            NotifyMessage::with_int(1)
         } else {
-            NotifyMessage::with_error("CAE Channel Already Exists")
+            NotifyMessage::with_int(0)
         }
     }
 
@@ -285,7 +302,7 @@ impl Dispatch {
         }
         let queue_name = assume_str(args[1]);
         let messages = &args[2..];
-        let q = self.get_or_create_queue(queue_name);
+        let q = try_or_error!(self.get_queue(queue_name).ok_or(()), "QNF Queue Not Found");
 
         debug!("inserting {} msgs into {:?}",
             messages.len(), queue_name);
@@ -306,20 +323,15 @@ impl Dispatch {
         }
         let queue_name = assume_str(args[1]);
         let channel_name = assume_str(args[2]);
-        let q = if let Some(q) = self.get_queue(queue_name) {
-            q
-        } else {
-            return NotifyMessage::with_error("QNF Queue Not Found");
-        };
+        let q = try_or_error!(self.get_queue(queue_name).ok_or(()), "QNF Queue Not Found");
 
         let mut successfully = 0;
         for id_arg in &args[3..] {
-            if let Ok(id) = assume_str(id_arg).parse::<u64>() {
-                if q.as_mut().ack(channel_name, id, self.clock).is_some() {
-                    successfully += 1
-                }
-            } else {
-                return NotifyMessage::with_error("IPA Invalid Id")
+            let id = try_or_error!(assume_str(id_arg).parse::<u64>(), "IPA Invalid Id");
+            match q.as_mut().ack(channel_name, id, self.clock) {
+                Some(true) => successfully += 1,
+                Some(false) => (),
+                None => return NotifyMessage::with_error("CNF Channel Not Found"),
             }
         }
 
@@ -332,11 +344,7 @@ impl Dispatch {
         }
         let queue_name = assume_str(args[1]);
         let channel_name_opt = args.get(2).map(|s| assume_str(s));
-        let q = if let Some(q) = self.get_queue(queue_name) {
-            q
-        } else {
-            return NotifyMessage::with_int(0);
-        };
+        let q = try_or_int!(self.get_queue(queue_name).ok_or(()), 0);
 
         match channel_name_opt {
             None => {
@@ -413,6 +421,27 @@ impl Connection {
         event_loop.reregister(&self.stream, self.token, self.interest, PollOpt::level()).unwrap();
     }
 
+    fn try_parse_request(&mut self, server: &mut Server, event_loop: &mut EventLoop<ServerHandler>) -> Result<bool, ()> {
+        match self.request.pop_value() {
+            Ok(value) => {
+                assert!(!self.processing);
+                assert!(!self.waiting);
+                assert!(self.timeout.is_none());
+                self.request_clock_ms = server.clock_ms();
+                self.processing = true;
+                self.interest = EventSet::all() - EventSet::readable() - EventSet::writable();
+                event_loop.reregister(&self.stream, self.token, self.interest, PollOpt::level()).unwrap();
+                self.dispatch(value, server, event_loop);
+                Ok(true)
+            },
+            Err(ProtocolError::Incomplete) => Ok(false),
+            Err(ProtocolError::Invalid(error)) => {
+                error!("{:?} protocol is invalid {:?}", self.token, error);
+                Err(())
+            },
+        }
+    }
+
     fn ready(&mut self, server: &mut Server, event_loop: &mut EventLoop<ServerHandler>, events: EventSet) -> bool {
         if events.is_hup() || events.is_error() {
             debug!("received events {:?} for token {:?}", events,  self.token);
@@ -431,22 +460,8 @@ impl Connection {
                     trace!("filled request with {} bytes, remaining: {}", bytes_read, self.request.remaining());
                 }
             };
-            match self.request.pop_value() {
-                Ok(value) => {
-                    assert!(!self.processing);
-                    assert!(!self.waiting);
-                    assert!(self.timeout.is_none());
-                    self.request_clock_ms = server.clock_ms();
-                    self.processing = true;
-                    self.interest = EventSet::all() - EventSet::readable() - EventSet::writable();
-                    event_loop.reregister(&self.stream, self.token, self.interest, PollOpt::level()).unwrap();
-                    self.dispatch(value, server, event_loop);
-                },
-                Err(ProtocolError::Incomplete) => (),
-                Err(ProtocolError::Invalid(error)) => {
-                    error!("{:?} protocol is invalid {:?}", self.token, error);
-                    return false
-                },
+            if self.try_parse_request(server, event_loop).is_err() {
+                return false
             }
         }
 
@@ -459,7 +474,7 @@ impl Connection {
                 trace!("filled response with {} bytes, remaining: {}", bytes_written, self.response.remaining());
             }
             if self.response.remaining() == 0 {
-                // TODO: try to pop a value from the request_buffer
+                // if we were to support pipelining we'd have to try to pop a request value here
                 self.interest = EventSet::all() - EventSet::writable();
                 event_loop.reregister(&self.stream, self.token, self.interest, PollOpt::level()).unwrap(); 
             }
@@ -485,9 +500,8 @@ impl Connection {
         }
 
         match msg {
-            NotifyMessage::GetWouldBlock{request, queue, channel, required_head} => {
-                // TODO: this timeout value should come with the message
-                let deadline = self.request_clock_ms + 5000;
+            NotifyMessage::GetWouldBlock{request, queue, channel, required_head, timeout} => {
+                let deadline = self.request_clock_ms + (timeout as u64 * 1000);
                 let clock = server.clock_ms();
                 if clock >= deadline {
                     self.send_response(Value::Nil, server, event_loop);
@@ -544,7 +558,7 @@ impl Connection {
             request: request,
             meta_lock: server.meta_lock.clone(),
             queues: server.queues.clone(),
-            clock: (server.clock_ms() / 1000) as u32
+            clock: server.clock_s(),
         };
         server.thread_pool.execute(move || dispatch.dispatch());
     }
@@ -595,9 +609,9 @@ impl Server {
         for queue_config in ServerConfig::read_queue_configs(&server.config) {
             info!("Opening queue {:?}", queue_config.name);
 
-            let queue = Queue::new(queue_config, true);
+            let q = Queue::new(queue_config, true);
             // load state
-            let info = queue.info();
+            let info = q.info(server.clock_s());
             let mut waiting_clients = WaitingClients {
                 head: info.head,
                 channels: Default::default(),
@@ -605,10 +619,10 @@ impl Server {
             for channel_name in info.channels.keys() {
                 waiting_clients.channels.insert(channel_name.into(), Default::default());
             }
-            server.waiting_clients.insert(queue.name().into(), waiting_clients);
+            server.waiting_clients.insert(q.name().into(), waiting_clients);
 
-            debug!("Done opening queue {:?}", queue.name());
-            server.queues.write().insert(queue.name().into(), Arc::new(queue));
+            debug!("Done opening queue {:?}", q.name());
+            server.queues.write().insert(q.name().into(), Arc::new(q));
         }
         debug!("Opening complete!");
 
@@ -817,6 +831,12 @@ impl Server {
         self.internal_clock_ms
     }
 
+    #[inline]
+    fn clock_s(&mut self) -> u32 {
+        (self.clock_ms() / 1000) as u32
+    }
+
+	#[inline(never)]
     fn get_clock_ms() -> u64 {
         let time::Timespec{sec, nsec} = time::get_time();
         sec as u64 + (nsec / 1000 / 1000) as u64
