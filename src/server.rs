@@ -53,7 +53,7 @@ struct Connection {
     request_clock_ms: u64,
     request: RequestBuffer,
     response: ResponseBuffer,
-    timeout: Option<Timeout>,
+    timeout: Option<(Timeout, Atom, Atom)>,
     processing: bool,
     waiting: bool,
     hup: bool,
@@ -511,10 +511,9 @@ impl Connection {
                         queue: queue.clone(),
                         channel: channel.clone()
                     };
-                    self.timeout = Some(event_loop.timeout_ms(
-                        (self.token, timeout_m),
-                        (deadline - clock) as u64
-                    ).unwrap());
+                    let timeout = event_loop.timeout_ms(
+                        (self.token, timeout_m), (deadline - clock) as u64).unwrap();
+                    self.timeout = Some((timeout, queue.clone(), channel.clone()));
                     server.wait_queue(request, queue, channel, cookie, required_head);
                 }
             },
@@ -568,7 +567,7 @@ impl Connection {
         assert!(self.waiting);
         self.processing = true;
         self.waiting = false;
-        assert!(event_loop.clear_timeout(self.timeout.take().unwrap()));
+        assert!(event_loop.clear_timeout(self.timeout.take().unwrap().0));
         self.dispatch(request, server, event_loop);
     }
 }
@@ -725,17 +724,23 @@ impl Server {
         }
     }
 
-    fn notify_connection_gone(&mut self, connection: &Connection,  event_loop: &mut EventLoop<ServerHandler>) {
+    fn notify_connection_gone(&mut self, connection: &mut Connection,  event_loop: &mut EventLoop<ServerHandler>) {
         debug!("notify_connection_gone {:?} {:?}", connection.token, connection.cookie);
         if !connection.waiting {
             return
         }
-        assert!(event_loop.clear_timeout(connection.timeout.unwrap()));
-        // FIXME: possibly expensive
-        for (_, w) in self.waiting_clients.iter_mut() {
-            for (_, cookies) in w.channels.iter_mut() {
+        let (timeout, queue, channel) = connection.timeout.take().unwrap();
+        assert!(event_loop.clear_timeout(timeout));
+
+        if let Some(w) = self.waiting_clients.get_mut(&queue) {
+            if let Some(cookies)  = w.channels.get_mut(&channel) {
+                // FIXME: only need to delete the first ocurrence
                 cookies.retain(|&(c, _)| c != connection.cookie);
+            } else {
+                unreachable!();
             }
+        } else {
+            unreachable!();
         }
     }
 
@@ -861,7 +866,8 @@ impl Handler for ServerHandler {
         };
         if !is_ok {
             trace!("deregistering token {:?}", token);
-            self.connections.remove(token).map(|c| self.server.notify_connection_gone(&c, event_loop));
+            self.connections.remove(token).map(
+                |mut c| self.server.notify_connection_gone(&mut c, event_loop));
         }
 
         trace!("done events {:?} for token {:?}", events, token);
@@ -882,7 +888,8 @@ impl Handler for ServerHandler {
         };
         if !is_ok {
             trace!("deregistering token {:?}", token);
-            self.connections.remove(token).map(|c| self.server.notify_connection_gone(&c, event_loop));
+            self.connections.remove(token).map(
+                |mut c| self.server.notify_connection_gone(&mut c, event_loop));
         }
         trace!("end notify event for token {:?}", token);
     }
@@ -907,7 +914,8 @@ impl Handler for ServerHandler {
         };
         if !is_ok {
             trace!("deregistering token {:?}", token);
-            self.connections.remove(token).map(|c| self.server.notify_connection_gone(&c, event_loop));
+            self.connections.remove(token).map(
+                |mut c| self.server.notify_connection_gone(&mut c, event_loop));
         }
         trace!("end timeout event for token {:?}", token);
     }
