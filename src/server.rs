@@ -47,15 +47,13 @@ pub type TimeoutType = (Token, TimeoutMessage);
 
 struct Connection {
     token: Token,
-    cookie: Cookie,
     stream: TcpStream,
     interest: EventSet,
     request_clock_ms: u64,
     request: RequestBuffer,
     response: ResponseBuffer,
     timeout: Option<(Timeout, Atom, Atom)>,
-    processing: bool,
-    waiting: bool,
+    processing: Option<Cookie>,
     hup: bool,
 }
 
@@ -72,7 +70,7 @@ struct Dispatch {
 #[derive(Default)]
 struct WaitingClients {
     head: u64,
-    channels: HashMap<Atom, VecDeque<(Cookie, Value)>>,
+    channels: HashMap<Atom, VecDeque<(Token, Value)>>,
 }
 
 pub struct Server {
@@ -80,7 +78,7 @@ pub struct Server {
     meta_lock: Arc<Mutex<()>>,
     queues: Arc<SpinRwLock<HashMap<Atom, Arc<Queue>>>>,
     waiting_clients: HashMap<Atom, WaitingClients>,
-    awaking_clients: Vec<(Cookie, Value)>,
+    awaking_clients: Vec<(Token, Value)>,
     listener: TcpListener,
     thread_pool: ThreadPool,
     maintenance_timeout: Timeout,
@@ -402,15 +400,13 @@ impl Connection {
     fn new(token: Token, nonce: u64, stream: TcpStream) -> Connection {
         Connection {
             token: token,
-            cookie: Cookie::new(token, nonce),
             stream: stream,
             interest: EventSet::all() - EventSet::writable(),
             request_clock_ms: 0,
             request: RequestBuffer::new(),
             response: ResponseBuffer::new(),
             timeout: None,
-            processing: false,
-            waiting: false,
+            processing: None,
             hup: false,
         }
     }
@@ -424,11 +420,7 @@ impl Connection {
     fn try_parse_request(&mut self, server: &mut Server, event_loop: &mut EventLoop<ServerHandler>) -> Result<bool, ()> {
         match self.request.pop_value() {
             Ok(value) => {
-                assert!(!self.processing);
-                assert!(!self.waiting);
-                assert!(self.timeout.is_none());
                 self.request_clock_ms = server.clock_ms();
-                self.processing = true;
                 self.interest = EventSet::all() - EventSet::readable() - EventSet::writable();
                 event_loop.reregister(&self.stream, self.token, self.interest, PollOpt::level()).unwrap();
                 self.dispatch(value, server, event_loop);
@@ -447,7 +439,7 @@ impl Connection {
             debug!("received events {:?} for token {:?}", events,  self.token);
             event_loop.deregister(&self.stream).unwrap();
             self.hup = true;
-            return self.processing
+            return self.processing.is_some()
         }
 
         if events.is_readable() {
@@ -483,20 +475,15 @@ impl Connection {
     }
 
     fn notify(&mut self, server: &mut Server, event_loop: &mut EventLoop<ServerHandler>, notification: NotifyType) -> bool {
-        assert!(self.processing);
-        assert!(!self.waiting);
         assert!(self.timeout.is_none());
-        self.processing = false;
-
         let (cookie, msg) = notification;
-
-        if self.hup {
-            return false
+        if Some(cookie) != self.processing {
+            return true
         }
 
-        // FIXME: this is impossible in the current code
-        if cookie != self.cookie {
-            return true
+        self.processing = None;
+        if self.hup {
+            return false
         }
 
         match msg {
@@ -506,15 +493,14 @@ impl Connection {
                 if clock >= deadline {
                     self.send_response(Value::Nil, server, event_loop);
                 } else {
-                    self.waiting = true;
-                    let timeout_m = TimeoutMessage::Timeout{
+                    let timeout_msg = TimeoutMessage::Timeout{
                         queue: queue.clone(),
                         channel: channel.clone()
                     };
                     let timeout = event_loop.timeout_ms(
-                        (self.token, timeout_m), (deadline - clock) as u64).unwrap();
+                        (self.token, timeout_msg), (deadline - clock) as u64).unwrap();
                     self.timeout = Some((timeout, queue.clone(), channel.clone()));
-                    server.wait_queue(request, queue, channel, cookie, required_head);
+                    server.wait_queue(request, queue, channel, self.token, required_head);
                 }
             },
             NotifyMessage::PutResponse{response, queue, head} => {
@@ -533,12 +519,9 @@ impl Connection {
     fn timeout(&mut self, server: &mut Server, event_loop: &mut EventLoop<ServerHandler>, timeout: TimeoutMessage) -> bool {
         match timeout {
             TimeoutMessage::Timeout{queue, channel} => {
-                assert!(self.waiting);
-                assert!(!self.processing);
-                assert!(self.timeout.is_some());
-                self.waiting = false;
-                self.timeout = None;
-                server.notify_timeout(queue, channel, self.cookie);
+                assert!(self.processing.is_none());
+                assert!(self.timeout.take().is_some());
+                server.notify_timeout(queue, channel, self.token);
                 self.send_response(Value::Nil, server, event_loop);
             },
             to => panic!("can't handle to {:?}", to)
@@ -547,11 +530,12 @@ impl Connection {
     }
 
     fn dispatch(&mut self, request: Value, server: &mut Server, event_loop: &mut EventLoop<ServerHandler>) {
-        server.nonce = server.nonce.wrapping_add(1);
-        self.cookie = Cookie::new(self.token, server.nonce);
+        assert!(self.processing.is_none());
+        let cookie = server.make_cookie(self.token);
+        self.processing = Some(cookie);
         // FIXME: this not only allocates but clone 4 ARCs
         let dispatch = Dispatch {
-            cookie: self.cookie,
+            cookie: cookie,
             config: server.config.clone(),
             channel: event_loop.channel(),
             request: request,
@@ -563,10 +547,6 @@ impl Connection {
     }
 
     fn retry(&mut self, request: Value, server: &mut Server, event_loop: &mut EventLoop<ServerHandler>) {
-        assert!(!self.processing);
-        assert!(self.waiting);
-        self.processing = true;
-        self.waiting = false;
         assert!(event_loop.clear_timeout(self.timeout.take().unwrap().0));
         self.dispatch(request, server, event_loop);
     }
@@ -633,23 +613,28 @@ impl Server {
         (server_handler, event_loop)
     }
 
-    fn wait_queue(&mut self, request: Value, queue: Atom, channel: Atom, cookie: Cookie, required_head: u64) {
-        debug!("wait_queue {:?} {:?} {:?} {:?}", queue, channel, cookie, required_head);
+    fn make_cookie(&mut self, token: Token) -> Cookie {
+        self.nonce = self.nonce.wrapping_add(1);
+        Cookie::new(token, self.nonce)
+    }
+
+    fn wait_queue(&mut self, request: Value, queue: Atom, channel: Atom, token: Token, required_head: u64) {
+        debug!("wait_queue {:?} {:?} {:?} {:?}", queue, channel, token, required_head);
         if let Some(w) = self.waiting_clients.get_mut(&queue) {
-            if let Some(cookies)  = w.channels.get_mut(&channel) {
+            if let Some(tokens)  = w.channels.get_mut(&channel) {
                 if required_head >= w.head {
-                    cookies.push_back((cookie, request));
+                    tokens.push_back((token, request));
                 } else {
                     debug!("Race condition, queue {:?} channel {:?} has new data {:?}", queue, channel, w.head);
-                    self.awaking_clients.push((cookie, request));
+                    self.awaking_clients.push((token, request));
                 }
             } else {
                 debug!("Race condition, queue {:?} channel {:?} is gone", queue, channel);
-                self.awaking_clients.push((cookie, request));
+                self.awaking_clients.push((token, request));
             }
         } else {
             debug!("Race condition, queue {:?} is gone", queue);
-            self.awaking_clients.push((cookie, request));
+            self.awaking_clients.push((token, request));
         }
     }
 
@@ -670,12 +655,12 @@ impl Server {
         }
     }
 
-    fn notify_timeout(&mut self, queue: Atom, channel: Atom, cookie: Cookie) {
-        debug!("notify_timeout {:?} {:?} {:?}", queue, channel, cookie);
+    fn notify_timeout(&mut self, queue: Atom, channel: Atom, token: Token) {
+        debug!("notify_timeout {:?} {:?} {:?}", queue, channel, token);
         if let Some(w) = self.waiting_clients.get_mut(&queue) {
-            if let Some(cookies)  = w.channels.get_mut(&channel) {
+            if let Some(tokens)  = w.channels.get_mut(&channel) {
                 // FIXME: only need to delete the first ocurrence
-                cookies.retain(|&(c, _)| c != cookie);
+                tokens.retain(|&(t, _)| t != token);
             } else {
                 unreachable!();
             }
@@ -725,8 +710,8 @@ impl Server {
     }
 
     fn notify_connection_gone(&mut self, connection: &mut Connection,  event_loop: &mut EventLoop<ServerHandler>) {
-        debug!("notify_connection_gone {:?} {:?}", connection.token, connection.cookie);
-        if !connection.waiting {
+        debug!("notify_connection_gone {:?}", connection.token);
+        if connection.timeout.is_none() {
             return
         }
         let (timeout, queue, channel) = connection.timeout.take().unwrap();
@@ -735,7 +720,7 @@ impl Server {
         if let Some(w) = self.waiting_clients.get_mut(&queue) {
             if let Some(cookies)  = w.channels.get_mut(&channel) {
                 // FIXME: only need to delete the first ocurrence
-                cookies.retain(|&(c, _)| c != connection.cookie);
+                cookies.retain(|&(c, _)| c != connection.token);
             } else {
                 unreachable!();
             }
@@ -773,8 +758,8 @@ impl Server {
     fn tick(&mut self, connections: &mut Slab<Connection>, event_loop: &mut EventLoop<ServerHandler>) {
         if !self.awaking_clients.is_empty() {
             let mut awaking_clients = mem::replace(&mut self.awaking_clients, Vec::new());
-            for (cookie, request) in awaking_clients.drain(..) {
-                connections[cookie.token()].retry(request, self, event_loop);
+            for (token, request) in awaking_clients.drain(..) {
+                connections[token].retry(request, self, event_loop);
             }
             self.awaking_clients = awaking_clients;
         }
