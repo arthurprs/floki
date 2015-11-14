@@ -1,8 +1,6 @@
 #![allow(dead_code)]
 #![allow(unused_variables)]
 #![allow(raw_pointer_derive)]
-#![feature(slice_patterns)]
-#![feature(libc)]
 #![feature(hashmap_hasher)]
 #![feature(drain)]
 #![feature(arc_counts)]
@@ -21,7 +19,6 @@ extern crate toml;
 extern crate linked_hash_map;
 extern crate fnv;
 extern crate spin;
-extern crate libc;
 extern crate rand;
 extern crate tendril;
 

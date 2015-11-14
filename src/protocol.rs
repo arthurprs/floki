@@ -158,9 +158,10 @@ impl RequestBuffer {
     }
 }
 
+const MIN_REQUESTBUFFER_SIZE: u32 = 4 * 1024;
 impl MutBuf for RequestBuffer {
     fn remaining(&self) -> usize {
-        cmp::min(4 * 1024, self.body.len32() - self.bytes_read) as usize
+        cmp::max(MIN_REQUESTBUFFER_SIZE, self.body.len32() - self.bytes_read) as usize
     }
 
     fn advance(&mut self, cnt: usize) {
@@ -169,8 +170,10 @@ impl MutBuf for RequestBuffer {
 
     fn mut_bytes(&mut self) -> &mut [u8] {
         let cur_len = self.body.len32();
-        if cur_len - self.bytes_read < 4 * 1024 {
-            unsafe { self.body.set_len(cmp::max(4 * 1024, cur_len * 2)); }
+        if cur_len - self.bytes_read < MIN_REQUESTBUFFER_SIZE {
+            self.body.reserve(MIN_REQUESTBUFFER_SIZE);
+            let capacity = self.body.capacity();
+            unsafe { self.body.set_len(capacity); }
         }
         &mut self.body[self.bytes_read as usize..]
     }
