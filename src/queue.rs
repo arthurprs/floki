@@ -186,7 +186,7 @@ impl Queue {
                     if expiration == 0 {
                         locked_channel.expired_count -= 1;
                     }
-                    // FIXME: double get bellow, not ideal, need entry api
+                    // FIXME: double get bellow, not ideal, need entry api to move item to back
                     let new_expiration = locked_channel.in_flight_map.get_refresh(&id).unwrap();
                     *new_expiration = clock + self.config.time_to_live;
                     debug!("[{}:{}] msg {} expired and will be sent again",
@@ -212,14 +212,14 @@ impl Queue {
     /// all calls are serialized internally
     pub fn push(&mut self, message: &[u8], clock: u32) -> Option<u64> {
         let w_lock = self.w_lock.lock().unwrap();
-        trace!("[{}] putting message", self.config.name);
+        trace!("[{}] putting message w/ clock {}", self.config.name, clock);
         self.backend.push(message, clock)
     }
 
     /// all calls are serialized internally
     pub fn push_many(&mut self, messages: &[&[u8]], clock: u32) -> Option<u64> {
         let w_lock = self.w_lock.lock().unwrap();
-        trace!("[{}] putting {} messages", self.config.name, messages.len());
+        trace!("[{}] putting {} messages w/ clock {}", self.config.name, messages.len(), clock);
         assert!(messages.len() > 0);
         for message in &messages[..messages.len() - 1] {
             self.backend.push(message, clock);

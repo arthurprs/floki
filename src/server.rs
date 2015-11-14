@@ -246,7 +246,7 @@ impl Dispatch {
                 _ => return NotifyMessage::with_error("CNF Channel Not Found")
             }
         }
-        NotifyMessage::with_value(Value::Bulk(results))
+        NotifyMessage::with_value(Value::Array(results))
     }
 
     fn hget(&self, args: &[&[u8]]) -> NotifyMessage {
@@ -290,9 +290,9 @@ impl Dispatch {
         let q = self.get_or_create_queue(queue_name);
 
         if self.create_channel(&q, channel_name) {
-            NotifyMessage::with_int(1)
+            NotifyMessage::with_ok()
         } else {
-            NotifyMessage::with_int(0)
+            NotifyMessage::with_error("CAE Channel Already Exists")
         }
     }
 
@@ -369,8 +369,8 @@ impl Dispatch {
         let mut argc: usize = 0;
 
         match self.request {
-            Value::Bulk(ref b) if b.len() > 0 && b.len() <= 50 => {
-                for v in b {
+            Value::Array(ref a) if a.len() > 0 && a.len() <= 50 => {
+                for v in a {
                     if let &Value::Data(ref d) = v {
                         args[argc] = d.as_ref();
                         argc += 1;

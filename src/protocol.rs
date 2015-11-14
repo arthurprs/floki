@@ -29,7 +29,7 @@ pub enum Value {
     Nil,
     Int(i64),
     Data(ByteTendril),
-    Bulk(Vec<Value>),
+    Array(Vec<Value>),
     Status(StrTendril),
     Error(StrTendril),
     Message(Message),
@@ -47,9 +47,9 @@ impl Value {
                 f.write_all(v.as_ref()).unwrap();
                 write!(f, "\r\n")
             }
-            Value::Bulk(b) => {
-                write!(f, "*{}\r\n", b.len()).unwrap();
-                for v in b {
+            Value::Array(a) => {
+                write!(f, "*{}\r\n", a.len()).unwrap();
+                for v in a {
                     v.serialize_to(f);
                 }
                 Ok(())
@@ -80,8 +80,8 @@ impl fmt::Debug for Value {
                     Ok(s) => write!(f, "Data({:?})", s),
                     Err(_) => write!(f, "Data({:?})", v.as_ref())
                 },
-            Value::Bulk(ref b) => {
-                try!(write!(f, "Bulk("));
+            Value::Array(ref b) => {
+                try!(write!(f, "Array("));
                 try!(f.debug_list().entries(b).finish());
                 write!(f, ")")
             },
@@ -195,7 +195,7 @@ impl Parser {
             b'+' => self.parse_status(),
             b':' => self.parse_int(),
             b'$' => self.parse_data(),
-            b'*' => self.parse_bulk(),
+            b'*' => self.parse_array(),
             b'-' => self.parse_error(),
             _ => Err("Invalid response when parsing value".into()),
         }
@@ -284,7 +284,7 @@ impl Parser {
         }
     }
 
-    fn parse_bulk(&mut self) -> ProtocolResult<Value> {
+    fn parse_array(&mut self) -> ProtocolResult<Value> {
         let length = try!(self.read_int_line());
         if length < 0 {
             Ok(Value::Nil)
@@ -294,7 +294,7 @@ impl Parser {
                 let value = try!(self.parse());
                 rv.push(value);
             }
-            Ok(Value::Bulk(rv))
+            Ok(Value::Array(rv))
         }
     }
 
@@ -343,12 +343,12 @@ mod tests {
     }
 
     #[test]
-    fn parse_valid_bulk() {
+    fn parse_valid_array() {
         let r = parse(b"*2\r\n$3\r\nfoo\r\n$4\r\nbarz\r\n");
         assert!(r.is_ok(), "{:?} not ok", r.unwrap_err());
         assert_eq_repr!(
             r.unwrap(),
-            Value::Bulk(vec![
+            Value::Array(vec![
                 Value::Data(b"foo".as_ref().into()),
                 Value::Data(b"barz".as_ref().into())
             ])
@@ -365,7 +365,7 @@ mod tests {
             assert!(r.is_ok(), "{:?} not ok", r.unwrap_err());
             assert_eq_repr!(
                 r.unwrap(),
-                Value::Bulk(vec![
+                Value::Array(vec![
                     Value::Data(b"foo".as_ref().into()),
                     Value::Data(b"barz".as_ref().into())
                 ])
