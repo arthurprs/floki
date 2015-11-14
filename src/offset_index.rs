@@ -12,7 +12,7 @@ impl OffsetIndex {
     pub fn new(id_offset: u64) -> OffsetIndex {
         OffsetIndex {
             id_offset: id_offset,
-            index: SpinMutex::new(Vec::with_capacity(10 * 1024)),
+            index: SpinMutex::new(Vec::with_capacity(1024)),
         }
     }
 
