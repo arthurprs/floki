@@ -52,7 +52,7 @@ impl Value {
                 for v in b {
                     v.serialize_to(f);
                 }
-                write!(f, "\r\n")
+                Ok(())
             },
             Value::Status(v) =>
                 write!(f, "+{}\r\n", v.as_ref()),
