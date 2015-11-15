@@ -10,7 +10,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use nix::c_void;
 use nix::sys::mman;
-use spin::RwLock as SpinRwLock;
+use spin::{Mutex as SpinLock, RwLock as SpinRwLock};
 use rustc_serialize::json;
 
 use config::*;
@@ -93,7 +93,7 @@ pub struct Segment {
     head: u64,
     closed: bool,
     deleted: bool,
-    index: OffsetIndex,
+    index: SpinLock<OffsetIndex>,
 }
 
 #[derive(Debug)]
@@ -168,12 +168,12 @@ impl Segment {
             // dirty_bytes: 0,
             closed: false,
             deleted: false,
-            index: OffsetIndex::new(start_id)
+            index: SpinLock::new(OffsetIndex::new(start_id))
         }
     }
     
     fn get(&self, id: u64) -> Result<InnerMessage, ()> {
-        let message_offset = if let Some(message_offset) = self.index.get_offset(id) {
+        let message_offset = if let Some(message_offset) = self.index.lock().get_offset(id) {
             message_offset
         } else {
             return Err(())
@@ -185,13 +185,12 @@ impl Segment {
 
         // check id and possible overflow
         assert!(message_offset <= self.file_offset,
-            "Corrupt file, message start offset {} is past file file offset {}", message_offset, self.file_offset);
+            "Corrupt file, message start offset {} is past file offset {}", message_offset, self.file_offset);
         let message_end_offset = message_offset + size_of::<MessageHeader>() as u32 + header.len as u32;
         assert!(message_end_offset <= self.file_offset,
-            "Corrupt file, message end offset {} is past file file offset {}", message_end_offset, self.file_offset);
+            "Corrupt file, message end offset {} is past file offset {}", message_end_offset, self.file_offset);
         assert!(header.id == id,
-            "Corrupt file, ids don't match {} {}", header.id, id);
-
+            "Corrupt file, ids don't match {} {} at offset {}", header.id, id, message_offset);
         let mmap_ptr = unsafe { self.file_mmap.offset(message_offset as isize + size_of::<MessageHeader>() as isize) };
 
         let message = InnerMessage {
@@ -235,9 +234,10 @@ impl Segment {
         //     )).unwrap();
         //     self.file.write_all(body.body).unwrap();
         // }
-        self.index.push_offset(header.id, self.file_offset);
+
+        self.file_offset += message_total_len as u32;
         self.head += 1;
-        self.file_offset += message_total_len as u32; 
+        self.index.lock().push_offset(header.id, self.file_offset - message_total_len as u32);
         // self.dirty_bytes += message_total_len;
         // self.dirty_messages += 1;
 
@@ -272,6 +272,7 @@ impl Segment {
         }
 
         let header_size = size_of::<MessageHeader>() as u32;
+        let mut locked_index = self.index.lock();
         while self.file_offset + header_size < self.file_size {
             let header: &MessageHeader = unsafe {
                 mem::transmute(self.file_mmap.offset(self.file_offset as isize))
@@ -292,7 +293,7 @@ impl Segment {
                     self.data_path, header.id, self.file_offset);
                 break
             }
-            self.index.push_offset(header.id, self.file_offset);
+            locked_index.push_offset(header.id, self.file_offset);
             self.file_offset += header_size + header.len;
             self.head += 1;
         }
