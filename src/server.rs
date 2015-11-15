@@ -294,7 +294,7 @@ impl Dispatch {
         }
     }
 
-    fn rpush_(&self, args: &[&[u8]]) -> NotifyMessage {
+    fn rpush(&self, args: &[&[u8]]) -> NotifyMessage {
         if args.len() < 3 {
             return NotifyMessage::with_error("MPA Queue or Value Missing")
         }
@@ -346,10 +346,10 @@ impl Dispatch {
 
         match channel_name_opt {
             None => {
-                q.as_mut().purge();
+                self.delete_queue(q);
             },
             Some("_purge") => {
-                self.delete_queue(q);
+                q.as_mut().purge();
             },
             Some(channel_name) => {
                 if ! self.delete_channel(&q, channel_name) {
@@ -382,7 +382,7 @@ impl Dispatch {
 
         let args_slice = &args[..argc];
         let notification = match assume_str(args[0]) {
-            "RPUSH" | "RPUSHX" => self.rpush_(args_slice),
+            "RPUSH" => self.rpush(args_slice),
             "HGET" => self.hget(args_slice),
             "HMGET" => self.hmget(args_slice),
             "HDEL" => self.hdel(args_slice),
@@ -561,7 +561,7 @@ impl Server {
         let listener = TcpListener::bind(&addr).unwrap();
 
         let num_cpus = get_num_cpus();
-        let num_threads = cmp::max(6, num_cpus * 2 + 1);
+        let num_threads = cmp::max(6, num_cpus * 2);
         debug!("detected {} cpus, using {} threads", num_cpus, num_threads);
 
         let mut event_loop = EventLoop::new().unwrap();
@@ -624,28 +624,28 @@ impl Server {
             if let Some(tokens)  = w.channels.get_mut(&channel) {
                 if required_head >= w.head {
                     tokens.push_back((token, request));
+                    return;
                 } else {
                     debug!("Race condition, queue {:?} channel {:?} has new data {:?}", queue, channel, w.head);
-                    self.awaking_clients.push((token, request));
                 }
             } else {
                 debug!("Race condition, queue {:?} channel {:?} is gone", queue, channel);
-                self.awaking_clients.push((token, request));
             }
         } else {
             debug!("Race condition, queue {:?} is gone", queue);
-            self.awaking_clients.push((token, request));
         }
+        self.awaking_clients.push((token, request));
     }
 
     fn notify_queue(&mut self, queue: Atom, new_head: u64) {
         debug!("notify_queue {:?} {:?}", queue, new_head);
         if let Some(w) = self.waiting_clients.get_mut(&queue) {
             if new_head > w.head {
+                let available = (new_head - w.head) as usize;
                 w.head = new_head;
                 for (_, tokens) in w.channels.iter_mut() {
-                    // FIXME: it should be possible to awake only the necessary amout of clients
-                    self.awaking_clients.extend(tokens.drain(..));
+                    let drain_len = cmp::min(available, tokens.len());
+                    self.awaking_clients.extend(tokens.drain(..drain_len));
                 }
             } else {
                 debug!("Race condition, queue {:?} tail already advanced", queue);
@@ -845,7 +845,7 @@ impl Handler for ServerHandler {
             token => if let Some(connection) = self.connections.get_mut(token) {
                 connection.ready(&mut self.server, event_loop, events)
             } else {
-                trace!("token {:?} not found", token);
+                warn!("ready token {:?} not found", token);
                 false
             }
         };
@@ -867,7 +867,7 @@ impl Handler for ServerHandler {
             token => if let Some(connection) = self.connections.get_mut(token) {
                 connection.notify(&mut self.server, event_loop, notification)
             } else {
-                trace!("token {:?} not found", token);
+                warn!("notify token {:?} not found", token);
                 false
             }
         };
@@ -893,7 +893,7 @@ impl Handler for ServerHandler {
             token => if let Some(connection) = self.connections.get_mut(token) {
                 connection.timeout(&mut self.server, event_loop, timeout.1)
             } else {
-                trace!("token {:?} not found", token);
+                warn!("timeout token {:?} not found", token);
                 false
             }
         };

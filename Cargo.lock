@@ -12,7 +12,7 @@ dependencies = [
  "rand 0.3.12 (registry+https://github.com/rust-lang/crates.io-index)",
  "rustc-serialize 0.3.16 (registry+https://github.com/rust-lang/crates.io-index)",
  "spin 0.3.4 (registry+https://github.com/rust-lang/crates.io-index)",
- "tendril 0.1.6 (git+https://github.com/arthurprs/tendril.git)",
+ "tendril 0.1.6 (git+https://github.com/arthurprs/tendril.git?rev=11149061dac78e7dd73f19b5a02d521547d7a443)",
  "threadpool 0.1.4 (registry+https://github.com/rust-lang/crates.io-index)",
  "time 0.1.34 (registry+https://github.com/rust-lang/crates.io-index)",
  "toml 0.1.23 (registry+https://github.com/rust-lang/crates.io-index)",
@@ -252,7 +252,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 [[package]]
 name = "tendril"
 version = "0.1.6"
-source = "git+https://github.com/arthurprs/tendril.git#11149061dac78e7dd73f19b5a02d521547d7a443"
+source = "git+https://github.com/arthurprs/tendril.git?rev=11149061dac78e7dd73f19b5a02d521547d7a443#11149061dac78e7dd73f19b5a02d521547d7a443"
 dependencies = [
  "encoding 0.2.32 (registry+https://github.com/rust-lang/crates.io-index)",
  "futf 0.1.1 (registry+https://github.com/rust-lang/crates.io-index)",
