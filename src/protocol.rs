@@ -60,7 +60,7 @@ impl Value {
                 write!(f, "-{}\r\n", v.as_ref()),
             Value::Message(message) => {
                 write!(f, "*2\r\n").unwrap();
-                write!(f, ":{}\r\n${}\r\n", message.id(), message.len()).unwrap();
+                write!(f, ":{}\r\n${}\r\n", message.id(), message.body().len()).unwrap();
                 f.write(message.body()).unwrap();
                 write!(f, "\r\n")
             }

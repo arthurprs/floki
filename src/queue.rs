@@ -465,7 +465,7 @@ mod tests {
         for i in 0..100_000 {
             assert!(q.push(&message, 0).is_some());
             let m = q.get("test", 0);
-            assert!(m.is_some());
+            assert!(m.unwrap().unwrap().body() == message);
         }
     }
 

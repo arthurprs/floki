@@ -21,10 +21,7 @@ const MAGIC_NUM: u32 = 0xF1031311u32;
 
 #[derive(Debug, Clone)]
 struct InnerMessage {
-    mmap_ptr: *mut u8,
-    fd_offset: u32,
-    id: u64,
-    len: u32,
+    mmap_ptr: *const MessageHeader,
 }
 
 #[derive(Debug, Clone)]
@@ -35,15 +32,16 @@ pub struct Message {
 
 impl Message {
     pub fn id(&self) -> u64 {
-        self.inner.id
-    }
-
-    pub fn len(&self) -> u32 {
-        self.inner.len
+        unsafe { (*self.inner.mmap_ptr).id }
     }
 
     pub fn body(&self) -> &[u8] {
-        unsafe { slice::from_raw_parts(self.inner.mmap_ptr, self.inner.len as usize) }
+        unsafe {
+            slice::from_raw_parts(
+                (self.inner.mmap_ptr as *const u8)
+                    .offset(size_of::<MessageHeader>() as isize),
+                (*self.inner.mmap_ptr).len as usize)
+        }
     }
 
     pub fn fd(&self) -> RawFd {
@@ -51,7 +49,7 @@ impl Message {
     }
 
     pub fn fd_offset(&self) -> u32 {
-        self.inner.fd_offset
+        (self.inner.mmap_ptr as usize - self.segment.file_mmap as usize) as u32
     }
 }
 
@@ -119,7 +117,7 @@ impl Segment {
                 .truncate(true)
                 .open(&data_path).unwrap();
         // TODO: try to use fallocate if present
-        // hopefully the filesystem supports sparse segments
+        // hopefully the filesystem supports sparse files
         file.set_len(config.segment_size).unwrap();
         let mut segment = Self::new(config, file, data_path, start_id);
         unsafe {
@@ -194,10 +192,7 @@ impl Segment {
         let mmap_ptr = unsafe { self.file_mmap.offset(message_offset as isize + size_of::<MessageHeader>() as isize) };
 
         let message = InnerMessage {
-            id: id,
-            len: header.len,
-            mmap_ptr: mmap_ptr,
-            fd_offset: message_offset + size_of::<MessageHeader>() as u32,
+            mmap_ptr: header,
         };
 
         Ok(message)
