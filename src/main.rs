@@ -32,6 +32,7 @@ mod rev;
 mod atom;
 mod cookie;
 mod offset_index;
+mod tristate_lock;
 
 #[cfg(not(test))]
 fn main() {

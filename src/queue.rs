@@ -10,6 +10,7 @@ use rustc_serialize::json;
 use config::*;
 use queue_backend::*;
 use utils::*;
+use tristate_lock::*;
 use rev::Rev;
 
 #[derive(Eq, PartialEq, Debug, Copy, Clone, RustcDecodable, RustcEncodable)]
@@ -65,10 +66,7 @@ pub struct Channel {
 #[derive(Debug)]
 pub struct Queue {
     config: Rc<QueueConfig>,
-    // backend writes don't block readers
-    // TODO: create a new lock type
-    w_lock: Mutex<()>, // write lock
-    r_lock: RwLock<()>, // read lock
+    lock: TristateLock<()>,
     backend: QueueBackend,
     channels: RwLock<HashMap<String, Mutex<Channel>>>,
     state: QueueState,
@@ -113,8 +111,7 @@ impl Queue {
         let rc_config = Rc::new(config);
         let mut queue = Queue {
             config: rc_config.clone(),
-            w_lock: Mutex::new(()),
-            r_lock: RwLock::new(()),
+            lock: TristateLock::new(()),
             backend: QueueBackend::new(rc_config.clone(), recover),
             channels: RwLock::new(Default::default()),
             state: QueueState::Ready,
@@ -148,7 +145,7 @@ impl Queue {
 
     pub fn create_channel<S>(&mut self, channel_name: S, clock: u32) -> bool
             where String: From<S> {
-        let r_lock = self.r_lock.read().unwrap();
+        let r_lock = self.lock.read();
         let mut locked_channel = self.channels.write().unwrap();
         if let Entry::Vacant(vacant_entry) = locked_channel.entry(channel_name.into()) {
             let channel = Channel {
@@ -173,7 +170,7 @@ impl Queue {
 
     /// get access is suposed to be thread-safe, even while writing
     pub fn get(&mut self, channel_name: &str, clock: u32) -> Option<Result<Message, u64>> {
-        let r_lock = self.r_lock.read().unwrap();
+        let r_lock = self.lock.read();
         let locked_channels = self.channels.read().unwrap();
         if let Some(channel) = locked_channels.get(channel_name) {
             let mut locked_channel = channel.lock().unwrap();
@@ -211,14 +208,14 @@ impl Queue {
 
     /// all calls are serialized internally
     pub fn push(&mut self, message: &[u8], clock: u32) -> Option<u64> {
-        let w_lock = self.w_lock.lock().unwrap();
+        let w_lock = self.lock.write();
         trace!("[{}] putting message w/ clock {}", self.config.name, clock);
         self.backend.push(message, clock)
     }
 
     /// all calls are serialized internally
     pub fn push_many(&mut self, messages: &[&[u8]], clock: u32) -> Option<u64> {
-        let w_lock = self.w_lock.lock().unwrap();
+        let w_lock = self.lock.write();
         trace!("[{}] putting {} messages w/ clock {}", self.config.name, messages.len(), clock);
         assert!(messages.len() > 0);
         for message in &messages[..messages.len() - 1] {
@@ -256,8 +253,7 @@ impl Queue {
 
     pub fn purge(&mut self) {
         info!("[{}] purging", self.config.name);
-        let r_lock = self.r_lock.write().unwrap();
-        let w_lock = self.w_lock.lock().unwrap();
+        let x_lock = self.lock.lock();
         self.as_mut().set_state(QueueState::Purging);
         self.as_mut().checkpoint(false);
         self.backend.purge();
@@ -272,7 +268,7 @@ impl Queue {
     }
 
     pub fn info(&self, clock: u32) -> QueueInfo {
-        let r_lock = self.r_lock.write().unwrap();
+        let r_lock = self.lock.read();
         let mut q_info = QueueInfo {
             tail: self.backend.tail(),
             head: self.backend.head(),
@@ -292,8 +288,7 @@ impl Queue {
 
     pub fn delete(&mut self) {
         info!("[{}] deleting", self.config.name);
-        let r_lock = self.r_lock.write().unwrap();
-        let w_lock = self.w_lock.lock().unwrap();
+        let x_lock = self.lock.lock();
         self.as_mut().set_state(QueueState::Deleting);
         self.as_mut().checkpoint(false);
         self.backend.delete();
@@ -402,7 +397,7 @@ impl Queue {
 
         debug!("[{}] smallest_tail is {}", self.config.name, smallest_tail);
 
-        let r_lock = self.r_lock.read();
+        let r_lock = self.lock.read();
         self.backend.gc(smallest_tail);
         self.as_mut().checkpoint(false);
     }
