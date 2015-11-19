@@ -16,7 +16,6 @@ use rev::Rev;
 #[derive(Eq, PartialEq, Debug, Copy, Clone, RustcDecodable, RustcEncodable)]
 pub enum QueueState {
     Ready,
-    Purging,
     Deleting
 }
 
@@ -134,10 +133,6 @@ impl Queue {
         }
         match self.state {
             QueueState::Deleting => panic!("Deleting can't be reverted"),
-            QueueState::Purging => match new_state {
-                QueueState::Ready => (),
-                other => panic!("Can't go from {:?} to {:?}", self.state, new_state),
-            },
             QueueState::Ready => (),
         }
         self.state = new_state;
@@ -254,8 +249,6 @@ impl Queue {
     pub fn purge(&mut self) {
         info!("[{}] purging", self.config.name);
         let x_lock = self.lock.lock();
-        self.as_mut().set_state(QueueState::Purging);
-        self.as_mut().checkpoint(false);
         self.backend.purge();
         for (_, channel) in self.channels.write().unwrap().iter_mut() {
             let mut locked_channel = channel.lock().unwrap();
@@ -263,7 +256,6 @@ impl Queue {
             locked_channel.in_flight_map.clear();
             locked_channel.expired_count = 0;
         }
-        self.as_mut().set_state(QueueState::Ready);
         self.as_mut().checkpoint(false);
     }
 
@@ -337,9 +329,6 @@ impl Queue {
                         })
                     );
                 }
-            }
-            QueueState::Purging => {
-                // TODO: resume purging
             }
             QueueState::Deleting => {
                 // TODO: return some sort of error

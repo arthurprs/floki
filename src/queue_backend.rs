@@ -469,8 +469,12 @@ impl QueueBackend {
 
     pub fn checkpoint(&mut self, full: bool) {
         let segments_copy = self.segments.read().clone();
-        let file_checkpoints: Vec<_> = segments_copy.into_iter().map(|segment| {
-            segment.as_mut().checkpoint(full)
+        let file_checkpoints: Vec<_> = segments_copy.into_iter().filter_map(|segment| {
+            if segment.tail >= self.tail {
+                Some(segment.as_mut().checkpoint(full))
+            } else {
+                None
+            }
         }).collect();
 
         let checkpoint = QueueBackendCheckpoint {
