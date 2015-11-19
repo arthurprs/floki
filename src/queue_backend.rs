@@ -3,6 +3,7 @@ use std::slice;
 use std::thread;
 use std::mem::{self, size_of};
 use std::io::prelude::*;
+use std::time::Duration;
 use std::os::unix::io::{RawFd, AsRawFd};
 use std::fs::{self, File, OpenOptions};
 use std::path::PathBuf;
@@ -413,7 +414,7 @@ impl QueueBackend {
 
     fn wait_delete_segment(segment: Arc<Segment>) {
         while Arc::strong_count(&segment) > 1 {
-            thread::sleep_ms(100);
+            thread::sleep(Duration::from_millis(100));
         }
         segment.as_mut().purge()
     }

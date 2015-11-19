@@ -1,6 +1,5 @@
 #![allow(dead_code)]
 #![allow(unused_variables)]
-#![allow(raw_pointer_derive)]
 #![feature(hashmap_hasher)]
 #![feature(drain)]
 #![feature(arc_counts)]
