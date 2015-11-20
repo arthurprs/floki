@@ -510,20 +510,22 @@ impl QueueBackend {
     }
 
     pub fn gc(&mut self, smallest_tail: u64) {
-        let mut gc_index = 0;
+        let mut gc_seg_count = 0;
         // collect until the first still open or with head > smallest_tail
         for segment in &*self.segments.read() {
             if ! segment.closed || segment.head > smallest_tail {
                 break
             }
-            gc_index += 1;
+            gc_seg_count += 1;
         }
-        info!("[{}] {} segments available for gc", self.config.name, gc_index);
-        if gc_index != 0 {
+        if gc_seg_count != 0 {
+            info!("[{}] {} segments available for gc", self.config.name, gc_seg_count);
             // purge them
-            let mut locked_segments = self.segments.write();
-            let gc_segments: Vec<_> = locked_segments.drain(..gc_index).collect();
-            drop(locked_segments);
+            let mut gc_segments: Vec<_> = Vec::with_capacity(gc_seg_count);
+            {
+                let mut locked_segments = self.segments.write();
+                gc_segments.extend(locked_segments.drain(..gc_seg_count));
+            }
             self.tail = gc_segments.last().unwrap().head;
             for segment in gc_segments {
                 Self::wait_delete_segment(segment)
