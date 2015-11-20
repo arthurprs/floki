@@ -147,7 +147,7 @@ impl Segment {
 
         let file_mmap = mman::mmap(
             ptr::null_mut(), file_size,
-            mman::PROT_READ | mman::PROT_WRITE, mman::MAP_SHARED,
+            mman::PROT_READ | mman::PROT_WRITE, mman::MAP_SHARED | mman::MAP_POPULATE,
             file.as_raw_fd(), 0).unwrap() as *mut u8;
         mman::madvise(
             file_mmap as *mut c_void,
