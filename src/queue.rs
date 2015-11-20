@@ -427,14 +427,14 @@ mod tests {
         get_queue_opt(name, false)
     }
 
-    fn gen_message(id: u64) -> &'static [u8] {
+    fn gen_message() -> &'static [u8] {
         return b"333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333";
     }
 
     #[test]
     fn test_fill() {
         let mut q = get_queue();
-        let message = gen_message(0);
+        let message = gen_message();
         for i in 0..100_000 {
             let r = q.push(&message, 0);
             assert!(r.is_some());
@@ -444,7 +444,7 @@ mod tests {
     #[test]
     fn test_put_get() {
         let mut q = get_queue();
-        let message = gen_message(0);
+        let message = gen_message();
         assert!(q.create_channel("test", 0));
         for i in 0..100_000 {
             assert!(q.push(&message, 0).is_some());
@@ -456,7 +456,7 @@ mod tests {
     #[test]
     fn test_create_channel() {
         let mut q = get_queue();
-        let message = gen_message(0);
+        let message = gen_message();
         assert!(q.get("test", 0).is_none());
         assert!(q.push(&message, 0).is_some());
         assert!(q.create_channel("test", 0) == true);
@@ -467,7 +467,7 @@ mod tests {
     fn test_in_flight() {
         let mut q = get_queue();
         assert!(q.create_channel("test", 0) == true);
-        let message = gen_message(0);
+        let message = gen_message();
         assert!(q.push(&message, 1).is_some());
         assert!(q.get("test", 1).unwrap().is_ok());
         assert!(q.get("test", 0).unwrap().is_err());
@@ -478,7 +478,7 @@ mod tests {
     #[test]
     fn test_in_flight_timeout() {
         let mut q = get_queue();
-        let message = gen_message(0);
+        let message = gen_message();
         assert!(q.create_channel("test", 0) == true);
         assert!(q.push(&message, 0).is_some());
         assert!(q.get("test", 0).unwrap().is_ok());
@@ -490,7 +490,7 @@ mod tests {
     fn test_backend_recover() {
         let mut q = get_queue_opt("test_backend_recover", false);
         assert!(q.create_channel("test", 0) == true);
-        let message = gen_message(0);
+        let message = gen_message();
         let mut put_msg_count = 0;
         while q.backend.segments_count() < 3 {
             assert!(q.push(&message, 0).is_some());
@@ -511,7 +511,7 @@ mod tests {
     #[test]
     fn test_queue_recover() {
         let mut q = get_queue_opt("test_queue_recover", false);
-        let message = gen_message(0);
+        let message = gen_message();
         assert!(q.create_channel("test", 0) == true);
         assert!(q.push(&message, 0).is_some());
         assert!(q.push(&message, 0).is_some());
@@ -529,7 +529,7 @@ mod tests {
 
     #[test]
     fn test_gc() {
-        let message = gen_message(0);
+        let message = gen_message();
         let mut q = get_queue_opt("test_gc", false);
         assert!(q.create_channel("test", 0) == true);
 
@@ -548,7 +548,7 @@ mod tests {
     #[bench]
     fn put_like_crazy(b: &mut test::Bencher) {
         let mut q = get_queue();
-        let m = &gen_message(0);
+        let m = &gen_message();
         let n = 10000;
         b.bytes = (m.len() * n) as u64;
         b.iter(|| {
@@ -562,7 +562,7 @@ mod tests {
     #[bench]
     fn put_get_like_crazy(b: &mut test::Bencher) {
         let mut q = get_queue();
-        let m = &gen_message(0);
+        let m = &gen_message();
         let n = 10000;
         q.create_channel("test", 0);
         b.bytes = (m.len() * n) as u64;

@@ -1,6 +1,7 @@
 use std::ptr;
 use std::slice;
 use std::thread;
+use std::cmp;
 use std::mem::{self, size_of};
 use std::io::prelude::*;
 use std::time::Duration;
@@ -360,8 +361,8 @@ impl QueueBackend {
     }
 
     fn find_segment(&self, id: u64) -> Option<Arc<Segment>> {
-        for segment in self.segments.read().iter().rev() {
-            if segment.tail <= id {
+        for segment in self.segments.read().iter() {
+            if id < segment.head && segment.tail < segment.head {
                 return Some(segment.clone())
             }
         }
@@ -395,9 +396,10 @@ impl QueueBackend {
     }
 
     /// Get a new message with the specified id
+    /// if not possible, return the next available message
     pub fn get(&mut self, id: u64) -> Option<Message> {
         if let Some(segment) = self.find_segment(id) {
-            if let Ok(inner) = segment.get(id) { 
+            if let Ok(inner) = segment.get(cmp::max(id, segment.tail)) { 
                 return Some(Message {
                     inner: inner,
                     segment: segment,
@@ -456,6 +458,10 @@ impl QueueBackend {
         let mut locked_segments = self.segments.write();
         for file_checkpoint in backend_checkpoint.segments {
             let segment = Arc::new(Segment::open(&self.config, file_checkpoint));
+            if !segment.closed && locked_segments.last_mut().is_some() {
+                // make sure we only have one open segment, the last
+                locked_segments.last_mut().unwrap().as_mut().closed = true;
+            }
             locked_segments.push(segment);
         }
 
@@ -524,4 +530,112 @@ impl QueueBackend {
             }
         }
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use config::*;
+    use std::thread;
+    use test;
+    use std::rc::Rc;
+    use utils;
+
+    fn get_backend_opt(name: &str, recover: bool) -> QueueBackend {
+        let mut server_config = ServerConfig::read();
+        server_config.data_directory = "./test_data".into();
+        server_config.segment_size = 4 * 1024 * 1024;
+        let mut queue_config = server_config.new_queue_config(name);
+        queue_config.time_to_live = 1;
+        utils::create_dir_if_not_exist(&queue_config.data_directory).unwrap();
+        QueueBackend::new(Rc::new(queue_config), recover)
+    }
+
+    fn get_backend() -> QueueBackend {
+        let thread = thread::current();
+        let name = thread.name().unwrap().split("::").last().unwrap();
+        get_backend_opt(name, false)
+    }
+
+    fn gen_message() -> &'static [u8] {
+        return b"333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333";
+    }
+
+    #[test]
+    fn test_corrupt_files() {
+        let mut backend = get_backend_opt("test_corrupt_2files", false);
+        let mut num_writes = 0;
+        while backend.segments_count() < 3 {
+            backend.push(gen_message(), 0).unwrap();
+            num_writes += 1;
+        }
+        backend.checkpoint(true);
+        {
+            // zero second half of first file
+            let mut segment = backend.segments.read()[0].clone();
+            segment.as_mut().file.set_len(segment.file_size as u64 / 2).unwrap();
+            segment.as_mut().file.set_len(segment.file_size as u64).unwrap();
+            // nuke the second
+            segment = backend.segments.read()[1].clone();
+            segment.as_mut().file.set_len(0).unwrap();
+            segment.as_mut().file.set_len(segment.file_size as u64).unwrap();
+        }
+
+        backend = get_backend_opt("test_corrupt_2files", true);
+        let mut num_reads = 0;
+        let mut id = 1;
+        let mut holes = 0;
+        while let Some(message) = backend.get(id) {
+            num_reads += 1;
+            if message.id() != id {
+                holes += 1
+            }
+            id = message.id() + 1;
+        }
+        assert_eq!(id, backend.head());
+        assert_eq!(num_reads, num_writes / 4 + 2);
+        assert_eq!(holes, 1);
+
+        {
+            // nuke the third
+            let segment = backend.segments.read()[2].clone();
+            segment.as_mut().file.set_len(0).unwrap();
+            segment.as_mut().file.set_len(segment.file_size as u64).unwrap();
+        }
+
+        backend = get_backend_opt("test_corrupt_2files", true);
+        num_reads = 0;
+        id = 1;
+        holes = 0;
+        while let Some(message) = backend.get(id) {
+            num_reads += 1;
+            if message.id() != id {
+                holes += 1
+            }
+            id = message.id() + 1;
+        }
+        assert_eq!(id, backend.segments.read()[0].head);
+        assert_eq!(num_reads, num_writes / 4 + 1);
+        assert_eq!(holes, 0);
+
+        // push to the third file, that we nuked
+        let prev_reads = num_reads;
+        backend.push(gen_message(), 0).unwrap() == num_writes + 1;
+        backend.push(gen_message(), 0).unwrap() == num_writes + 2;
+
+        num_reads = 0;
+        id = 1;
+        holes = 0;
+        while let Some(message) = backend.get(id) {
+            num_reads += 1;
+            if message.id() != id {
+                holes += 1
+            }
+            id = message.id() + 1;
+        }
+        assert_eq!(id, backend.head());
+        assert_eq!(num_reads, prev_reads + 2);
+        assert_eq!(holes, 1);
+    }
+
 }
