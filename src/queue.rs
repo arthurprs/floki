@@ -422,9 +422,11 @@ mod tests {
     }
 
     fn get_queue() -> Queue {
-        let thread = thread::current();
-        let name = thread.name().unwrap().split("::").last().unwrap();
-        get_queue_opt(name, false)
+        get_queue_opt(thread::current().name().unwrap(), false)
+    }
+
+    fn get_queue_recover() -> Queue {
+        get_queue_opt(thread::current().name().unwrap(), true)
     }
 
     fn gen_message() -> &'static [u8] {
@@ -488,7 +490,7 @@ mod tests {
 
     #[test]
     fn test_backend_recover() {
-        let mut q = get_queue_opt("test_backend_recover", false);
+        let mut q = get_queue();
         assert!(q.create_channel("test", 0) == true);
         let message = gen_message();
         let mut put_msg_count = 0;
@@ -498,7 +500,7 @@ mod tests {
         }
         q.checkpoint(true);
 
-        q = get_queue_opt("test_backend_recover", true);
+        q = get_queue_recover();
         assert!(q.create_channel("test", 1) == false);
         assert_eq!(q.backend.segments_count(), 3);
         let mut get_msg_count = 0;
@@ -510,7 +512,7 @@ mod tests {
 
     #[test]
     fn test_queue_recover() {
-        let mut q = get_queue_opt("test_queue_recover", false);
+        let mut q = get_queue();
         let message = gen_message();
         assert!(q.create_channel("test", 0) == true);
         assert!(q.push(&message, 0).is_some());
@@ -520,7 +522,7 @@ mod tests {
         assert!(q.get("test", 0).unwrap().is_err());
         q.checkpoint(true);
 
-        q = get_queue_opt("test_queue_recover", true);
+        q = get_queue_recover();
         assert!(q.create_channel("test", 0) == false);
         assert!(q.get("test", 0).unwrap().is_ok());
         assert!(q.get("test", 0).unwrap().is_ok());
@@ -530,7 +532,7 @@ mod tests {
     #[test]
     fn test_gc() {
         let message = gen_message();
-        let mut q = get_queue_opt("test_gc", false);
+        let mut q = get_queue();
         assert!(q.create_channel("test", 0) == true);
 
         while q.backend.segments_count() < 3 {

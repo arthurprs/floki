@@ -539,7 +539,6 @@ mod tests {
     use super::*;
     use config::*;
     use std::thread;
-    use test;
     use std::rc::Rc;
     use utils;
 
@@ -554,9 +553,11 @@ mod tests {
     }
 
     fn get_backend() -> QueueBackend {
-        let thread = thread::current();
-        let name = thread.name().unwrap().split("::").last().unwrap();
-        get_backend_opt(name, false)
+        get_backend_opt(thread::current().name().unwrap(), false)
+    }
+
+    fn get_backend_recover() -> QueueBackend {
+        get_backend_opt(thread::current().name().unwrap(), true)
     }
 
     fn gen_message() -> &'static [u8] {
@@ -565,7 +566,7 @@ mod tests {
 
     #[test]
     fn test_corrupt_files() {
-        let mut backend = get_backend_opt("test_corrupt_2files", false);
+        let mut backend = get_backend();
         let mut num_writes = 0;
         while backend.segments_count() < 3 {
             backend.push(gen_message(), 0).unwrap();
@@ -583,7 +584,7 @@ mod tests {
             segment.as_mut().file.set_len(segment.file_size as u64).unwrap();
         }
 
-        backend = get_backend_opt("test_corrupt_2files", true);
+        backend = get_backend_recover();
         let mut num_reads = 0;
         let mut id = 1;
         let mut holes = 0;
@@ -605,7 +606,7 @@ mod tests {
             segment.as_mut().file.set_len(segment.file_size as u64).unwrap();
         }
 
-        backend = get_backend_opt("test_corrupt_2files", true);
+        backend = get_backend_recover();
         num_reads = 0;
         id = 1;
         holes = 0;
