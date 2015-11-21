@@ -25,8 +25,8 @@ pub fn fallocate(f: &File, offset: u64, len: u64) -> io::Result<()> {
 	    let mut store = fstore_t{
 	    	fst_flags: F_ALLOCATECONTIG,
 	    	fst_posmode: F_PEOFPOSMODE,
-	    	fst_offset: offset,
-	    	fst_length: len,
+	    	fst_offset: offset as off_t,
+	    	fst_length: len as off_t,
 	    	fst_bytesalloc: 0
     	};
 	    if fcntl(fd, F_PREALLOCATE, &store) == -1 {
@@ -36,7 +36,7 @@ pub fn fallocate(f: &File, offset: u64, len: u64) -> io::Result<()> {
 		        return Err(io::Error::last_os_error())
 		    }
 	    }
-	    match ftruncate(fd, offset + len) {
+	    match ftruncate(fd, (offset + len) as off_t) {
 			0 => Ok(()),
 			err_code => Err(io::Error::last_os_error())
 		}
