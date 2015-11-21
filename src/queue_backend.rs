@@ -18,6 +18,7 @@ use rustc_serialize::json;
 use config::*;
 use utils::*;
 use offset_index::*;
+use fallocate::*;
 
 const MAGIC_NUM: u32 = 0xF1031311u32;
 
@@ -118,9 +119,8 @@ impl Segment {
                 .create(true)
                 .truncate(true)
                 .open(&data_path).unwrap();
-        // TODO: try to use fallocate if present
-        // hopefully the filesystem supports sparse files
-        file.set_len(config.segment_size).unwrap();
+        fallocate(&file, 0, config.segment_size).unwrap();
+
         let mut segment = Self::new(config, file, data_path, start_id);
         unsafe {
             let magic_num = segment.file_mmap as *mut u32;

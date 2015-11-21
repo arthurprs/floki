@@ -8,6 +8,7 @@
 #[cfg(test)] extern crate test;
 extern crate env_logger;
 #[macro_use] extern crate log;
+extern crate libc;
 extern crate nix;
 extern crate mio;
 extern crate num_cpus;
@@ -32,6 +33,7 @@ mod atom;
 mod cookie;
 mod offset_index;
 mod tristate_lock;
+mod fallocate;
 
 #[cfg(not(test))]
 fn main() {

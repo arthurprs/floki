@@ -470,7 +470,7 @@ mod tests {
         let message = gen_message();
         assert!(q.push(&message, 1).is_some());
         assert!(q.get("test", 1).unwrap().is_ok());
-        assert!(q.get("test", 0).unwrap().is_err());
+        assert!(q.get("test", 1).unwrap().is_err());
         assert_eq!(q.info(1).channels["test"].in_flight_count, 1);
         assert_eq!(q.info(2).channels["test"].in_flight_count, 0);
     }
