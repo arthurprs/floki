@@ -1,6 +1,7 @@
 # Floki
 
 [![Build Status](https://travis-ci.org/arthurprs/floki.svg)](https://travis-ci.org/arthurprs/floki)
+[![Coverage Status](https://coveralls.io/repos/arthurprs/floki/badge.svg?branch=master&service=github)](https://coveralls.io/github/arthurprs/floki?branch=master)
 
 **Atention, this is a work in progress and completely unusable at this point**
 
@@ -16,6 +17,8 @@ Floki borrows concepts from both Kafka and Amazon SQS into an easy to use packag
 - [ ] Hardened internals
 
 ## TODO
+- [ ] Lots of documentation
+- [ ] Map commands to Redis commands (WIP)
 - [ ] Better error handling
 - [ ] Make internal data structures size-bounded, based on configurations
 - [ ] Ticket based Acknowledgement
