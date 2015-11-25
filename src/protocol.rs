@@ -32,7 +32,7 @@ pub enum Value {
     Array(Vec<Value>),
     Status(StrTendril),
     Error(StrTendril),
-    Message(Message),
+    Message((u64, Message)),
 }
 
 impl Value {
@@ -58,9 +58,9 @@ impl Value {
                 write!(f, "+{}\r\n", v.as_ref()),
             Value::Error(v) =>
                 write!(f, "-{}\r\n", v.as_ref()),
-            Value::Message(message) => {
+            Value::Message((ticket, message)) => {
                 write!(f, "*2\r\n").unwrap();
-                write!(f, ":{}\r\n${}\r\n", message.id(), message.body().len()).unwrap();
+                write!(f, ":{}\r\n${}\r\n", ticket, message.body().len()).unwrap();
                 f.write(message.body()).unwrap();
                 write!(f, "\r\n")
             }

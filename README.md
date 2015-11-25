@@ -13,12 +13,13 @@ Floki borrows concepts from both Kafka and Amazon SQS into an easy to use packag
 - [x] Multiple Channels per Queue (efficient fanout)
 - [x] Disk Backed
 - [x] Runs on most Unix systems
-- [ ] Crash resistant (works, needs more testing)
+- [x] Crash resistant
 - [ ] Hardened internals
 
 ## TODO
+- [ ] Map commands to Redis commands
+- [ ] Opt-in persistency guarantee (needs group commit-ish implementation)
 - [ ] Lots of documentation
-- [ ] Map commands to Redis commands (WIP)
 - [ ] Better error handling
 - [ ] Make internal data structures size-bounded, based on configurations
 - [ ] Ticket based Acknowledgement

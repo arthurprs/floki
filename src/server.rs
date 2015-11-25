@@ -37,6 +37,15 @@ pub enum NotifyMessage {
 
 pub type NotifyType = (Cookie, NotifyMessage);
 
+impl From<QueueError> for NotifyMessage {
+    fn from(from: QueueError) -> Self {
+        match from {
+            QueueError::ChannelNotFound => NotifyMessage::with_error("CNF Channel Not Found"),
+            _ => panic!("{:?}", from)
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum TimeoutMessage {
     Timeout{queue: Atom, channel: Atom},
@@ -224,10 +233,10 @@ impl Dispatch {
         let mut results = Vec::with_capacity(count);
         for _ in 0..count {
             match q.as_mut().get(channel_name, self.clock) {
-                Some(Ok(message)) => {
-                    results.push(Value::Message(message));
+                Ok(ticket_message) => {
+                    results.push(Value::Message(ticket_message));
                 },
-                Some(Err(required_head)) => {
+                Err(QueueError::EndOfQueue(required_head)) => {
                     debug!("queue {:?} channel {:?} has no messages", queue_name, channel_name);
                     // block only if we have no results
                     if results.is_empty() {
@@ -241,7 +250,7 @@ impl Dispatch {
                     }
                     break
                 },
-                _ => return NotifyMessage::with_error("CNF Channel Not Found")
+                Err(qe) => return qe.into()
             }
         }
         NotifyMessage::with_value(Value::Array(results))
@@ -262,10 +271,10 @@ impl Dispatch {
 
         // get one by one, this contributes for fairness avoiding starving consumers
         match q.as_mut().get(channel_name, self.clock) {
-            Some(Ok(message)) => {
-                NotifyMessage::with_value(Value::Message(message))
+            Ok(ticket_message) => {
+                NotifyMessage::with_value(Value::Message(ticket_message))
             },
-            Some(Err(required_head)) => {
+            Err(QueueError::EndOfQueue(required_head)) => {
                 debug!("queue {:?} channel {:?} has no messages", queue_name, channel_name);
                 NotifyMessage::GetWouldBlock{
                     request: self.request.clone(),
@@ -275,7 +284,7 @@ impl Dispatch {
                     timeout: timeout,
                 }
             },
-            _ => NotifyMessage::with_error("CNF Channel Not Found")
+            Err(qe) => return qe.into()
         }
     }
 
@@ -327,9 +336,8 @@ impl Dispatch {
         for id_arg in &args[3..] {
             let id = try_or_error!(assume_str(id_arg).parse::<u64>(), "IPA Invalid Id");
             match q.as_mut().ack(channel_name, id, self.clock) {
-                Some(true) => successfully += 1,
-                Some(false) => (),
-                None => return NotifyMessage::with_error("CNF Channel Not Found"),
+                Ok(_) => successfully += 1,
+                Err(qe) => return qe.into(),
             }
         }
 
