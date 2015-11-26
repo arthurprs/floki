@@ -15,6 +15,7 @@ threadpool = "*"
 time = "*"
 num_cpus = "*"
 fnv = "*"
+twox-hash = "*"
 spin = "*"
 rand = "*"
 

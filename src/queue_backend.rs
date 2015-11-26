@@ -14,6 +14,8 @@ use nix::c_void;
 use nix::sys::mman;
 use spin::{Mutex as SpinLock, RwLock as SpinRwLock};
 use rustc_serialize::json;
+use twox_hash::XxHash;
+use std::hash::Hasher;
 
 use config::*;
 use utils::*;
@@ -108,6 +110,17 @@ pub struct QueueBackend {
 impl Segment {
     fn gen_file_path(config: &QueueConfig, start_id: u64, ext: &str) -> PathBuf {
         config.data_directory.join(format!("{:015}.{}", start_id, ext))
+    }
+
+    fn hash_segment_message(header: &MessageHeader) -> u32 {
+        let mut hasher = XxHash::with_seed(0);
+        unsafe {
+            hasher.write(slice::from_raw_parts(
+                (header as *const _ as *const u8).offset(size_of::<u32>() as isize),
+                size_of::<MessageHeader>() + header.len as usize - size_of::<u32>()
+            ));
+        }
+        (hasher.finish() & 0xFFFFFFFF) as u32
     }
 
     fn create(config: &QueueConfig, start_id: u64) -> Segment {
@@ -208,37 +221,27 @@ impl Segment {
             return Err(())
         }
 
-        let header = MessageHeader {
-            hash: 0,
-            id: self.head,
-            timestamp: clock,
-            len: body.len() as u32
-        };
+        let id = self.head;
 
         unsafe {
-            ptr::copy_nonoverlapping(
-                mem::transmute(&header),
-                self.file_mmap.offset(self.file_offset as isize),
-                size_of::<MessageHeader>());
+            let header: &mut MessageHeader = mem::transmute(self.file_mmap.offset(self.file_offset as isize));
+            header.id = self.head;
+            header.timestamp = clock;
+            header.len = body.len() as u32;
             ptr::copy_nonoverlapping(
                 body.as_ptr(),
                 self.file_mmap.offset(self.file_offset as isize + size_of::<MessageHeader>() as isize),
                 body.len());
+            header.hash = Self::hash_segment_message(header);
         }
-        // unsafe {
-        //     self.file.write_all(slice::from_raw_parts::<u8>(
-        //         mem::transmute(&header), size_of::<MessageHeader>()
-        //     )).unwrap();
-        //     self.file.write_all(body.body).unwrap();
-        // }
 
         self.file_offset += message_total_len as u32;
         self.head += 1;
-        self.index.lock().push_offset(header.id, self.file_offset - message_total_len as u32);
+        self.index.lock().push_offset(id, self.file_offset - message_total_len as u32);
         // self.dirty_bytes += message_total_len;
         // self.dirty_messages += 1;
 
-        Ok(header.id)
+        Ok(id)
     }
 
     fn sync(&mut self, full: bool) {
@@ -285,7 +288,7 @@ impl Segment {
                 break
             }
             if self.file_offset + header_size + header.len < self.file_size {
-                if header.hash != 0 {
+                if header.hash != Self::hash_segment_message(header) {
                     warn!("[{:?}] corrupt message with id {} when recovering @{}",
                         self.data_path, header.id, self.file_offset);
                     break
@@ -601,7 +604,7 @@ mod tests {
             id = message.id() + 1;
         }
         assert_eq!(id, backend.head());
-        assert_eq!(num_reads, num_writes / 4 + 2);
+        assert_eq!(num_reads, num_writes / 4 + 1);
         assert_eq!(holes, 1);
 
         {
@@ -623,7 +626,7 @@ mod tests {
             id = message.id() + 1;
         }
         assert_eq!(id, backend.segments.read()[0].head);
-        assert_eq!(num_reads, num_writes / 4 + 1);
+        assert_eq!(num_reads, num_writes / 4);
         assert_eq!(holes, 0);
 
         // push to the third file, that we nuked

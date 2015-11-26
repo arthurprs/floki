@@ -18,6 +18,7 @@ extern crate rustc_serialize;
 extern crate toml;
 extern crate linked_hash_map;
 extern crate fnv;
+extern crate twox_hash;
 extern crate spin;
 extern crate rand;
 extern crate tendril;
