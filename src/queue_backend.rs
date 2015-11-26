@@ -259,6 +259,11 @@ impl Segment {
         self.file_offset = size_of::<u32>() as u32;
         self.sync_offset = self.file_offset;
 
+        mman::madvise(
+            self.file_mmap as *mut c_void,
+            self.sync_offset as u64,
+            mman::MADV_WILLNEED).unwrap();
+
         unsafe {
             let magic_num = self.file_mmap as *mut u32;
             if *magic_num != MAGIC_NUM {
