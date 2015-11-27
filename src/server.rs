@@ -40,7 +40,10 @@ pub type NotifyType = (Cookie, NotifyMessage);
 impl From<QueueError> for NotifyMessage {
     fn from(from: QueueError) -> Self {
         match from {
-            QueueError::ChannelNotFound => NotifyMessage::with_error("CNF Channel Not Found"),
+            QueueError::ChannelNotFound =>
+                NotifyMessage::with_error("CNF Channel Not Found"),
+            QueueError::ChannelAlreadyExists =>
+                NotifyMessage::with_error("CAE Channel Already Exists"),
             _ => panic!("{:?}", from)
         }
     }
@@ -160,32 +163,30 @@ impl Dispatch {
         q.as_mut().delete();
     }
 
-    fn delete_channel(&self, q: &Queue, channel_name: &str) -> bool {
+    fn delete_channel(&self, q: &Queue, channel_name: &str) -> QueueResult<()> {
         debug!("deleting queue {:?} channel {:?}", q.name(), channel_name);
         let meta_lock = self.meta_lock.lock().unwrap();
-        if q.as_mut().delete_channel(channel_name) {
+        let result = q.as_mut().delete_channel(channel_name);
+        if result.is_ok() {
             self.notify_server(NotifyMessage::ChannelDelete{
                 queue: q.name().into(),
                 channel: channel_name.into(),
             });
-            true
-        } else {
-            false
         }
+        result
     }
 
-    fn create_channel(&self, q: &Queue, channel_name: &str) -> bool {
+    fn create_channel(&self, q: &Queue, channel_name: &str) -> QueueResult<()> {
         info!("creating queue {:?} channel {:?}", q.name(), channel_name);
         let meta_lock = self.meta_lock.lock().unwrap();
-        if q.as_mut().create_channel(channel_name, self.clock) {
+        let result = q.as_mut().create_channel(channel_name, self.clock);
+        if result.is_ok() {
             self.notify_server(NotifyMessage::ChannelCreate{
                 queue: q.name().into(),
                 channel: channel_name.into(),
             });
-            true
-        } else {
-            false
         }
+        result
     }
 
     fn get_or_create_queue(&self, name: &str) -> Arc<Queue> {
@@ -250,7 +251,7 @@ impl Dispatch {
                     }
                     break
                 },
-                Err(qe) => return qe.into()
+                Err(err) => return err.into()
             }
         }
         NotifyMessage::with_value(Value::Array(results))
@@ -284,7 +285,7 @@ impl Dispatch {
                     timeout: timeout,
                 }
             },
-            Err(qe) => return qe.into()
+            Err(err) => return err.into()
         }
     }
 
@@ -296,10 +297,9 @@ impl Dispatch {
         let channel_name = assume_str(args[2]);
         let q = self.get_or_create_queue(queue_name);
 
-        if self.create_channel(&q, channel_name) {
-            NotifyMessage::with_ok()
-        } else {
-            NotifyMessage::with_error("CAE Channel Already Exists")
+        match self.create_channel(&q, channel_name) {
+            Ok(_) => NotifyMessage::with_ok(),
+            Err(err) => err.into()
         }
     }
 
@@ -333,11 +333,10 @@ impl Dispatch {
         let q = try_or_error!(self.get_queue(queue_name).ok_or(()), "QNF Queue Not Found");
 
         let mut successfully = 0;
-        for id_arg in &args[3..] {
-            let id = try_or_error!(assume_str(id_arg).parse::<u64>(), "IPA Invalid Id");
-            match q.as_mut().ack(channel_name, id, self.clock) {
-                Ok(_) => successfully += 1,
-                Err(qe) => return qe.into(),
+        for ticket_arg in &args[3..] {
+            let ticket = try_or_error!(assume_str(ticket_arg).parse::<u64>(), "IPA Invalid Ticket");
+            if q.as_mut().ack(channel_name, ticket, self.clock).is_ok() {
+                successfully += 1
             }
         }
 
@@ -356,13 +355,28 @@ impl Dispatch {
             None => {
                 self.delete_queue(q);
             },
-            Some("_purge") => {
+            Some(channel_name) => {
+                try_or_int!(self.delete_channel(&q, channel_name), 0);
+            },
+        }
+
+        NotifyMessage::with_int(1)
+    }
+
+    fn sdel(&self, args: &[&[u8]]) -> NotifyMessage {
+        if args.len() < 3 {
+            return NotifyMessage::with_error("MPA Queue or Channel Missing")
+        }
+        let queue_name = assume_str(args[1]);
+        let channel_name = assume_str(args[2]);
+        let q = try_or_int!(self.get_queue(queue_name).ok_or(()), 0);
+
+        match channel_name {
+            "*" => {
                 q.as_mut().purge();
             },
-            Some(channel_name) => {
-                if ! self.delete_channel(&q, channel_name) {
-                    return NotifyMessage::with_int(0);
-                }
+            channel_name => {
+                try_or_int!(q.as_mut().purge_channel(channel_name), 0);
             },
         }
 
@@ -396,6 +410,7 @@ impl Dispatch {
             "HDEL" => self.hdel(args_slice),
             "MSET" => self.mset(args_slice),
             "DEL" => self.del(args_slice),
+            "SDEL" => self.sdel(args_slice),
             _ => NotifyMessage::with_error("UCOM Unknown Command")
         };
 
@@ -476,7 +491,7 @@ impl Connection {
             if self.response.remaining() == 0 {
                 // if we were to support pipelining we'd have to try to pop a request value here
                 self.interest = EventSet::all() - EventSet::writable();
-                event_loop.reregister(&self.stream, self.token, self.interest, PollOpt::level()).unwrap(); 
+                event_loop.reregister(&self.stream, self.token, self.interest, PollOpt::level()).unwrap();
             }
         }
         true

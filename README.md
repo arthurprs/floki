@@ -17,9 +17,9 @@ Floki borrows concepts from both Kafka and Amazon SQS into an easy to use packag
 - [ ] Hardened internals
 
 ## TODO
-- [ ] Map commands to Redis commands
-- [ ] Opt-in persistency guarantee (needs group commit-ish implementation)
+- [x] Ticket based Acknowledgement
+- [ ] Map commands to Redis commands in a sensible way
+- [ ] Better error handling (wip)
 - [ ] Lots of documentation
-- [ ] Better error handling
+- [ ] Opt-in persistency guarantee (needs group commit-ish implementation)
 - [ ] Make internal data structures size-bounded, based on configurations
-- [ ] Ticket based Acknowledgement

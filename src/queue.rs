@@ -14,10 +14,11 @@ use tristate_lock::*;
 use rev::Rev;
 use rand;
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub enum QueueError {
+    ChannelAlreadyExists,
     ChannelNotFound,
-    InvalidTicket,
+    TicketNotFound,
     EndOfQueue(u64),
 }
 
@@ -111,6 +112,13 @@ impl Channel {
 
         self.in_flight_map.len() as u32 - self.expired_count
     }
+
+    fn purge(&mut self, new_tail: u64) {
+        self.in_flight_heap.clear();
+        self.in_flight_map.clear();
+        self.expired_count = 0;
+        self.tail = new_tail;
+    }
 }
 
 unsafe impl Sync for Queue {}
@@ -154,11 +162,10 @@ impl Queue {
         self.state = new_state;
     }
 
-    pub fn create_channel<S>(&mut self, channel_name: S, clock: u32) -> bool
-            where String: From<S> {
+    pub fn create_channel(&mut self, channel_name: &str, clock: u32) -> QueueResult<()> {
         let r_lock = self.lock.read();
-        let mut locked_channel = self.channels.write().unwrap();
-        if let Entry::Vacant(vacant_entry) = locked_channel.entry(channel_name.into()) {
+        let mut locked_channels = self.channels.write().unwrap();
+        if let Entry::Vacant(vacant_entry) = locked_channels.entry(channel_name.into()) {
             let channel = Channel {
                 last_touched: clock,
                 expired_count: 0,
@@ -166,17 +173,32 @@ impl Queue {
                 in_flight_map: Default::default(),
                 in_flight_heap: Default::default(),
             };
-            debug!("creating channel {:?}", channel);
+            debug!("[{}] creating channel {:?}", self.config.name, channel);
             vacant_entry.insert(Mutex::new(channel));
-            true
+            Ok(())
         } else {
-            false
+            Err(QueueError::ChannelAlreadyExists)
         }
     }
 
-    pub fn delete_channel(&mut self, channel_name: &str) -> bool {
-        let mut locked_channel = self.channels.write().unwrap();
-        locked_channel.remove(channel_name).is_some()
+    pub fn delete_channel(&mut self, channel_name: &str) -> QueueResult<()> {
+        let mut locked_channels = self.channels.write().unwrap();
+        if locked_channels.remove(channel_name).is_some() {
+            Ok(())
+        } else {
+            Err(QueueError::ChannelNotFound)
+        }
+    }
+
+    pub fn purge_channel(&mut self, channel_name: &str) -> QueueResult<()> {
+        let locked_channels = self.channels.write().unwrap();
+        if let Some(channel) = locked_channels.get(channel_name) {
+            let r_lock = self.lock.read();
+            channel.lock().unwrap().purge(self.backend.head());
+            Ok(())
+        } else {
+            Err(QueueError::ChannelNotFound)
+        }
     }
 
     /// get access is suposed to be thread-safe, even while writing
@@ -257,7 +279,7 @@ impl Queue {
             // TODO: success rate should be much higher, so remove and re-add if needed
             match locked_channel.in_flight_map.get(&ticket) {
                 Some(state) if clock < state.expiration => (),
-                _ => return Err(QueueError::InvalidTicket),
+                _ => return Err(QueueError::TicketNotFound),
             };
 
             let state = locked_channel.in_flight_map.remove(&ticket).unwrap();
@@ -476,7 +498,7 @@ mod tests {
     fn test_put_get() {
         let mut q = get_queue();
         let message = gen_message();
-        assert!(q.create_channel("test", 0));
+        assert!(q.create_channel("test", 0).is_ok());
         for i in 0..100_000 {
             assert!(q.push(&message, 0).is_some());
             let r = q.get("test", 0);
@@ -490,7 +512,7 @@ mod tests {
         let message = gen_message();
         assert!(q.get("test", 0).is_err());
         assert!(q.push(&message, 0).is_some());
-        assert!(q.create_channel("test", 0) == true);
+        assert!(q.create_channel("test", 0).is_ok());
         assert!(q.get("test", 0).is_err());
         assert!(q.push(&message, 0).is_some());
         assert!(q.get("test", 0).is_ok());
@@ -499,7 +521,7 @@ mod tests {
     #[test]
     fn test_in_flight() {
         let mut q = get_queue();
-        assert!(q.create_channel("test", 0) == true);
+        assert!(q.create_channel("test", 0).is_ok());
         let message = gen_message();
         assert!(q.push(&message, 1).is_some());
         assert!(q.get("test", 1).is_ok());
@@ -512,7 +534,7 @@ mod tests {
     fn test_in_flight_timeout() {
         let mut q = get_queue();
         let message = gen_message();
-        assert!(q.create_channel("test", 0) == true);
+        assert!(q.create_channel("test", 0).is_ok());
         assert!(q.push(&message, 0).is_some());
         assert!(q.get("test", 0).is_ok());
         assert!(q.get("test", 0).is_err());
@@ -522,7 +544,7 @@ mod tests {
     #[test]
     fn test_backend_recover() {
         let mut q = get_queue();
-        assert!(q.create_channel("test", 0) == true);
+        assert!(q.create_channel("test", 0).is_ok());
         let message = gen_message();
         let mut put_msg_count = 0;
         while q.backend.segments_count() < 3 {
@@ -532,7 +554,7 @@ mod tests {
         q.checkpoint(true);
 
         q = get_queue_recover();
-        assert!(q.create_channel("test", 1) == false);
+        assert_eq!(q.create_channel("test", 1), Err(QueueError::ChannelAlreadyExists));
         assert_eq!(q.backend.segments_count(), 3);
         let mut get_msg_count = 0;
         while let Ok(_) = q.get("test", 0) {
@@ -545,7 +567,7 @@ mod tests {
     fn test_queue_recover() {
         let mut q = get_queue();
         let message = gen_message();
-        assert!(q.create_channel("test", 0) == true);
+        assert!(q.create_channel("test", 0).is_ok());
         assert!(q.push(&message, 0).is_some());
         assert!(q.push(&message, 0).is_some());
         assert!(q.get("test", 0).is_ok());
@@ -554,7 +576,7 @@ mod tests {
         q.checkpoint(true);
 
         q = get_queue_recover();
-        assert!(q.create_channel("test", 0) == false);
+        assert_eq!(q.create_channel("test", 0), Err(QueueError::ChannelAlreadyExists));
         assert!(q.get("test", 0).is_ok());
         assert!(q.get("test", 0).is_ok());
         assert!(q.get("test", 0).is_err());
@@ -564,7 +586,7 @@ mod tests {
     fn test_gc() {
         let message = gen_message();
         let mut q = get_queue();
-        assert!(q.create_channel("test", 0) == true);
+        assert!(q.create_channel("test", 0).is_ok());
 
         while q.backend.segments_count() < 3 {
             assert!(q.push(&message, 0).is_some());
@@ -597,7 +619,7 @@ mod tests {
         let mut q = get_queue();
         let m = &gen_message();
         let n = 10000;
-        q.create_channel("test", 0);
+        q.create_channel("test", 0).unwrap();
         b.bytes = (m.len() * n) as u64;
         b.iter(|| {
             for _ in 0..n {
