@@ -44,7 +44,7 @@ impl From<QueueError> for NotifyMessage {
                 NotifyMessage::with_error("CNF Channel Not Found"),
             QueueError::ChannelAlreadyExists =>
                 NotifyMessage::with_error("CAE Channel Already Exists"),
-            _ => panic!("{:?}", from)
+            _ => panic!("Not expected error type {:?}", from)
         }
     }
 }
@@ -238,7 +238,6 @@ impl Dispatch {
                     results.push(Value::Message(ticket_message));
                 },
                 Err(QueueError::EndOfQueue(required_head)) => {
-                    debug!("queue {:?} channel {:?} has no messages", queue_name, channel_name);
                     // block only if we have no results
                     if results.is_empty() {
                         return NotifyMessage::GetWouldBlock{
@@ -363,7 +362,7 @@ impl Dispatch {
         NotifyMessage::with_int(1)
     }
 
-    fn sdel(&self, args: &[&[u8]]) -> NotifyMessage {
+    fn srem(&self, args: &[&[u8]]) -> NotifyMessage {
         if args.len() < 3 {
             return NotifyMessage::with_error("MPA Queue or Channel Missing")
         }
@@ -410,7 +409,7 @@ impl Dispatch {
             "HDEL" => self.hdel(args_slice),
             "MSET" => self.mset(args_slice),
             "DEL" => self.del(args_slice),
-            "SDEL" => self.sdel(args_slice),
+            "SREM" => self.srem(args_slice),
             _ => NotifyMessage::with_error("UCOM Unknown Command")
         };
 
@@ -732,8 +731,8 @@ impl Server {
         }
     }
 
-    fn notify_connection_gone(&mut self, connection: &mut Connection,  event_loop: &mut EventLoop<ServerHandler>) {
-        debug!("notify_connection_gone {:?}", connection.token);
+    fn notify_client_gone(&mut self, connection: &mut Connection,  event_loop: &mut EventLoop<ServerHandler>) {
+        debug!("notify_client_gone {:?}", connection.token);
         if connection.timeout.is_none() {
             return
         }
@@ -752,12 +751,18 @@ impl Server {
         }
     }
 
+    fn remove_client(&mut self, token: Token, connections: &mut Slab<Connection>, event_loop: &mut EventLoop<ServerHandler>) {
+        info!("closing token {:?} connection", token);
+        let mut connection = connections.remove(token).unwrap();
+        self.notify_client_gone(&mut connection, event_loop);
+    }
+
     fn ready(&mut self, connections: &mut Slab<Connection>, event_loop: &mut EventLoop<ServerHandler>, events: EventSet) -> bool {
         assert_eq!(events, EventSet::readable());
 
         if let Some(stream) = self.listener.accept().unwrap() {
-            let connection_addr = stream.peer_addr();
-            info!("incomming connection from {:?}", connection_addr);
+            let connection_addr = stream.peer_addr().unwrap();
+            trace!("incomming connection from {:?}", connection_addr);
 
             // Don't buffer output in TCP - kills latency sensitive benchmarks
             // TODO: use TCP_CORK
@@ -766,7 +771,7 @@ impl Server {
             let token = connections.insert_with(
                 |token| Connection::new(token, 0, stream)).unwrap();
 
-            debug!("assigned token {:?} to client {:?}", token, connection_addr);
+            info!("assigned token {:?} to client {:?}", token, connection_addr);
 
             event_loop.register_opt(
                 &connections[token].stream,
@@ -873,11 +878,8 @@ impl Handler for ServerHandler {
             }
         };
         if !is_ok {
-            trace!("deregistering token {:?}", token);
-            self.connections.remove(token).map(
-                |mut c| self.server.notify_connection_gone(&mut c, event_loop));
+            self.server.remove_client(token, &mut self.connections, event_loop);
         }
-
         trace!("done events {:?} for token {:?}", events, token);
     }
 
@@ -895,9 +897,7 @@ impl Handler for ServerHandler {
             }
         };
         if !is_ok {
-            trace!("deregistering token {:?}", token);
-            self.connections.remove(token).map(
-                |mut c| self.server.notify_connection_gone(&mut c, event_loop));
+            self.server.remove_client(token, &mut self.connections, event_loop);
         }
         trace!("end notify event for token {:?}", token);
     }
@@ -921,9 +921,7 @@ impl Handler for ServerHandler {
             }
         };
         if !is_ok {
-            trace!("deregistering token {:?}", token);
-            self.connections.remove(token).map(
-                |mut c| self.server.notify_connection_gone(&mut c, event_loop));
+            self.server.remove_client(token, &mut self.connections, event_loop);
         }
         trace!("end timeout event for token {:?}", token);
     }

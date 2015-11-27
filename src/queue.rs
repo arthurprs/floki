@@ -229,7 +229,7 @@ impl Queue {
             }
 
             // fetch from the backend
-            if let Some(message) = self.backend.get(locked_channel.tail) {
+            return if let Some(message) = self.backend.get(locked_channel.tail) {
                 let ticket = rand::random::<u64>();
                 let id = message.id();
                 let state = InFlightState {
@@ -243,9 +243,11 @@ impl Queue {
                     self.config.name, channel_name, message.id(), ticket);
                 trace!("[{}:{}] advancing tail to {}",
                     self.config.name, channel_name, locked_channel.tail);
-                return Ok((ticket, message))
+                Ok((ticket, message))
+            } else {
+                debug!("[{}:{}] no more messages", self.config.name, channel_name);
+                Err(QueueError::EndOfQueue(locked_channel.tail))
             }
-            return Err(QueueError::EndOfQueue(locked_channel.tail))
         }
         Err(QueueError::ChannelNotFound)
     }
