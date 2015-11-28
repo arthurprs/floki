@@ -44,8 +44,14 @@ impl From<QueueError> for NotifyMessage {
                 NotifyMessage::with_error("CNF Channel Not Found"),
             QueueError::ChannelAlreadyExists =>
                 NotifyMessage::with_error("CAE Channel Already Exists"),
-            _ => panic!("Not expected error type {:?}", from)
+            _ => NotifyMessage::with_error(&format!("Unexpected error {:?}", from))
         }
+    }
+}
+
+impl From<str::Utf8Error> for NotifyMessage {
+    fn from(from: str::Utf8Error) -> Self {
+        NotifyMessage::with_error("IPA Invalid UTF8")
     }
 }
 
@@ -104,6 +110,12 @@ pub struct ServerHandler {
 }
 
 macro_rules! try_or_error {
+    ($try: expr) => (
+        match $try {
+            Ok(ok) => ok,
+            Err(error) => return error.into(),
+        }
+    );
     ($try: expr, $error: expr) => (
         match $try {
             Ok(ok) => ok,
@@ -143,7 +155,7 @@ impl NotifyMessage {
     }
 }
 
-fn assume_str(possibly_str: &[u8]) -> &str {
+pub fn assume_str(possibly_str: &[u8]) -> &str {
     unsafe { str::from_utf8_unchecked(possibly_str) }
 }
 
@@ -250,7 +262,7 @@ impl Dispatch {
                     }
                     break
                 },
-                Err(err) => return err.into()
+                Err(error) => return error.into()
             }
         }
         NotifyMessage::with_value(Value::Array(results))
@@ -284,7 +296,7 @@ impl Dispatch {
                     timeout: timeout,
                 }
             },
-            Err(err) => return err.into()
+            Err(error) => return error.into()
         }
     }
 
@@ -292,14 +304,12 @@ impl Dispatch {
         if args.len() < 3 {
             return NotifyMessage::with_error("MPA Queue or Channel Missing")
         }
-        let queue_name = assume_str(args[1]);
-        let channel_name = assume_str(args[2]);
+        let queue_name = try_or_error!(str::from_utf8(args[1]));
+        let channel_name = try_or_error!(str::from_utf8(args[2]));
         let q = self.get_or_create_queue(queue_name);
 
-        match self.create_channel(&q, channel_name) {
-            Ok(_) => NotifyMessage::with_ok(),
-            Err(err) => err.into()
-        }
+        try_or_error!(self.create_channel(&q, channel_name));
+        NotifyMessage::with_ok()
     }
 
     fn rpush(&self, args: &[&[u8]]) -> NotifyMessage {
@@ -312,7 +322,7 @@ impl Dispatch {
 
         debug!("inserting {} msgs into {:?}",
             messages.len(), queue_name);
-        let last_id = q.as_mut().push_many(messages, self.clock).unwrap();
+        let last_id = try_or_error!(q.as_mut().push_many(messages, self.clock));
         trace!("inserted {} messages into {:?} with last id {:?}",
             messages.len(), queue_name, last_id);
 

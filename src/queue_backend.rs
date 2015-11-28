@@ -154,12 +154,12 @@ impl Segment {
     fn create(config: &QueueConfig, start_id: u64) -> QueueBackendResult<Segment> {
         let data_path = Self::gen_file_path(config, start_id, DATA_EXTENSION);
         debug!("[{}] creating data file {:?}", config.name, data_path);
-        let file = OpenOptions::new()
+        let file = try!(OpenOptions::new()
                 .read(true)
                 .write(true)
                 .create(true)
                 .truncate(true)
-                .open(&data_path).unwrap();
+                .open(&data_path));
         try!(fallocate(&file, 0, config.segment_size));
 
         let mut segment = try!(Self::new(config, file, data_path, start_id));
@@ -181,7 +181,7 @@ impl Segment {
     }
 
     fn new(config: &QueueConfig, file: File, data_path: PathBuf, start_id: u64) -> QueueBackendResult<Segment> {
-        let file_size = file.metadata().unwrap().len();
+        let file_size = try!(file.metadata()).len();
         if file_size <= 4 {
             return Err(QueueBackendError::SegmentFileInvalid)
         }
@@ -534,7 +534,7 @@ impl QueueBackend {
         let tmp_path = self.config.data_directory.join(TMP_BACKEND_CHECKPOINT_FILE);
         let result = File::create(&tmp_path)
             .and_then(|mut file| {
-                write!(file, "{}", json::as_pretty_json(&checkpoint)).unwrap();
+                try!(write!(file, "{}", json::as_pretty_json(&checkpoint)));
                 file.sync_data()
             }).and_then(|_| {
                 let final_path = tmp_path.with_file_name(BACKEND_CHECKPOINT_FILE);
