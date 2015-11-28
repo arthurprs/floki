@@ -3,6 +3,7 @@ use std::slice;
 use std::thread;
 use std::cmp;
 use std::mem::{self, size_of};
+use std::io;
 use std::io::prelude::*;
 use std::time::Duration;
 use std::os::unix::io::{RawFd, AsRawFd};
@@ -143,16 +144,13 @@ impl Segment {
         segment
     }
 
-    fn open(config: &QueueConfig, checkpoint: SegmentCheckpoint) -> Segment {
+    fn open(config: &QueueConfig, checkpoint: &SegmentCheckpoint) -> Result<Segment, io::Error> {
         let data_path = Self::gen_file_path(config, checkpoint.tail, DATA_EXTENSION);
         debug!("[{}] opening data file {:?}", config.name, data_path);
-        let file = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(&data_path).unwrap();
+        let file = try!(OpenOptions::new().read(true).write(true).open(&data_path));
         let mut segment = Self::new(config, file, data_path, checkpoint.tail);
         segment.recover(checkpoint);
-        segment
+        Ok(segment)
     }
 
     fn new(config: &QueueConfig, file: File, data_path: PathBuf, start_id: u64) -> Segment {
@@ -252,7 +250,7 @@ impl Segment {
         }
     }
 
-    fn recover(&mut self, checkpoint: SegmentCheckpoint) {
+    fn recover(&mut self, checkpoint: &SegmentCheckpoint) {
         debug!("[{:?}] checkpoint loaded: {:?}", self.data_path, checkpoint);
         assert_eq!(self.tail, checkpoint.tail);
         self.tail = checkpoint.tail;
@@ -464,8 +462,15 @@ impl QueueBackend {
         info!("[{}] checkpoint loaded: {:?}", self.config.name, backend_checkpoint);
 
         let mut locked_segments = self.segments.write();
-        for file_checkpoint in backend_checkpoint.segments {
-            let segment = Arc::new(Segment::open(&self.config, file_checkpoint));
+        for segment_checkpoint in &backend_checkpoint.segments {
+            let segment = match Segment::open(&self.config, segment_checkpoint) {
+                Ok(inner_segment) => Arc::new(inner_segment),
+                Err(error) => {
+                    warn!("[{}] error opening segment from checkpoint {:?}: {}",
+                        self.config.name, segment_checkpoint, error);
+                    continue
+                },
+            };
             if !segment.closed && locked_segments.last_mut().is_some() {
                 // make sure we only have one open segment, the last
                 locked_segments.last_mut().unwrap().as_mut().closed = true;
@@ -546,6 +551,7 @@ impl QueueBackend {
 mod tests {
     use super::*;
     use config::*;
+    use std::fs;
     use std::thread;
     use std::rc::Rc;
     use utils;
@@ -649,4 +655,51 @@ mod tests {
         assert_eq!(holes, 1);
     }
 
+    #[test]
+    fn test_missing_file() {
+        let mut num_writes = 0;
+        let file_paths: Vec<_> = {
+            let mut backend = get_backend();
+            while backend.segments_count() < 3 {
+                backend.push(gen_message(), 0).unwrap();
+                num_writes += 1;
+            }
+            backend.checkpoint(true);
+
+            let locked_segments = backend.segments.read();
+            locked_segments.iter().map(|s| s.data_path.clone()).collect()
+        };
+
+        for (segment_num, file_path) in file_paths.iter().enumerate() {
+            fs::remove_file(&file_path).unwrap();
+
+            let mut backend = get_backend_recover();
+            let mut num_reads = 0;
+            let mut id = 1;
+            let mut holes = 0;
+            while let Some(message) = backend.get(id) {
+                num_reads += 1;
+                if message.id() != id {
+                    holes += 1
+                }
+                id = message.id() + 1;
+            }
+            assert_eq!(id, backend.head());
+            match segment_num {
+                0 => {
+                    assert_eq!(num_reads, (num_writes - 1) / 2 + 1);
+                    assert_eq!(holes, 1);
+                },
+                1 => {
+                    assert_eq!(num_reads, 1);
+                    assert_eq!(holes, 1);
+                },
+                2 => {
+                    assert_eq!(num_reads, 0);
+                    assert_eq!(holes, 0);
+                },
+                _ => unreachable!()
+            }
+        }
+    }
 }
