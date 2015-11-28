@@ -59,9 +59,8 @@ impl Value {
             Value::Error(v) =>
                 write!(f, "-{}\r\n", v.as_ref()),
             Value::Message((ticket, message)) => {
-                write!(f, "*2\r\n").unwrap();
-                write!(f, ":{}\r\n${}\r\n", ticket, message.body().len()).unwrap();
-                f.write(message.body()).unwrap();
+                write!(f, "*2\r\n:{}\r\n:${}\r\n", ticket, message.body().len()).unwrap();
+                f.write_all(message.body()).unwrap();
                 write!(f, "\r\n")
             }
         }.unwrap()
