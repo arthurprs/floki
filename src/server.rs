@@ -49,12 +49,6 @@ impl From<QueueError> for NotifyMessage {
     }
 }
 
-impl From<str::Utf8Error> for NotifyMessage {
-    fn from(from: str::Utf8Error) -> Self {
-        NotifyMessage::with_error("IPA Invalid UTF8")
-    }
-}
-
 #[derive(Debug)]
 pub enum TimeoutMessage {
     Timeout{queue: Atom, channel: Atom},
@@ -155,8 +149,17 @@ impl NotifyMessage {
     }
 }
 
-pub fn assume_str(possibly_str: &[u8]) -> &str {
+fn assume_str(possibly_str: &[u8]) -> &str {
     unsafe { str::from_utf8_unchecked(possibly_str) }
+}
+
+fn check_identifier_str(possibly_str: &[u8]) -> Result<&str, NotifyMessage> {
+    if possibly_str.iter().all(|&b| (b as char).is_alphanumeric() || b == b'_') {
+        Ok(assume_str(possibly_str))
+    } else {
+        // FIXME
+        Err(NotifyMessage::with_error("IPA Invalid Name"))
+    }
 }
 
 impl Dispatch {
@@ -304,8 +307,8 @@ impl Dispatch {
         if args.len() < 3 {
             return NotifyMessage::with_error("MPA Queue or Channel Missing")
         }
-        let queue_name = try_or_error!(str::from_utf8(args[1]));
-        let channel_name = try_or_error!(str::from_utf8(args[2]));
+        let queue_name = try_or_error!(check_identifier_str(args[1]));
+        let channel_name = try_or_error!(check_identifier_str(args[2]));
         let q = self.get_or_create_queue(queue_name);
 
         try_or_error!(self.create_channel(&q, channel_name));
