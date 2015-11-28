@@ -41,6 +41,10 @@ impl Message {
         unsafe { (*self.inner.mmap_ptr).id }
     }
 
+    pub fn timestamp(&self) -> u32 {
+        unsafe { (*self.inner.mmap_ptr).timestamp }
+    }
+
     pub fn body(&self) -> &[u8] {
         unsafe {
             slice::from_raw_parts(
