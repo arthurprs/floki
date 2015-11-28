@@ -88,8 +88,8 @@ impl fmt::Debug for Value {
                 write!(f, "Status({:?})", v.as_ref()),
             Value::Error(ref v) =>
                 write!(f, "Error({:?})", v.as_ref()),
-            Value::Message(_) =>
-                write!(f, "Message(..)"),
+            Value::Message((ticket, ref message)) =>
+                write!(f, "Message(({:?}, {:?}))", ticket, message.id()),
         }
     }
 }

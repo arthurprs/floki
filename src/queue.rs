@@ -38,9 +38,9 @@ impl Default for QueueState {
 
 #[derive(Debug, PartialEq, RustcDecodable, RustcEncodable)]
 pub struct ChannelInfo {
+    pub tail: u64,
     pub last_touched: u32,
     pub in_flight_count: u32,
-    pub tail: u64,
 }
 
 #[derive(Debug, RustcDecodable, RustcEncodable)]
@@ -52,8 +52,8 @@ pub struct QueueInfo {
 
 #[derive(Debug, Eq, PartialEq, RustcDecodable, RustcEncodable)]
 struct ChannelCheckpoint {
-    last_touched: u32,
     tail: u64,
+    last_touched: u32,
 }
 
 #[derive(Debug, Default, RustcDecodable, RustcEncodable)]
@@ -61,6 +61,8 @@ struct QueueCheckpoint {
     state: QueueState,
     channels: BTreeMap<String, ChannelCheckpoint>,
 }
+
+const EXPIRED: u32 = 0;
 
 #[derive(Debug)]
 struct InFlightState {
@@ -104,7 +106,7 @@ impl Channel {
         for (_, state) in self.in_flight_map.iter_mut().skip(self.expired_count as usize) {
             if clock >= state.expiration {
                 self.expired_count += 1;
-                state.expiration = 0;
+                state.expiration = EXPIRED;
             } else {
                 break
             }
@@ -213,7 +215,7 @@ impl Queue {
             if let Some((&ticket, &InFlightState{expiration, ..})) = locked_channel.in_flight_map.front() {
                 // check in flight queue for timeouts
                 if clock >= expiration {
-                    if expiration == 0 {
+                    if expiration == EXPIRED {
                         locked_channel.expired_count -= 1;
                     }
                     let mut state = locked_channel.in_flight_map.remove(&ticket).unwrap();
