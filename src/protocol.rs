@@ -316,19 +316,6 @@ mod tests {
         Parser::new(slice).parse()
     }
 
-    macro_rules! assert_eq_repr {
-        ($left:expr , $right:expr) => ({
-            match (format!("{:?}", &$left), format!("{:?}", &$right)) {
-                (left_val, right_val) => {
-                    if !(left_val == right_val) {
-                        panic!("repr assertion failed: `(debug(left) == debug(right))` \
-                               (left: `{:?}`, right: `{:?}`)", left_val, right_val)
-                    }
-                }
-            }
-        })
-    }
-
     #[test]
     fn parse_incomplete() {
         let r = parse(b"*2\r\n$3\r\nfoo");

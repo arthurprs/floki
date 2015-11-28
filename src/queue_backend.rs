@@ -17,6 +17,7 @@ use spin::{Mutex as SpinLock, RwLock as SpinRwLock};
 use rustc_serialize::json;
 use twox_hash::XxHash;
 use std::hash::Hasher;
+use nix;
 
 use config::*;
 use utils::*;
@@ -24,6 +25,28 @@ use offset_index::*;
 use fallocate::*;
 
 const MAGIC_NUM: u32 = 0xF1031311u32;
+
+pub type QueueBackendResult<T> = Result<T, QueueBackendError>;
+
+#[derive(Debug)]
+pub enum QueueBackendError {
+    SegmentFull,
+    SegmentFileInvalid,
+    Io(io::Error),
+}
+
+impl From<io::Error> for QueueBackendError {
+    fn from(from: io::Error) -> QueueBackendError {
+        QueueBackendError::Io(from)
+    }
+}
+
+impl From<nix::Error> for QueueBackendError {
+    fn from(from: nix::Error) -> QueueBackendError {
+        QueueBackendError::Io(from.into())
+    }
+}
+
 
 #[derive(Debug, Clone)]
 struct InnerMessage {
@@ -128,7 +151,7 @@ impl Segment {
         (hasher.finish() & 0xFFFFFFFF) as u32
     }
 
-    fn create(config: &QueueConfig, start_id: u64) -> Segment {
+    fn create(config: &QueueConfig, start_id: u64) -> QueueBackendResult<Segment> {
         let data_path = Self::gen_file_path(config, start_id, DATA_EXTENSION);
         debug!("[{}] creating data file {:?}", config.name, data_path);
         let file = OpenOptions::new()
@@ -137,40 +160,42 @@ impl Segment {
                 .create(true)
                 .truncate(true)
                 .open(&data_path).unwrap();
-        fallocate(&file, 0, config.segment_size).unwrap();
+        try!(fallocate(&file, 0, config.segment_size));
 
-        let mut segment = Self::new(config, file, data_path, start_id);
+        let mut segment = try!(Self::new(config, file, data_path, start_id));
         unsafe {
-            let magic_num = segment.file_mmap as *mut u32;
-            *magic_num = MAGIC_NUM;
+            *(segment.file_mmap as *mut u32) = MAGIC_NUM;
         }
         segment.file_offset = size_of::<u32>() as u32;
-        segment
-    }
 
-    fn open(config: &QueueConfig, checkpoint: &SegmentCheckpoint) -> Result<Segment, io::Error> {
-        let data_path = Self::gen_file_path(config, checkpoint.tail, DATA_EXTENSION);
-        debug!("[{}] opening data file {:?}", config.name, data_path);
-        let file = try!(OpenOptions::new().read(true).write(true).open(&data_path));
-        let mut segment = Self::new(config, file, data_path, checkpoint.tail);
-        segment.recover(checkpoint);
         Ok(segment)
     }
 
-    fn new(config: &QueueConfig, file: File, data_path: PathBuf, start_id: u64) -> Segment {
-        let file_size = file.metadata().unwrap().len();
-        assert_eq!(file_size, config.segment_size);
+    fn open(config: &QueueConfig, checkpoint: &SegmentCheckpoint) -> QueueBackendResult<Segment> {
+        let data_path = Self::gen_file_path(config, checkpoint.tail, DATA_EXTENSION);
+        debug!("[{}] opening data file {:?}", config.name, data_path);
+        let file = try!(OpenOptions::new().read(true).write(true).open(&data_path));
+        let mut segment = try!(Self::new(config, file, data_path, checkpoint.tail));
+        try!(segment.recover(checkpoint));
+        Ok(segment)
+    }
 
-        let file_mmap = mman::mmap(
+    fn new(config: &QueueConfig, file: File, data_path: PathBuf, start_id: u64) -> QueueBackendResult<Segment> {
+        let file_size = file.metadata().unwrap().len();
+        if file_size <= 4 {
+            return Err(QueueBackendError::SegmentFileInvalid)
+        }
+
+        let file_mmap = try!(mman::mmap(
             ptr::null_mut(), file_size,
             mman::PROT_READ | mman::PROT_WRITE, mman::MAP_SHARED,
-            file.as_raw_fd(), 0).unwrap() as *mut u8;
-        mman::madvise(
+            file.as_raw_fd(), 0)) as *mut u8;
+        try!(mman::madvise(
             file_mmap as *mut c_void,
             file_size,
-            mman::MADV_SEQUENTIAL).unwrap();
+            mman::MADV_SEQUENTIAL));
 
-        Segment {
+        Ok(Segment {
             data_path: data_path,
             file: file,
             file_mmap: file_mmap,
@@ -184,7 +209,7 @@ impl Segment {
             closed: false,
             deleted: false,
             index: SpinLock::new(OffsetIndex::new(start_id))
-        }
+        })
     }
     
     fn get(&self, id: u64) -> Result<InnerMessage, ()> {
@@ -215,12 +240,12 @@ impl Segment {
         Ok(message)
     }
 
-    fn push(&mut self, body: &[u8], clock: u32) -> Result<u64, ()> {
+    fn push(&mut self, body: &[u8], clock: u32) -> QueueBackendResult<u64> {
         let message_total_len = size_of::<MessageHeader>() + body.len();
 
         if message_total_len as u32 > self.file_size - self.file_offset {
             self.closed = true;
-            return Err(())
+            return Err(QueueBackendError::SegmentFull)
         }
 
         let id = self.head;
@@ -254,27 +279,24 @@ impl Segment {
         }
     }
 
-    fn recover(&mut self, checkpoint: &SegmentCheckpoint) {
+    fn recover(&mut self, checkpoint: &SegmentCheckpoint) -> QueueBackendResult<()> {
         debug!("[{:?}] checkpoint loaded: {:?}", self.data_path, checkpoint);
         assert_eq!(self.tail, checkpoint.tail);
         self.tail = checkpoint.tail;
         self.head = checkpoint.tail;
         self.sync_offset = checkpoint.sync_offset;
         self.closed = checkpoint.closed;
-        self.file_offset = size_of::<u32>() as u32;
-        self.sync_offset = self.file_offset;
 
-        mman::madvise(
+        try!(mman::madvise(
             self.file_mmap as *mut c_void,
             self.sync_offset as u64,
-            mman::MADV_WILLNEED).unwrap();
+            mman::MADV_WILLNEED));
 
+        self.file_offset = size_of::<u32>() as u32;
         unsafe {
-            let magic_num = self.file_mmap as *mut u32;
-            if *magic_num != MAGIC_NUM {
+            if *(self.file_mmap as *mut u32) != MAGIC_NUM {
                 warn!("[{:?}] incorrect magic number", self.data_path);
-                *magic_num = MAGIC_NUM;
-                return;
+                *(self.file_mmap as *mut u32) = MAGIC_NUM
             }
         }
 
@@ -306,6 +328,7 @@ impl Segment {
         }
 
         self.sync_offset = self.file_offset;
+        Ok(())
     }
 
     fn checkpoint(&mut self, full: bool) -> SegmentCheckpoint {
@@ -381,28 +404,31 @@ impl QueueBackend {
 
     /// Put a message at the end of the Queue, return the message id if succesfull
     /// Note: it's the caller responsability to serialize write calls
-    pub fn push(&mut self, body: &[u8], timestamp: u32) -> Option<u64> {
+    pub fn push(&mut self, body: &[u8], timestamp: u32) -> QueueBackendResult<u64> {
         let result = if let Some(segment) = self.segments.read().last() {
-            segment.as_mut().push(body, timestamp).ok()
+            segment.as_mut().push(body, timestamp)
         } else {
-            None
+            Err(QueueBackendError::SegmentFull)
         };
 
-        if let Some(id) = result {
-            assert_eq!(id, self.head);
-            self.head += 1;
-            return result
+        match result {
+            Ok(id) => {
+                assert_eq!(id, self.head);
+                self.head += 1;
+                return result
+            },
+            Err(QueueBackendError::SegmentFull) => (),
+            Err(_) => return result
         }
 
         // create a new segment
-        let segment = Arc::new(Segment::create(&self.config, self.head));
+        let segment = Arc::new(try!(Segment::create(&self.config, self.head)));
         self.segments.write().push(segment.clone());
 
-        let id = segment.as_mut().push(body, timestamp)
-            .expect("Can't write to a newly created file!");
+        let id = try!(segment.as_mut().push(body, timestamp));
         assert_eq!(id, self.head);
         self.head += 1;
-        Some(id)
+        Ok(id)
     }
 
     /// Get a new message with the specified id
@@ -470,7 +496,7 @@ impl QueueBackend {
             let segment = match Segment::open(&self.config, segment_checkpoint) {
                 Ok(inner_segment) => Arc::new(inner_segment),
                 Err(error) => {
-                    warn!("[{}] error opening segment from checkpoint {:?}: {}",
+                    warn!("[{}] error opening segment from checkpoint {:?}: {:?}",
                         self.config.name, segment_checkpoint, error);
                     continue
                 },
@@ -602,7 +628,7 @@ mod tests {
             segment.as_mut().file.set_len(segment.file_size as u64).unwrap();
         }
 
-        backend = get_backend_recover();
+        let mut backend = get_backend_recover();
         let mut num_reads = 0;
         let mut id = 1;
         let mut holes = 0;
@@ -618,10 +644,9 @@ mod tests {
         assert_eq!(holes, 1);
 
         {
-            // nuke the third
+            // truncate the third
             let segment = backend.segments.read()[2].clone();
             segment.as_mut().file.set_len(0).unwrap();
-            segment.as_mut().file.set_len(segment.file_size as u64).unwrap();
         }
 
         backend = get_backend_recover();

@@ -14,26 +14,27 @@ use tristate_lock::*;
 use rev::Rev;
 use rand;
 
-#[derive(Debug, PartialEq)]
+pub type QueueResult<T> = Result<T, QueueError>;
+
+#[derive(Debug)]
 pub enum QueueError {
     ChannelAlreadyExists,
     ChannelNotFound,
     TicketNotFound,
     EndOfQueue(u64),
+    Backend(QueueBackendError),
 }
 
-pub type QueueResult<T> = Result<T, QueueError>;
+impl From<QueueBackendError> for QueueError {
+    fn from(from: QueueBackendError) -> QueueError {
+        QueueError::Backend(from)
+    }
+}
 
 #[derive(Eq, PartialEq, Debug, Copy, Clone, RustcDecodable, RustcEncodable)]
 pub enum QueueState {
     Ready,
     Deleting
-}
-
-impl Default for QueueState {
-    fn default() -> Self {
-        QueueState::Ready
-    }
 }
 
 #[derive(Debug, PartialEq, RustcDecodable, RustcEncodable)]
@@ -56,7 +57,7 @@ struct ChannelCheckpoint {
     last_touched: u32,
 }
 
-#[derive(Debug, Default, RustcDecodable, RustcEncodable)]
+#[derive(Debug, RustcDecodable, RustcEncodable)]
 struct QueueCheckpoint {
     state: QueueState,
     channels: BTreeMap<String, ChannelCheckpoint>,
@@ -255,21 +256,21 @@ impl Queue {
     }
 
     /// all calls are serialized internally
-    pub fn push(&mut self, message: &[u8], clock: u32) -> Option<u64> {
+    pub fn push(&mut self, message: &[u8], clock: u32) -> QueueResult<u64> {
         let w_lock = self.lock.write();
         trace!("[{}] putting message w/ clock {}", self.config.name, clock);
-        self.backend.push(message, clock)
+        Ok(try!(self.backend.push(message, clock)))
     }
 
     /// all calls are serialized internally
-    pub fn push_many(&mut self, messages: &[&[u8]], clock: u32) -> Option<u64> {
+    pub fn push_many(&mut self, messages: &[&[u8]], clock: u32) -> QueueResult<u64> {
         let w_lock = self.lock.write();
         trace!("[{}] putting {} messages w/ clock {}", self.config.name, messages.len(), clock);
         assert!(messages.len() > 0);
         for message in &messages[..messages.len() - 1] {
-            self.backend.push(message, clock);
+            try!(self.backend.push(message, clock));
         }
-        self.backend.push(messages[messages.len() - 1], clock)
+        Ok(try!(self.backend.push(messages[messages.len() - 1], clock)))
     }
 
     /// ack access is suposed to be thread-safe, even while writing
@@ -394,7 +395,7 @@ impl Queue {
     fn checkpoint(&mut self, full: bool) {
         let mut checkpoint = QueueCheckpoint {
             state: self.state,
-            .. Default::default()
+            channels: Default::default()
         };
 
         if self.state == QueueState::Ready {
@@ -493,8 +494,7 @@ mod tests {
         let mut q = get_queue();
         let message = gen_message();
         for i in 0..100_000 {
-            let r = q.push(&message, 0);
-            assert!(r.is_some());
+            assert!(q.push(&message, 0).is_ok());
         }
     }
 
@@ -504,7 +504,7 @@ mod tests {
         let message = gen_message();
         assert!(q.create_channel("test", 0).is_ok());
         for i in 0..100_000 {
-            assert!(q.push(&message, 0).is_some());
+            assert!(q.push(&message, 0).is_ok());
             let r = q.get("test", 0);
             assert!(r.unwrap().1.body() == message);
         }
@@ -515,10 +515,11 @@ mod tests {
         let mut q = get_queue();
         let message = gen_message();
         assert!(q.get("test", 0).is_err());
-        assert!(q.push(&message, 0).is_some());
+        assert!(q.push(&message, 0).is_ok());
         assert!(q.create_channel("test", 0).is_ok());
+        assert_eq_repr!(q.create_channel("test", 0).unwrap_err(), QueueError::ChannelAlreadyExists);
         assert!(q.get("test", 0).is_err());
-        assert!(q.push(&message, 0).is_some());
+        assert!(q.push(&message, 0).is_ok());
         assert!(q.get("test", 0).is_ok());
     }
 
@@ -527,7 +528,7 @@ mod tests {
         let mut q = get_queue();
         assert!(q.create_channel("test", 0).is_ok());
         let message = gen_message();
-        assert!(q.push(&message, 1).is_some());
+        assert!(q.push(&message, 1).is_ok());
         assert!(q.get("test", 1).is_ok());
         assert!(q.get("test", 1).is_err());
         assert_eq!(q.info(1).channels["test"].in_flight_count, 1);
@@ -539,7 +540,7 @@ mod tests {
         let mut q = get_queue();
         let message = gen_message();
         assert!(q.create_channel("test", 0).is_ok());
-        assert!(q.push(&message, 0).is_some());
+        assert!(q.push(&message, 0).is_ok());
         assert!(q.get("test", 0).is_ok());
         assert!(q.get("test", 0).is_err());
         assert!(q.get("test", 1).is_ok());
@@ -552,13 +553,13 @@ mod tests {
         let message = gen_message();
         let mut put_msg_count = 0;
         while q.backend.segments_count() < 3 {
-            assert!(q.push(&message, 0).is_some());
+            assert!(q.push(&message, 0).is_ok());
             put_msg_count += 1;
         }
         q.checkpoint(true);
 
         q = get_queue_recover();
-        assert_eq!(q.create_channel("test", 1), Err(QueueError::ChannelAlreadyExists));
+        assert_eq_repr!(q.create_channel("test", 1).unwrap_err(), QueueError::ChannelAlreadyExists);
         assert_eq!(q.backend.segments_count(), 3);
         let mut get_msg_count = 0;
         while let Ok(_) = q.get("test", 0) {
@@ -572,15 +573,15 @@ mod tests {
         let mut q = get_queue();
         let message = gen_message();
         assert!(q.create_channel("test", 0).is_ok());
-        assert!(q.push(&message, 0).is_some());
-        assert!(q.push(&message, 0).is_some());
+        assert!(q.push(&message, 0).is_ok());
+        assert!(q.push(&message, 0).is_ok());
         assert!(q.get("test", 0).is_ok());
         assert!(q.get("test", 0).is_ok());
         assert!(q.get("test", 0).is_err());
         q.checkpoint(true);
 
         q = get_queue_recover();
-        assert_eq!(q.create_channel("test", 0), Err(QueueError::ChannelAlreadyExists));
+        assert_eq_repr!(q.create_channel("test", 0).unwrap_err(), QueueError::ChannelAlreadyExists);
         assert!(q.get("test", 0).is_ok());
         assert!(q.get("test", 0).is_ok());
         assert!(q.get("test", 0).is_err());
@@ -593,7 +594,7 @@ mod tests {
         assert!(q.create_channel("test", 0).is_ok());
 
         while q.backend.segments_count() < 3 {
-            assert!(q.push(&message, 0).is_some());
+            assert!(q.push(&message, 0).is_ok());
             let r = q.get("test", 0);
             assert!(r.is_ok());
             assert!(q.ack("test", r.unwrap().0, 0).is_ok());
@@ -612,8 +613,7 @@ mod tests {
         b.bytes = (m.len() * n) as u64;
         b.iter(|| {
             for _ in 0..n {
-                let r = q.push(m, 0);
-                assert!(r.is_some());
+                assert!(q.push(m, 0).is_ok());
             }
         });
     }

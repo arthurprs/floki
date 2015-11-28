@@ -8,7 +8,7 @@ rustc-serialize = "*"
 log = "*"
 env_logger = "*"
 mio = "0.4.*"
-nix = "0.3.6"
+linked-hash-map = "*"
 libc = "*"
 toml = "*"
 threadpool = "*"
@@ -19,8 +19,8 @@ twox-hash = "*"
 spin = "*"
 rand = "*"
 
-[dependencies.linked-hash-map]
-git="https://github.com/contain-rs/linked-hash-map.git"
+[dependencies.nix]
+git="https://github.com/carllerche/nix-rust.git"
 
 [dependencies.tendril]
 git="https://github.com/arthurprs/tendril.git"

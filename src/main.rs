@@ -24,11 +24,11 @@ extern crate rand;
 extern crate tendril;
 
 mod config;
+#[macro_use] mod utils;
 mod queue;
-#[cfg(not(test))]mod server;
+#[cfg(not(test))] mod server;
 mod protocol;
 mod queue_backend;
-mod utils;
 mod rev;
 mod atom;
 mod cookie;
