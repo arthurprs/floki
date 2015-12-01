@@ -36,10 +36,26 @@ impl<T: AsRef<str>> From<T> for Atom {
 	}
 }
 
-/*
 #[cfg(test)]
 mod tests {
-    use string_cache::Atom;
+    use super::Atom;
+    use std::collections::HashMap;
+
+    #[test]
+    fn borrow_str_compatible() {
+        let mut hm: HashMap<Atom, _> = HashMap::new();
+        hm.insert("key1".into(), 1);
+        hm.insert("key2".into(), 2);
+        assert_eq!(hm.get("key1"), Some(&1));
+        assert_eq!(hm.get("key2"), Some(&2));
+    }
+}
+
+/*
+#[cfg(test)]
+mod benchs {
+    // use string_cache::Atom;
+    use super::Atom;
     use test;
     use std::sync::Arc;
     use tendril;
@@ -102,7 +118,21 @@ mod tests {
         b.iter(|| {
             for s in &items {
                 let tendril_str = TheTendril::from_slice(s.as_ref());
-                test::black_box(s);
+                test::black_box(tendril_str);
+            }
+        })
+    }
+
+    #[bench]
+    fn bench_atom_clone(b: &mut test::Bencher) {
+        let items: Vec<Atom> = vec![
+            "my_queue_1".into(),
+            "my_own_queue_100000".into(),
+            "my_longer_queue_name_100001".into()
+        ];
+        b.iter(|| {
+            for s in &items {
+                test::black_box(s.clone());
             }
         })
     }
