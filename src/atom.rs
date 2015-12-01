@@ -1,9 +1,9 @@
 use std::borrow::Borrow;
 use std::ops::Deref;
-use std::sync::Arc;
+use string_cache;
 
 #[derive(Hash, Eq, PartialEq, Debug, Clone)]
-pub struct Atom(Arc<String>);
+pub struct Atom(string_cache::Atom);
 
 impl Borrow<str> for Atom {
     #[inline(always)]
@@ -23,6 +23,6 @@ impl Deref for Atom {
 impl<T: AsRef<str>> From<T> for Atom {
     #[inline(always)]
 	fn from(from: T) -> Atom {
-		Atom(Arc::new(from.as_ref().into()))
+		Atom(from.as_ref().into())
 	}
 }
