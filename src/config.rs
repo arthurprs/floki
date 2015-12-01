@@ -15,7 +15,8 @@ pub struct ServerConfig {
     pub data_directory: PathBuf,
     pub bind_address: String,
     pub segment_size: u64,
-    pub maintenance_timeout: u32,
+    pub max_connections: usize,
+    pub maintenance_timeout: usize,
 }
 
 #[derive(Debug)]
@@ -40,15 +41,17 @@ impl ServerConfig {
         let bind_address = config.get("bind_address").unwrap().as_str().unwrap();
         let data_directory = config.get("data_directory").unwrap().as_str().unwrap();
         let segment_size = config.get("segment_size").unwrap().as_integer().unwrap() as u64 * 1024 * 1024;
+        let max_connections = config.get("max_connections").unwrap().as_integer().unwrap();
         let maintenance_timeout = config.get("maintenance_timeout").unwrap().as_integer().unwrap();
 
-        assert!(segment_size <= 2 << 31, "segment_size must be <= 2GB");
+        assert!(segment_size <= 1 << 31, "segment_size must be <= 2GB");
 
         ServerConfig {
             data_directory: data_directory.into(),
             bind_address: bind_address.into(),
             segment_size: segment_size,
-            maintenance_timeout: maintenance_timeout as u32,
+            max_connections: max_connections as usize,
+            maintenance_timeout: maintenance_timeout as usize,
         }
     }
 

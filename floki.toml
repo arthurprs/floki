@@ -2,5 +2,5 @@ bind_address="127.0.0.1:9797"
 data_directory="./data/"
 segment_size=128
 segments_prealocated=2
-checkpoint_interval=1000
 maintenance_timeout=1000
+max_connections=1024

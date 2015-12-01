@@ -640,9 +640,11 @@ impl Server {
         }
         debug!("Opening complete!");
 
+        let connections = Slab::new_starting_at(FIRST_CLIENT, server.config.max_connections);
+
         let server_handler = ServerHandler {
             server: server,
-            connections: Slab::new_starting_at(FIRST_CLIENT, 1024)
+            connections: connections,
         };
 
         (server_handler, event_loop)
@@ -777,21 +779,21 @@ impl Server {
             let connection_addr = stream.peer_addr().unwrap();
             trace!("incomming connection from {:?}", connection_addr);
 
-            // Don't buffer output in TCP - kills latency sensitive benchmarks
-            // TODO: use TCP_CORK
-            stream.set_nodelay(true).unwrap();
+            let token_opt = connections.insert_with(
+                |token| Connection::new(token, 0, stream));
 
-            let token = connections.insert_with(
-                |token| Connection::new(token, 0, stream)).unwrap();
+            if let Some(token) = token_opt {
+                info!("assigned token {:?} to client {:?}", token, connection_addr);
 
-            info!("assigned token {:?} to client {:?}", token, connection_addr);
-
-            event_loop.register_opt(
-                &connections[token].stream,
-                token,
-                connections[token].interest,
-                PollOpt::level()
-            ).unwrap();
+                event_loop.register_opt(
+                    &connections[token].stream,
+                    token,
+                    connections[token].interest,
+                    PollOpt::level()
+                ).unwrap();
+            } else {
+                warn!("dropping incomming connection from {:?}, max_connections reached", connection_addr);
+            }
         }
         true
     }
