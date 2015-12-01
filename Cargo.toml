@@ -18,7 +18,6 @@ fnv = "*"
 twox-hash = "*"
 spin = "*"
 rand = "*"
-string_cache = "*"
 
 [dependencies.nix]
 git="https://github.com/carllerche/nix-rust.git"

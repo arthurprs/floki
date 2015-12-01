@@ -22,7 +22,6 @@ extern crate twox_hash;
 extern crate spin;
 extern crate rand;
 extern crate tendril;
-extern crate string_cache;
 
 mod config;
 #[macro_use] mod utils;
