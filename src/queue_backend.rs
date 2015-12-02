@@ -404,7 +404,7 @@ impl QueueBackend {
         None
     }
 
-    /// returns the id that when requested will yield messages
+    /// returns the smallest id that when requested will yield messages
     /// with timestamps >= the requested timestamp
     fn find_id_for_timestamp(&self, timestamp: u32) -> u64 {
         let mut tail = self.tail;
@@ -613,7 +613,7 @@ mod tests {
         server_config.data_directory = "./test_data".into();
         server_config.segment_size = 4 * 1024 * 1024;
         let mut queue_config = server_config.new_queue_config(name);
-        queue_config.time_to_live = 1;
+        queue_config.message_timeout = 1;
         utils::create_dir_if_not_exist(&queue_config.data_directory).unwrap();
         QueueBackend::new(Rc::new(queue_config), recover)
     }

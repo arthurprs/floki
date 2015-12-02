@@ -14,9 +14,11 @@ pub const INDEX_EXTENSION: &'static str = "index";
 pub struct ServerConfig {
     pub data_directory: PathBuf,
     pub bind_address: String,
-    pub segment_size: u64,
     pub max_connections: usize,
-    pub maintenance_timeout: usize,
+    pub segment_size: u64,
+    pub maintenance_interval: u64,
+    pub message_timeout: u32,
+    pub retention_period: u32,
 }
 
 #[derive(Debug)]
@@ -24,7 +26,43 @@ pub struct QueueConfig {
     pub name: String,
     pub data_directory: PathBuf,
     pub segment_size: u64,
-    pub time_to_live: u32,
+    pub message_timeout: u32,
+    pub retention_period: u32,
+}
+
+
+fn split_number_suffix(s: &str) -> Result<(u64, &str), ()> {
+    let digits_end = s.chars().position(|c| !c.is_digit(10)).unwrap_or(0);
+    let (digits, suffix) = (&s[0..digits_end], &s[digits_end..]);
+    if let Ok(number) = digits.parse::<u64>() {
+        Ok((number, suffix))
+    } else {
+        Err(())
+    }
+}
+
+pub fn parse_duration(duration_text: &str) -> Result<u64, ()> {
+    let (number, suffix) = try!(split_number_suffix(duration_text));
+    let scale = match suffix.to_lowercase().as_ref() {
+        "ms" => 1,
+        "s" => 1000,
+        "m" => 1000 * 60,
+        "h" => 1000 * 60 * 60,
+        "d" => 1000 * 60 * 60 * 24,
+        _ => return Err(())
+    };
+    number.checked_mul(scale).ok_or(())
+}
+
+pub fn parse_size(size_text: &str) -> Result<u64, ()> {
+    let (number, suffix) = try!(split_number_suffix(size_text));
+    let scale = match suffix.to_lowercase().as_ref() {
+        "b" => 1,
+        "m" | "mb" => 1024,
+        "g" | "gb" => 1024 * 1024,
+        _ => return Err(())
+    };
+    number.checked_mul(scale).ok_or(())
 }
 
 impl ServerConfig {
@@ -40,18 +78,26 @@ impl ServerConfig {
 
         let bind_address = config.get("bind_address").unwrap().as_str().unwrap();
         let data_directory = config.get("data_directory").unwrap().as_str().unwrap();
-        let segment_size = config.get("segment_size").unwrap().as_integer().unwrap() as u64 * 1024 * 1024;
         let max_connections = config.get("max_connections").unwrap().as_integer().unwrap();
-        let maintenance_timeout = config.get("maintenance_timeout").unwrap().as_integer().unwrap();
+        let segment_size = parse_size(
+            config.get("segment_size").unwrap().as_str().unwrap()).unwrap();
+        let maintenance_interval = parse_duration(
+            config.get("maintenance_interval").unwrap().as_str().unwrap()).unwrap();
+        let message_timeout = parse_duration(
+            config.get("message_timeout").unwrap().as_str().unwrap()).unwrap();
+        let retention_period = parse_duration(
+            config.get("retention_period").unwrap().as_str().unwrap()).unwrap();
 
         assert!(segment_size <= 1 << 31, "segment_size must be <= 2GB");
 
         ServerConfig {
             data_directory: data_directory.into(),
             bind_address: bind_address.into(),
-            segment_size: segment_size,
             max_connections: max_connections as usize,
-            maintenance_timeout: maintenance_timeout as usize,
+            segment_size: segment_size,
+            maintenance_interval: maintenance_interval,
+            message_timeout: (message_timeout / 1000) as u32,
+            retention_period: (retention_period / 1000) as u32,
         }
     }
 
@@ -85,7 +131,8 @@ impl QueueConfig {
             name: name,
             data_directory: data_directory,
             segment_size: server_config.segment_size,
-            time_to_live: 30
+            message_timeout: server_config.message_timeout,
+            retention_period: server_config.retention_period,
         }
     }
 

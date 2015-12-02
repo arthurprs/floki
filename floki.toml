@@ -1,6 +1,7 @@
 bind_address="127.0.0.1:9797"
 data_directory="./data/"
-segment_size=128
-segments_prealocated=2
-maintenance_timeout=1000
+segment_size="128mb"
+maintenance_interval="1s"
 max_connections=1024
+message_timeout="30s"
+retention_period="30d"

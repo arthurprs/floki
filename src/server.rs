@@ -604,7 +604,7 @@ impl Server {
             EventSet::all() - EventSet::writable(), PollOpt::level()).unwrap();
 
         let maintenance_timeout = event_loop.timeout_ms(
-            (SERVER, TimeoutMessage::Maintenance), config.maintenance_timeout as u64).unwrap();
+            (SERVER, TimeoutMessage::Maintenance), config.maintenance_interval as u64).unwrap();
 
         let mut server = Server {
             listener: listener,
@@ -813,8 +813,7 @@ impl Server {
     fn notify(&mut self, connections: &mut Slab<Connection>, event_loop: &mut EventLoop<ServerHandler>, notification: NotifyType) -> bool {
         match notification.1 {
             NotifyMessage::MaintenanceDone => {
-                self.maintenance_timeout = event_loop.timeout_ms(
-                    (SERVER, TimeoutMessage::Maintenance), self.config.maintenance_timeout as u64).unwrap();
+                self.schedule_maintenance(event_loop);
             }
             NotifyMessage::QueueDelete{queue} => {
                 self.notify_queue_deleted(queue);
@@ -834,22 +833,31 @@ impl Server {
         true
     }
 
+    fn schedule_maintenance(&mut self, event_loop: &mut EventLoop<ServerHandler>) {
+        self.maintenance_timeout = event_loop.timeout_ms(
+            (SERVER, TimeoutMessage::Maintenance), self.config.maintenance_interval as u64).unwrap();
+    }
+
+    fn maintenance(&mut self, event_loop: &mut EventLoop<ServerHandler>) {
+        let queues = self.queues.clone();
+        let channel = event_loop.channel();
+        self.thread_pool.execute(move || {
+            let queue_names: Vec<_> = queues.read().keys().cloned().collect();
+            for queue_name in queue_names {
+                // get the shared lock for a brief moment
+                let q_opt = queues.read().get(&queue_name).cloned();
+                if let Some(q) = q_opt {
+                    q.as_mut().maintenance();
+                }
+            }
+            channel.send((Cookie::new(SERVER, 0), NotifyMessage::MaintenanceDone)).unwrap();
+        });
+    }
+
     fn timeout(&mut self, connections: &mut Slab<Connection>, event_loop: &mut EventLoop<ServerHandler>, timeout: TimeoutMessage) -> bool {
         match timeout {
             TimeoutMessage::Maintenance => {
-                let queues = self.queues.clone();
-                let channel = event_loop.channel();
-                self.thread_pool.execute(move || {
-                    let queue_names: Vec<_> = queues.read().keys().cloned().collect();
-                    for queue_name in queue_names {
-                        // get the shared lock for a brief moment
-                        let q_opt = queues.read().get(&queue_name).cloned();
-                        if let Some(q) = q_opt {
-                            q.as_mut().maintenance();
-                        }
-                    }
-                    channel.send((Cookie::new(SERVER, 0), NotifyMessage::MaintenanceDone)).unwrap();
-                });
+                self.maintenance(event_loop)
             },
             to => panic!("can't handle to {:?}", to)
         }

@@ -222,7 +222,7 @@ impl Queue {
                     let mut state = locked_channel.in_flight_map.remove(&ticket).unwrap();
                     let id = state.id;
                     let ticket = rand::random::<u64>();
-                    state.expiration = clock + self.config.time_to_live;
+                    state.expiration = clock + self.config.message_timeout;
                     locked_channel.in_flight_map.insert(ticket, state);
                     locked_channel.in_flight_heap.push((Rev(id), ticket));
                     debug!("[{}:{}] msg {} expired and will be sent again as ticket {}",
@@ -237,7 +237,7 @@ impl Queue {
                 let id = message.id();
                 let state = InFlightState {
                     id: id,
-                    expiration: clock + self.config.time_to_live,
+                    expiration: clock + self.config.message_timeout,
                 };
                 locked_channel.in_flight_map.insert(ticket, state);
                 locked_channel.in_flight_heap.push((Rev(id), ticket));
@@ -473,7 +473,7 @@ mod tests {
         server_config.data_directory = "./test_data".into();
         server_config.segment_size = 4 * 1024 * 1024;
         let mut queue_config = server_config.new_queue_config(name);
-        queue_config.time_to_live = 1;
+        queue_config.message_timeout = 1;
         Queue::new(queue_config, recover)
     }
 
