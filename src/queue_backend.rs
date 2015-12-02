@@ -427,6 +427,16 @@ impl QueueBackend {
     fn find_id_for_timestamp(&self, timestamp: u32) -> u64 {
         let mut tail = self.tail;
         let mut head = self.head;
+        // narrow search window using segment info, it may same some IO in the next step
+        for segment in self.segments.read().iter() {
+            if segment.first_timestamp < timestamp {
+                tail = segment.tail
+            }
+            if segment.last_timestamp > timestamp {
+                head = segment.head
+            }
+        }
+        // binary search style search inside the segments
         while head > tail {
             let id = tail + (head - tail) / 2;
             if let Some(msg) = self.get(id) {
