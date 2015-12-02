@@ -111,11 +111,11 @@ struct QueueBackendCheckpoint {
 
 #[derive(Debug)]
 pub struct Segment {
-    data_path: PathBuf,
+    file_path: PathBuf,
     // TODO: move mmaped file abstraction
     file: File,
     file_mmap: *mut u8,
-    file_size: u32,
+    file_len: u32,
     file_offset: u32,
     sync_offset: u32,
     // dirty_bytes: usize,
@@ -152,17 +152,17 @@ impl Segment {
     }
 
     fn create(config: &QueueConfig, start_id: u64) -> QueueBackendResult<Segment> {
-        let data_path = Self::gen_file_path(config, start_id, DATA_EXTENSION);
-        debug!("[{}] creating data file {:?}", config.name, data_path);
+        let file_path = Self::gen_file_path(config, start_id, DATA_EXTENSION);
+        debug!("[{}] creating data file {:?}", config.name, file_path);
         let file = try!(OpenOptions::new()
                 .read(true)
                 .write(true)
                 .create(true)
                 .truncate(true)
-                .open(&data_path));
+                .open(&file_path));
         try!(fallocate(&file, 0, config.segment_size));
 
-        let mut segment = try!(Self::new(config, file, data_path, start_id));
+        let mut segment = try!(Self::new(config, file, file_path, start_id));
         unsafe {
             *(segment.file_mmap as *mut u32) = MAGIC_NUM;
         }
@@ -172,34 +172,34 @@ impl Segment {
     }
 
     fn open(config: &QueueConfig, checkpoint: &SegmentCheckpoint) -> QueueBackendResult<Segment> {
-        let data_path = Self::gen_file_path(config, checkpoint.tail, DATA_EXTENSION);
-        debug!("[{}] opening data file {:?}", config.name, data_path);
-        let file = try!(OpenOptions::new().read(true).write(true).open(&data_path));
-        let mut segment = try!(Self::new(config, file, data_path, checkpoint.tail));
+        let file_path = Self::gen_file_path(config, checkpoint.tail, DATA_EXTENSION);
+        debug!("[{}] opening data file {:?}", config.name, file_path);
+        let file = try!(OpenOptions::new().read(true).write(true).open(&file_path));
+        let mut segment = try!(Self::new(config, file, file_path, checkpoint.tail));
         try!(segment.recover(checkpoint));
         Ok(segment)
     }
 
-    fn new(config: &QueueConfig, file: File, data_path: PathBuf, start_id: u64) -> QueueBackendResult<Segment> {
-        let file_size = try!(file.metadata()).len();
-        if file_size <= 4 {
+    fn new(config: &QueueConfig, file: File, file_path: PathBuf, start_id: u64) -> QueueBackendResult<Segment> {
+        let file_len = try!(file.metadata()).len();
+        if file_len <= 4 {
             return Err(QueueBackendError::SegmentFileInvalid)
         }
 
         let file_mmap = try!(mman::mmap(
-            ptr::null_mut(), file_size,
+            ptr::null_mut(), file_len,
             mman::PROT_READ | mman::PROT_WRITE, mman::MAP_SHARED,
             file.as_raw_fd(), 0)) as *mut u8;
         try!(mman::madvise(
             file_mmap as *mut c_void,
-            file_size,
+            file_len,
             mman::MADV_SEQUENTIAL));
 
         Ok(Segment {
-            data_path: data_path,
+            file_path: file_path,
             file: file,
             file_mmap: file_mmap,
-            file_size: file_size as u32,
+            file_len: file_len as u32,
             file_offset: 0,
             sync_offset: 0,
             tail: start_id,
@@ -243,7 +243,7 @@ impl Segment {
     fn push(&mut self, body: &[u8], clock: u32) -> QueueBackendResult<u64> {
         let message_total_len = size_of::<MessageHeader>() + body.len();
 
-        if message_total_len as u32 > self.file_size - self.file_offset {
+        if message_total_len as u32 > self.file_len - self.file_offset {
             self.closed = true;
             return Err(QueueBackendError::SegmentFull)
         }
@@ -264,9 +264,10 @@ impl Segment {
 
         self.file_offset += message_total_len as u32;
         self.head += 1;
-        self.index.lock().push_offset(id, self.file_offset - message_total_len as u32);
         // self.dirty_bytes += message_total_len;
         // self.dirty_messages += 1;
+        // push_offset is the sync point between readers and writers, do it last
+        self.index.lock().push_offset(id, self.file_offset - message_total_len as u32);
 
         Ok(id)
     }
@@ -280,7 +281,7 @@ impl Segment {
     }
 
     fn recover(&mut self, checkpoint: &SegmentCheckpoint) -> QueueBackendResult<()> {
-        debug!("[{:?}] checkpoint loaded: {:?}", self.data_path, checkpoint);
+        debug!("[{:?}] checkpoint loaded: {:?}", self.file_path, checkpoint);
         assert_eq!(self.tail, checkpoint.tail);
         self.tail = checkpoint.tail;
         self.head = checkpoint.tail;
@@ -295,36 +296,37 @@ impl Segment {
         self.file_offset = size_of::<u32>() as u32;
         unsafe {
             if *(self.file_mmap as *mut u32) != MAGIC_NUM {
-                warn!("[{:?}] incorrect magic number", self.data_path);
+                warn!("[{:?}] incorrect magic number", self.file_path);
                 *(self.file_mmap as *mut u32) = MAGIC_NUM
             }
         }
 
         let header_size = size_of::<MessageHeader>() as u32;
         let mut locked_index = self.index.lock();
-        while self.file_offset + header_size < self.file_size {
+        while self.file_offset + header_size < self.file_len {
             let header: &MessageHeader = unsafe {
                 mem::transmute(self.file_mmap.offset(self.file_offset as isize))
             };
+            let message_total_len = header_size + header.len;
             if header.id != self.head {
                 warn!("[{:?}] expected id {} got {} when recovering @{}",
-                    self.data_path, self.head, header.id, self.file_offset);
+                    self.file_path, self.head, header.id, self.file_offset);
                 break
             }
-            if self.file_offset + header_size + header.len < self.file_size {
+            if self.file_offset + message_total_len < self.file_len {
                 if header.hash != Self::hash_segment_message(header) {
                     warn!("[{:?}] corrupt message with id {} when recovering @{}",
-                        self.data_path, header.id, self.file_offset);
+                        self.file_path, header.id, self.file_offset);
                     break
                 }
             } else {
                 warn!("[{:?}] message with id {} would overflow file @{}",
-                    self.data_path, header.id, self.file_offset);
+                    self.file_path, header.id, self.file_offset);
                 break
             }
-            locked_index.push_offset(header.id, self.file_offset);
             self.file_offset += header_size + header.len;
             self.head += 1;
+            locked_index.push_offset(header.id, self.file_offset - message_total_len);
         }
 
         self.sync_offset = self.file_offset;
@@ -359,10 +361,10 @@ impl Segment {
 impl Drop for Segment {
     fn drop(&mut self) {
         let mmap = self.file_mmap as *mut c_void;
-        mman::madvise(mmap, self.file_size as u64, mman::MADV_DONTNEED).unwrap();
-        mman::munmap(mmap, self.file_size as u64).unwrap();
+        mman::madvise(mmap, self.file_len as u64, mman::MADV_DONTNEED).unwrap();
+        mman::munmap(mmap, self.file_len as u64).unwrap();
         if self.deleted {
-            remove_file_if_exist(&self.data_path).unwrap();
+            remove_file_if_exist(&self.file_path).unwrap();
         }
     }
 }
@@ -402,6 +404,26 @@ impl QueueBackend {
         None
     }
 
+    /// returns the id that when requested will yield messages
+    /// with timestamps >= the requested timestamp
+    fn find_id_for_timestamp(&self, timestamp: u32) -> u64 {
+        let mut tail = self.tail;
+        let mut head = self.head;
+        while head > tail {
+            let id = tail + (head - tail) / 2;
+            if let Some(msg) = self.get(id) {
+                if msg.timestamp() >= timestamp {
+                    head = id;
+                } else {
+                    tail = id + 1;
+                }
+            } else {
+                head = id;
+            }
+        }
+        return tail
+    }
+
     /// Put a message at the end of the Queue, return the message id if succesfull
     /// Note: it's the caller responsability to serialize write calls
     pub fn push(&mut self, body: &[u8], timestamp: u32) -> QueueBackendResult<u64> {
@@ -433,7 +455,7 @@ impl QueueBackend {
 
     /// Get a new message with the specified id
     /// if not possible, return the next available message
-    pub fn get(&mut self, id: u64) -> Option<Message> {
+    pub fn get(&self, id: u64) -> Option<Message> {
         if let Some(segment) = self.find_segment(id) {
             if let Ok(inner) = segment.get(cmp::max(id, segment.tail)) { 
                 return Some(Message {
@@ -609,6 +631,65 @@ mod tests {
     }
 
     #[test]
+    fn test_find_timestamp() {
+        let mut backend = get_backend();
+        let mut num_writes = 1u64;
+        while backend.segments_count() < 3 {
+            backend.push(gen_message(), num_writes as u32).unwrap();
+            num_writes += 1;
+        }
+
+        let get_timestamp = |timestamp: u32| {
+            backend.get(backend.find_id_for_timestamp(timestamp)).unwrap().timestamp()
+        };
+
+        assert_eq!(backend.find_id_for_timestamp(0), backend.tail);
+        assert_eq!(backend.find_id_for_timestamp(num_writes as u32), backend.head);
+        assert_eq!(get_timestamp(0), 1);
+
+        for ts in 1..num_writes as u32 {
+            assert_eq!(get_timestamp(ts), ts);
+        }
+
+        // remove middle file
+        backend.segments.write().remove(1);
+
+        for segment in backend.segments.read().iter() {
+            for ts in segment.tail as u32..segment.head as u32 {
+                assert_eq!(get_timestamp(ts), ts);
+            }
+        }
+    }
+
+    #[test]
+    fn test_find_timestamp2() {
+        let mut backend = get_backend();
+        let mut num_writes = 1u64;
+        while backend.segments_count() < 3 {
+            backend.push(gen_message(), (num_writes / 10) as u32).unwrap();
+            num_writes += 1;
+        }
+
+        assert_eq!(backend.find_id_for_timestamp(0), 1);
+        for id in 10..num_writes {
+            // must return the first id with timestamp >= requested timestamp
+            assert_eq!(backend.find_id_for_timestamp((id / 10) as u32), id - id % 10);
+        }
+    }
+
+    #[test]
+    fn test_find_timestamp3() {
+        let mut backend = get_backend();
+        // when empty
+        assert_eq!(backend.find_id_for_timestamp(0), backend.tail);
+        assert_eq!(backend.find_id_for_timestamp(100000), backend.tail);
+        // simulate get misses
+        backend.head = 10000;
+        assert_eq!(backend.find_id_for_timestamp(0), backend.tail);
+        assert_eq!(backend.find_id_for_timestamp(100000), backend.tail);
+    }
+
+    #[test]
     fn test_corrupt_files() {
         let mut backend = get_backend();
         let mut num_writes = 0;
@@ -620,12 +701,12 @@ mod tests {
         {
             // zero second half of first file
             let mut segment = backend.segments.read()[0].clone();
-            segment.as_mut().file.set_len(segment.file_size as u64 / 2).unwrap();
-            segment.as_mut().file.set_len(segment.file_size as u64).unwrap();
+            segment.as_mut().file.set_len(segment.file_len as u64 / 2).unwrap();
+            segment.as_mut().file.set_len(segment.file_len as u64).unwrap();
             // nuke the second
             segment = backend.segments.read()[1].clone();
             segment.as_mut().file.set_len(0).unwrap();
-            segment.as_mut().file.set_len(segment.file_size as u64).unwrap();
+            segment.as_mut().file.set_len(segment.file_len as u64).unwrap();
         }
 
         let mut backend = get_backend_recover();
@@ -696,13 +777,13 @@ mod tests {
             backend.checkpoint(true);
 
             let locked_segments = backend.segments.read();
-            locked_segments.iter().map(|s| s.data_path.clone()).collect()
+            locked_segments.iter().map(|s| s.file_path.clone()).collect()
         };
 
         for (segment_num, file_path) in file_paths.iter().enumerate() {
             fs::remove_file(&file_path).unwrap();
 
-            let mut backend = get_backend_recover();
+            let backend = get_backend_recover();
             let mut num_reads = 0;
             let mut id = 1;
             let mut holes = 0;
