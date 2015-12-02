@@ -432,7 +432,7 @@ impl Queue {
         }
     }
 
-    pub fn maintenance(&mut self) {
+    pub fn maintenance(&mut self, clock: u32) {
         let smallest_tail = {
             self.channels.read().unwrap().values()
                 .map(|c| c.lock().unwrap().real_tail())
@@ -443,7 +443,7 @@ impl Queue {
         debug!("[{}] smallest_tail is {}", self.config.name, smallest_tail);
 
         let r_lock = self.lock.read();
-        self.backend.gc(smallest_tail);
+        self.backend.gc(smallest_tail, clock);
         self.as_mut().checkpoint(false);
     }
 
@@ -472,6 +472,7 @@ mod tests {
         let mut server_config = ServerConfig::read();
         server_config.data_directory = "./test_data".into();
         server_config.segment_size = 4 * 1024 * 1024;
+        server_config.retention_period = 1;
         let mut queue_config = server_config.new_queue_config(name);
         queue_config.message_timeout = 1;
         Queue::new(queue_config, recover)
@@ -591,17 +592,20 @@ mod tests {
     fn test_gc() {
         let message = gen_message();
         let mut q = get_queue();
-        assert!(q.create_channel("test", 0).is_ok());
+        assert!(q.create_channel("test", 2).is_ok());
 
         while q.backend.segments_count() < 3 {
-            assert!(q.push(&message, 0).is_ok());
-            let r = q.get("test", 0);
+            assert!(q.push(&message, 2).is_ok());
+            let r = q.get("test", 2);
             assert!(r.is_ok());
-            assert!(q.ack("test", r.unwrap().0, 0).is_ok());
+            assert!(q.ack("test", r.unwrap().0, 2).is_ok());
         }
-        q.maintenance();
 
-        // gc should get rid of the first two segments
+        // retention period will keep segments from beeing deleted
+        q.maintenance(2);
+        assert_eq!(q.backend.segments_count(), 3);
+        // retention period expired, gc should get rid of the first two segments
+        q.maintenance(3);
         assert_eq!(q.backend.segments_count(), 1);
     }
 

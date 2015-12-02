@@ -25,11 +25,13 @@ use offset_index::*;
 use fallocate::*;
 
 const MAGIC_NUM: u32 = 0xF1031311u32;
+const INVALID_TIMESTAMP: u32 = 0;
 
 pub type QueueBackendResult<T> = Result<T, QueueBackendError>;
 
 #[derive(Debug)]
 pub enum QueueBackendError {
+    MessageTooBig,
     SegmentFull,
     SegmentFileInvalid,
     Io(io::Error),
@@ -46,7 +48,6 @@ impl From<nix::Error> for QueueBackendError {
         QueueBackendError::Io(from.into())
     }
 }
-
 
 #[derive(Debug, Clone)]
 struct InnerMessage {
@@ -118,13 +119,15 @@ pub struct Segment {
     file_len: u32,
     file_offset: u32,
     sync_offset: u32,
-    // dirty_bytes: usize,
-    // dirty_messages: usize,
+    first_timestamp: u32,
+    last_timestamp: u32,
     tail: u64,
     head: u64,
     closed: bool,
     deleted: bool,
     index: SpinLock<OffsetIndex>,
+    // dirty_bytes: usize,
+    // dirty_messages: usize,
 }
 
 #[derive(Debug)]
@@ -148,7 +151,7 @@ impl Segment {
                 size_of::<MessageHeader>() + header.len as usize - size_of::<u32>()
             ));
         }
-        (hasher.finish() & 0xFFFFFFFF) as u32
+        hasher.finish() as u32
     }
 
     fn create(config: &QueueConfig, start_id: u64) -> QueueBackendResult<Segment> {
@@ -202,13 +205,15 @@ impl Segment {
             file_len: file_len as u32,
             file_offset: 0,
             sync_offset: 0,
+            first_timestamp: INVALID_TIMESTAMP,
+            last_timestamp: INVALID_TIMESTAMP,
             tail: start_id,
             head: start_id,
-            // dirty_messages: 0,
-            // dirty_bytes: 0,
             closed: false,
             deleted: false,
             index: SpinLock::new(OffsetIndex::new(start_id))
+            // dirty_messages: 0,
+            // dirty_bytes: 0,
         })
     }
     
@@ -241,9 +246,13 @@ impl Segment {
     }
 
     fn push(&mut self, body: &[u8], clock: u32) -> QueueBackendResult<u64> {
-        let message_total_len = size_of::<MessageHeader>() + body.len();
+        let header_size = size_of::<MessageHeader>() as u32;
+        let message_total_len = header_size + body.len() as u32;
 
-        if message_total_len as u32 > self.file_len - self.file_offset {
+        if message_total_len > self.file_len - self.file_offset {
+            if message_total_len + size_of::<u32>() as u32 >= self.file_len {
+                return Err(QueueBackendError::MessageTooBig)
+            }
             self.closed = true;
             return Err(QueueBackendError::SegmentFull)
         }
@@ -262,12 +271,16 @@ impl Segment {
             header.hash = Self::hash_segment_message(header);
         }
 
-        self.file_offset += message_total_len as u32;
+        if self.first_timestamp == INVALID_TIMESTAMP {
+            self.first_timestamp = clock;
+        }
+        self.last_timestamp = clock;
+        self.file_offset += message_total_len;
         self.head += 1;
         // self.dirty_bytes += message_total_len;
         // self.dirty_messages += 1;
         // push_offset is the sync point between readers and writers, do it last
-        self.index.lock().push_offset(id, self.file_offset - message_total_len as u32);
+        self.index.lock().push_offset(id, self.file_offset - message_total_len);
 
         Ok(id)
     }
@@ -324,6 +337,11 @@ impl Segment {
                     self.file_path, header.id, self.file_offset);
                 break
             }
+
+            if self.first_timestamp == INVALID_TIMESTAMP {
+                self.first_timestamp = header.timestamp;
+            }
+            self.last_timestamp = header.timestamp;
             self.file_offset += header_size + header.len;
             self.head += 1;
             locked_index.push_offset(header.id, self.file_offset - message_total_len);
@@ -574,11 +592,14 @@ impl QueueBackend {
         }
     }
 
-    pub fn gc(&mut self, smallest_tail: u64) {
+    pub fn gc(&mut self, smallest_tail: u64, clock: u32) {
+        // collect until the first still open
+        // or with head > smallest_tail
+        // or has a message preserved by the retention period
+        let gc_after_timestamp = clock.saturating_sub(self.config.retention_period);
         let mut gc_seg_count = 0;
-        // collect until the first still open or with head > smallest_tail
         for segment in &*self.segments.read() {
-            if ! segment.closed || segment.head > smallest_tail {
+            if ! segment.closed || segment.head > smallest_tail || segment.first_timestamp > gc_after_timestamp {
                 break
             }
             gc_seg_count += 1;
@@ -590,8 +611,12 @@ impl QueueBackend {
             {
                 let mut locked_segments = self.segments.write();
                 gc_segments.extend(locked_segments.drain(..gc_seg_count));
+                if let Some(first_segment) = locked_segments.first() {
+                    self.tail = first_segment.tail;
+                } else {
+                    self.tail = self.head;
+                }
             }
-            self.tail = gc_segments.last().unwrap().head;
             for segment in gc_segments {
                 Self::wait_delete_segment(segment)
             }
@@ -612,6 +637,7 @@ mod tests {
         let mut server_config = ServerConfig::read();
         server_config.data_directory = "./test_data".into();
         server_config.segment_size = 4 * 1024 * 1024;
+        server_config.retention_period = 1;
         let mut queue_config = server_config.new_queue_config(name);
         queue_config.message_timeout = 1;
         utils::create_dir_if_not_exist(&queue_config.data_directory).unwrap();

@@ -655,11 +655,11 @@ impl Server {
         Cookie::new(token, self.nonce)
     }
 
-    fn wait_queue(&mut self, request: Value, queue: Atom, channel: Atom, token: Token, required_head: u64) {
-        debug!("wait_queue {:?} {:?} {:?} {:?}", queue, channel, token, required_head);
+    fn wait_queue(&mut self, request: Value, queue: Atom, channel: Atom, token: Token, required_tail: u64) {
+        debug!("wait_queue {:?} {:?} {:?} {:?}", queue, channel, token, required_tail);
         if let Some(w) = self.waiting_clients.get_mut(&queue) {
             if let Some(tokens)  = w.channels.get_mut(&channel) {
-                if required_head >= w.head {
+                if required_tail >= w.head {
                     tokens.push_back((token, request));
                     return;
                 } else {
@@ -841,13 +841,14 @@ impl Server {
     fn maintenance(&mut self, event_loop: &mut EventLoop<ServerHandler>) {
         let queues = self.queues.clone();
         let channel = event_loop.channel();
+        let clock = self.clock_s();
         self.thread_pool.execute(move || {
             let queue_names: Vec<_> = queues.read().keys().cloned().collect();
             for queue_name in queue_names {
                 // get the shared lock for a brief moment
                 let q_opt = queues.read().get(&queue_name).cloned();
                 if let Some(q) = q_opt {
-                    q.as_mut().maintenance();
+                    q.as_mut().maintenance(clock);
                 }
             }
             channel.send((Cookie::new(SERVER, 0), NotifyMessage::MaintenanceDone)).unwrap();
