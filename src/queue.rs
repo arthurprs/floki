@@ -495,7 +495,7 @@ mod tests {
         let mut q = get_queue();
         let message = gen_message();
         for i in 0..100_000 {
-            assert!(q.push(&message, 0).is_ok());
+            q.push(&message, 0).unwrap();
         }
     }
 
@@ -503,9 +503,9 @@ mod tests {
     fn test_put_get() {
         let mut q = get_queue();
         let message = gen_message();
-        assert!(q.create_channel("test", 0).is_ok());
+        q.create_channel("test", 0).unwrap();
         for i in 0..100_000 {
-            assert!(q.push(&message, 0).is_ok());
+            q.push(&message, 0).unwrap();
             let r = q.get("test", 0);
             assert!(r.unwrap().1.body() == message);
         }
@@ -515,23 +515,23 @@ mod tests {
     fn test_create_channel() {
         let mut q = get_queue();
         let message = gen_message();
-        assert!(q.get("test", 0).is_err());
-        assert!(q.push(&message, 0).is_ok());
-        assert!(q.create_channel("test", 0).is_ok());
+        q.get("test", 0).unwrap_err();
+        q.push(&message, 0).unwrap();
+        q.create_channel("test", 0).unwrap();
         assert_eq_repr!(q.create_channel("test", 0).unwrap_err(), QueueError::ChannelAlreadyExists);
-        assert!(q.get("test", 0).is_err());
-        assert!(q.push(&message, 0).is_ok());
-        assert!(q.get("test", 0).is_ok());
+        q.get("test", 0).unwrap_err();
+        q.push(&message, 0).unwrap();
+        q.get("test", 0).unwrap();
     }
 
     #[test]
     fn test_in_flight() {
         let mut q = get_queue();
-        assert!(q.create_channel("test", 0).is_ok());
+        q.create_channel("test", 0).unwrap();
         let message = gen_message();
-        assert!(q.push(&message, 1).is_ok());
-        assert!(q.get("test", 1).is_ok());
-        assert!(q.get("test", 1).is_err());
+        q.push(&message, 1).unwrap();
+        q.get("test", 1).unwrap();
+        q.get("test", 1).unwrap_err();
         assert_eq!(q.info(1).channels["test"].in_flight_count, 1);
         assert_eq!(q.info(2).channels["test"].in_flight_count, 0);
     }
@@ -540,21 +540,21 @@ mod tests {
     fn test_in_flight_timeout() {
         let mut q = get_queue();
         let message = gen_message();
-        assert!(q.create_channel("test", 0).is_ok());
-        assert!(q.push(&message, 0).is_ok());
-        assert!(q.get("test", 0).is_ok());
-        assert!(q.get("test", 0).is_err());
-        assert!(q.get("test", 1).is_ok());
+        q.create_channel("test", 0).unwrap();
+        q.push(&message, 0).unwrap();
+        q.get("test", 0).unwrap();
+        q.get("test", 0).unwrap_err();
+        q.get("test", 1).unwrap();
     }
 
     #[test]
     fn test_backend_recover() {
         let mut q = get_queue();
-        assert!(q.create_channel("test", 0).is_ok());
+        q.create_channel("test", 0).unwrap();
         let message = gen_message();
         let mut put_msg_count = 0;
         while q.backend.segments_count() < 3 {
-            assert!(q.push(&message, 0).is_ok());
+            q.push(&message, 0).unwrap();
             put_msg_count += 1;
         }
         q.checkpoint(true);
@@ -573,32 +573,31 @@ mod tests {
     fn test_queue_recover() {
         let mut q = get_queue();
         let message = gen_message();
-        assert!(q.create_channel("test", 0).is_ok());
-        assert!(q.push(&message, 0).is_ok());
-        assert!(q.push(&message, 0).is_ok());
-        assert!(q.get("test", 0).is_ok());
-        assert!(q.get("test", 0).is_ok());
-        assert!(q.get("test", 0).is_err());
+        q.create_channel("test", 0).unwrap();
+        q.push(&message, 0).unwrap();
+        q.push(&message, 0).unwrap();
+        q.get("test", 0).unwrap();
+        q.get("test", 0).unwrap();
+        q.get("test", 0).unwrap_err();
         q.checkpoint(true);
 
         q = get_queue_recover();
         assert_eq_repr!(q.create_channel("test", 0).unwrap_err(), QueueError::ChannelAlreadyExists);
-        assert!(q.get("test", 0).is_ok());
-        assert!(q.get("test", 0).is_ok());
-        assert!(q.get("test", 0).is_err());
+        q.get("test", 0).unwrap();
+        q.get("test", 0).unwrap();
+        q.get("test", 0).unwrap_err();
     }
 
     #[test]
     fn test_gc() {
         let message = gen_message();
         let mut q = get_queue();
-        assert!(q.create_channel("test", 2).is_ok());
+        q.create_channel("test", 2).unwrap();
 
         while q.backend.segments_count() < 3 {
-            assert!(q.push(&message, 2).is_ok());
-            let r = q.get("test", 2);
-            assert!(r.is_ok());
-            assert!(q.ack("test", r.unwrap().0, 2).is_ok());
+            q.push(&message, 2).unwrap();
+            let (ticket, _) = q.get("test", 2).unwrap();
+            q.ack("test", ticket, 2).unwrap();
         }
 
         // retention period will keep segments from beeing deleted
@@ -617,7 +616,7 @@ mod tests {
         b.bytes = (m.len() * n) as u64;
         b.iter(|| {
             for _ in 0..n {
-                assert!(q.push(m, 0).is_ok());
+                q.push(m, 0).unwrap();
             }
         });
     }
@@ -633,7 +632,7 @@ mod tests {
             for _ in 0..n {
                 let p = q.push(m, 0).unwrap();
                 let (ticket, gm) = q.get("test", 0).unwrap();
-                assert!(q.ack("test", ticket, 0).is_ok());
+                q.ack("test", ticket, 0).unwrap();
                 assert_eq!(p, gm.id());
             }
         });
