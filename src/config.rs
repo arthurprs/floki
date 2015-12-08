@@ -18,7 +18,7 @@ pub struct ServerConfig {
     pub bind_address: String,
     pub max_connections: usize,
     pub maintenance_interval: u64,
-    default_queue_config: QueueConfig,
+    pub default_queue_config: QueueConfig,
 }
 
 #[derive(Debug)]
@@ -61,8 +61,9 @@ pub fn parse_size(size_text: &str) -> Result<u64, ()> {
     let (number, suffix) = try!(split_number_suffix(size_text));
     let scale = match suffix.to_lowercase().as_ref() {
         "b" => 1,
-        "m" | "mb" => 1024,
-        "g" | "gb" => 1024 * 1024,
+        "k" | "kb" => 1024,
+        "m" | "mb" => 1024 * 1024,
+        "g" | "gb" => 1024 * 1024 * 1024,
         _ => return Err(())
     };
     number.checked_mul(scale).ok_or(())
@@ -103,7 +104,7 @@ impl ServerConfig {
 
         let bind_address = read_config!(config, "bind_address" => str);
         let data_directory = read_config!(config, "data_directory" => str);
-        let max_connections = read_config!(config, "data_directory" => int);
+        let max_connections = read_config!(config, "max_connections" => int);
         let segment_size = read_config!(config, "segment_size" => size);
         let maintenance_interval = read_config!(config, "maintenance_interval" => duration);
         let message_timeout = read_config!(config, "message_timeout" => duration);

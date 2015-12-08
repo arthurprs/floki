@@ -603,16 +603,30 @@ impl QueueBackend {
     }
 
     pub fn gc(&mut self, smallest_tail: u64, clock: u32) {
-        // collect until the first still open
-        // or with head > smallest_tail
-        // or has a message preserved by the retention period
-        let gc_after_timestamp = clock.saturating_sub(self.config.retention_period);
         let mut gc_seg_count = 0;
-        for segment in &*self.segments.read() {
-            if ! segment.closed || segment.head > smallest_tail || segment.first_timestamp > gc_after_timestamp {
-                break
+        {
+            let locked_segments = self.segments.read();
+            let mut total_rem_size = locked_segments.iter().map(|s| s.file_len as u64).sum::<u64>();
+            for segment in locked_segments.iter() {
+                if ! segment.closed {
+                    break
+                }
+
+                let contains_channel_msg = smallest_tail < segment.head;
+                let last_msg_age = clock - segment.last_timestamp;
+                let pass_hard_retention_period = last_msg_age <= self.config.hard_retention_period;
+                let pass_hard_retention_size = total_rem_size <= self.config.hard_retention_size;
+                let pass_retention_period = last_msg_age <= self.config.retention_period;
+                let pass_retention_size = total_rem_size <= self.config.retention_size;
+
+                if pass_hard_retention_period && pass_hard_retention_size {
+                    if contains_channel_msg || pass_retention_period || pass_retention_size {
+                        break
+                    }
+                }
+                gc_seg_count += 1;
+                total_rem_size -= segment.file_len as u64;
             }
-            gc_seg_count += 1;
         }
         if gc_seg_count != 0 {
             info!("[{}] {} segments available for gc", self.config.name, gc_seg_count);
@@ -646,8 +660,9 @@ mod tests {
     fn get_backend_opt(name: &str, recover: bool) -> QueueBackend {
         let mut server_config = ServerConfig::read();
         server_config.data_directory = "./test_data".into();
-        server_config.segment_size = 4 * 1024 * 1024;
-        server_config.retention_period = 1;
+        server_config.default_queue_config.segment_size = 4 * 1024 * 1024;
+        server_config.default_queue_config.retention_period = 1;
+        server_config.default_queue_config.hard_retention_period = 2;
         let mut queue_config = server_config.new_queue_config(name);
         queue_config.message_timeout = 1;
         utils::create_dir_if_not_exist(&queue_config.data_directory).unwrap();
@@ -724,6 +739,49 @@ mod tests {
         assert_eq!(backend.find_id_for_timestamp(0), backend.tail);
         assert_eq!(backend.find_id_for_timestamp(100000), backend.tail);
     }
+
+    #[test]
+    fn test_retention_period() {
+        let mut backend = get_backend();
+        while backend.segments_count() < 3 {
+            let msg_timestamp = backend.segments_count() as u32;
+            backend.push(gen_message(), msg_timestamp).unwrap();
+        }
+        let head = backend.head;
+        // check segments last timestamps to validade the tests bellow
+        assert_eq!(backend.segments.read()[0].last_timestamp, 1);
+        assert_eq!(backend.segments.read()[1].last_timestamp, 2);
+        assert_eq!(backend.segments.read()[2].last_timestamp, 2);
+
+        // retention period will keep segments from beeing deleted
+        backend.gc(1, 2);
+        assert_eq!(backend.segments_count(), 3);
+        backend.gc(head, 2);
+        assert_eq!(backend.segments_count(), 3);
+        // soft retention period expired, gc should get rid of the first segment
+        // but only if it's cleared by the smallest tail
+        backend.gc(1, 3);
+        assert_eq!(backend.segments_count(), 3);
+        backend.gc(head, 3);
+        assert_eq!(backend.segments_count(), 2);
+        // hard retention period will forcefully purge the second segment
+        // leaving only the last, which is still open
+        backend.gc(head, 4);
+        assert_eq!(backend.segments_count(), 1);
+    }
+
+    // #[test]
+    // fn test_hard_retention_period() {
+    //     let mut backend = get_backend();
+    //     while backend.segments_count() < 3 {
+    //         backend.push(gen_message(), 1).unwrap();
+    //     }
+    //     let head = backend.head;
+
+    //     // har retention period will purge old segments even if not cleared by the smallest tail
+    //     backend.gc(1, 4);
+    //     assert_eq!(backend.segments_count(), 1);
+    // }
 
     #[test]
     fn test_corrupt_files() {

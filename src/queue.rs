@@ -471,8 +471,9 @@ mod tests {
     fn get_queue_opt(name: &str, recover: bool) -> Queue {
         let mut server_config = ServerConfig::read();
         server_config.data_directory = "./test_data".into();
-        server_config.segment_size = 4 * 1024 * 1024;
-        server_config.retention_period = 1;
+        server_config.default_queue_config.segment_size = 4 * 1024 * 1024;
+        server_config.default_queue_config.retention_period = 1;
+        server_config.default_queue_config.hard_retention_period = 2;
         let mut queue_config = server_config.new_queue_config(name);
         queue_config.message_timeout = 1;
         Queue::new(queue_config, recover)
@@ -493,9 +494,8 @@ mod tests {
     #[test]
     fn test_fill() {
         let mut q = get_queue();
-        let message = gen_message();
         for i in 0..100_000 {
-            q.push(&message, 0).unwrap();
+            q.push(gen_message(), 0).unwrap();
         }
     }
 
@@ -514,13 +514,12 @@ mod tests {
     #[test]
     fn test_create_channel() {
         let mut q = get_queue();
-        let message = gen_message();
         q.get("test", 0).unwrap_err();
-        q.push(&message, 0).unwrap();
+        q.push(gen_message(), 0).unwrap();
         q.create_channel("test", 0).unwrap();
         assert_eq_repr!(q.create_channel("test", 0).unwrap_err(), QueueError::ChannelAlreadyExists);
         q.get("test", 0).unwrap_err();
-        q.push(&message, 0).unwrap();
+        q.push(gen_message(), 0).unwrap();
         q.get("test", 0).unwrap();
     }
 
@@ -528,8 +527,7 @@ mod tests {
     fn test_in_flight() {
         let mut q = get_queue();
         q.create_channel("test", 0).unwrap();
-        let message = gen_message();
-        q.push(&message, 1).unwrap();
+        q.push(gen_message(), 1).unwrap();
         q.get("test", 1).unwrap();
         q.get("test", 1).unwrap_err();
         assert_eq!(q.info(1).channels["test"].in_flight_count, 1);
@@ -539,9 +537,8 @@ mod tests {
     #[test]
     fn test_in_flight_timeout() {
         let mut q = get_queue();
-        let message = gen_message();
         q.create_channel("test", 0).unwrap();
-        q.push(&message, 0).unwrap();
+        q.push(gen_message(), 0).unwrap();
         q.get("test", 0).unwrap();
         q.get("test", 0).unwrap_err();
         q.get("test", 1).unwrap();
@@ -551,10 +548,9 @@ mod tests {
     fn test_backend_recover() {
         let mut q = get_queue();
         q.create_channel("test", 0).unwrap();
-        let message = gen_message();
         let mut put_msg_count = 0;
         while q.backend.segments_count() < 3 {
-            q.push(&message, 0).unwrap();
+            q.push(gen_message(), 0).unwrap();
             put_msg_count += 1;
         }
         q.checkpoint(true);
@@ -572,10 +568,9 @@ mod tests {
     #[test]
     fn test_queue_recover() {
         let mut q = get_queue();
-        let message = gen_message();
         q.create_channel("test", 0).unwrap();
-        q.push(&message, 0).unwrap();
-        q.push(&message, 0).unwrap();
+        q.push(gen_message(), 0).unwrap();
+        q.push(gen_message(), 0).unwrap();
         q.get("test", 0).unwrap();
         q.get("test", 0).unwrap();
         q.get("test", 0).unwrap_err();
@@ -589,21 +584,20 @@ mod tests {
     }
 
     #[test]
-    fn test_gc() {
-        let message = gen_message();
+    fn test_maintenance() {
         let mut q = get_queue();
-        q.create_channel("test", 2).unwrap();
+        q.create_channel("test", 1).unwrap();
 
         while q.backend.segments_count() < 3 {
-            q.push(&message, 2).unwrap();
-            let (ticket, _) = q.get("test", 2).unwrap();
-            q.ack("test", ticket, 2).unwrap();
+            q.push(gen_message(), 1).unwrap();
+            let (ticket, _) = q.get("test", 1).unwrap();
+            q.ack("test", ticket, 1).unwrap();
         }
 
         // retention period will keep segments from beeing deleted
         q.maintenance(2);
         assert_eq!(q.backend.segments_count(), 3);
-        // retention period expired, gc should get rid of the first two segments
+        // retention period expired, gc should get rid of the first two segment
         q.maintenance(3);
         assert_eq!(q.backend.segments_count(), 1);
     }
@@ -611,7 +605,7 @@ mod tests {
     #[bench]
     fn put_like_crazy(b: &mut test::Bencher) {
         let mut q = get_queue();
-        let m = &gen_message();
+        let m = gen_message();
         let n = 10000;
         b.bytes = (m.len() * n) as u64;
         b.iter(|| {
