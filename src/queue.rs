@@ -1,4 +1,4 @@
-use std::sync::{Mutex, RwLock};
+use std::sync::Mutex;
 use std::collections::{BTreeMap, BinaryHeap};
 use std::collections::hash_map::Entry;
 use std::io::{Read, Write};
@@ -86,7 +86,7 @@ struct Channel {
 struct InnerQueue {
     config: QueueConfig,
     backend: QueueBackend,
-    channels: RwLock<HashMap<String, Mutex<Channel>>>,
+    channels: HashMap<String, Mutex<Channel>>,
     state: QueueState,
 }
 
@@ -113,11 +113,11 @@ impl Queue {
     }
 
     pub fn create_channel(&self, channel_name: &str, clock: u32) -> QueueResult<()> {
-        self.inner.read().create_channel(channel_name, clock)
+        self.inner.lock().create_channel(channel_name, clock)
     }
 
     pub fn delete_channel(&self, channel_name: &str) -> QueueResult<()> {
-        self.inner.read().delete_channel(channel_name)
+        self.inner.lock().delete_channel(channel_name)
     }
 
     pub fn purge_channel(&self, channel_name: &str) -> QueueResult<()> {
@@ -216,7 +216,7 @@ impl InnerQueue {
         let mut queue = InnerQueue {
             config: config.clone(),
             backend: QueueBackend::new(config, recover),
-            channels: RwLock::new(Default::default()),
+            channels: Default::default(),
             state: QueueState::Ready,
         };
         if recover {
@@ -238,9 +238,8 @@ impl InnerQueue {
         self.state = new_state;
     }
 
-    pub fn create_channel(&self, channel_name: &str, clock: u32) -> QueueResult<()> {
-        let mut locked_channels = self.channels.write().unwrap();
-        if let Entry::Vacant(vacant_entry) = locked_channels.entry(channel_name.into()) {
+    pub fn create_channel(&mut self, channel_name: &str, clock: u32) -> QueueResult<()> {
+        if let Entry::Vacant(vacant_entry) = self.channels.entry(channel_name.into()) {
             let channel = Channel {
                 last_touched: clock,
                 expired_count: 0,
@@ -256,9 +255,8 @@ impl InnerQueue {
         }
     }
 
-    pub fn delete_channel(&self, channel_name: &str) -> QueueResult<()> {
-        let mut locked_channels = self.channels.write().unwrap();
-        if locked_channels.remove(channel_name).is_some() {
+    pub fn delete_channel(&mut self, channel_name: &str) -> QueueResult<()> {
+        if self.channels.remove(channel_name).is_some() {
             Ok(())
         } else {
             Err(QueueError::ChannelNotFound)
@@ -266,8 +264,7 @@ impl InnerQueue {
     }
 
     pub fn purge_channel(&self, channel_name: &str) -> QueueResult<()> {
-        let locked_channels = self.channels.write().unwrap();
-        if let Some(channel) = locked_channels.get(channel_name) {
+        if let Some(channel) = self.channels.get(channel_name) {
             channel.lock().unwrap().purge(self.backend.head());
             Ok(())
         } else {
@@ -277,8 +274,7 @@ impl InnerQueue {
 
     /// get access is suposed to be thread-safe, even while writing
     pub fn get(&self, channel_name: &str, clock: u32) -> QueueResult<(u64, Message)> {
-        let locked_channels = self.channels.read().unwrap();
-        if let Some(channel) = locked_channels.get(channel_name) {
+        if let Some(channel) = self.channels.get(channel_name) {
             let mut locked_channel = channel.lock().unwrap();
 
             locked_channel.last_touched = clock;
@@ -343,8 +339,7 @@ impl InnerQueue {
 
     /// ack access is suposed to be thread-safe, even while writing
     pub fn ack(&self, channel_name: &str, ticket: u64, clock: u32) -> QueueResult<()> {
-        let locked_channels = self.channels.read().unwrap();
-        if let Some(channel) = locked_channels.get(channel_name) {
+        if let Some(channel) = self.channels.get(channel_name) {
             let mut locked_channel = channel.lock().unwrap();
             locked_channel.last_touched = clock;
 
@@ -373,7 +368,7 @@ impl InnerQueue {
     pub fn purge(&mut self) {
         info!("[{}] purging", self.config.name);
         self.backend.purge();
-        for (_, channel) in self.channels.write().unwrap().iter_mut() {
+        for (_, channel) in &mut self.channels {
             let mut locked_channel = channel.lock().unwrap();
             locked_channel.tail = self.backend.tail();
             locked_channel.in_flight_map.clear();
@@ -389,7 +384,7 @@ impl InnerQueue {
             channels: Default::default(),
             segments_count: self.backend.segments_count() as u32,
         };
-        for (channel_name, channel) in self.channels.write().unwrap().iter() {
+        for (channel_name, channel) in &self.channels {
             let mut locked_channel = channel.lock().unwrap();
             q_info.channels.insert(channel_name.clone(), ChannelInfo{
                 last_touched: locked_channel.last_touched,
@@ -438,9 +433,8 @@ impl InnerQueue {
 
         match self.state {
             QueueState::Ready => {
-                let mut locked_channels = self.channels.write().unwrap();
                 for (channel_name, channel_checkpoint) in queue_checkpoint.channels {
-                    locked_channels.insert(
+                    self.channels.insert(
                         channel_name,
                         Mutex::new(Channel {
                             last_touched: channel_checkpoint.last_touched,
@@ -466,8 +460,7 @@ impl InnerQueue {
 
         if self.state == QueueState::Ready {
             self.backend.checkpoint(full);
-            let locked_channels = self.channels.read().unwrap();
-            for (channel_name, channel) in locked_channels.iter() {
+            for (channel_name, channel) in &self.channels {
                 let locked_channel = channel.lock().unwrap();
                 checkpoint.channels.insert(
                     channel_name.clone(),
@@ -500,7 +493,7 @@ impl InnerQueue {
 
     pub fn maintenance(&mut self, clock: u32) {
         let smallest_tail = {
-            self.channels.read().unwrap().values()
+            self.channels.values()
                 .map(|c| c.lock().unwrap().real_tail())
                 .min()
                 .unwrap_or(0)
