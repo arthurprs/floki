@@ -1,5 +1,4 @@
 #![allow(dead_code)]
-#![allow(unused_variables)]
 #![feature(iter_arith)]
 #![feature(hashmap_hasher)]
 #![feature(drain)]

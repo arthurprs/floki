@@ -9,7 +9,6 @@ use std::time::Duration;
 use std::os::unix::io::{RawFd, AsRawFd};
 use std::fs::{self, File, OpenOptions};
 use std::path::PathBuf;
-use std::rc::Rc;
 use std::sync::Arc;
 use nix::c_void;
 use nix::sys::mman;
@@ -132,7 +131,7 @@ pub struct Segment {
 
 #[derive(Debug)]
 pub struct QueueBackend {
-    config: Rc<QueueConfig>,
+    config: QueueConfig,
     segments: SpinRwLock<Vec<Arc<Segment>>>,
     head: u64,
     tail: u64
@@ -183,7 +182,7 @@ impl Segment {
         Ok(segment)
     }
 
-    fn new(config: &QueueConfig, file: File, file_path: PathBuf, start_id: u64) -> QueueBackendResult<Segment> {
+    fn new(_: &QueueConfig, file: File, file_path: PathBuf, start_id: u64) -> QueueBackendResult<Segment> {
         let file_len = try!(file.metadata()).len();
         if file_len <= 4 {
             return Err(QueueBackendError::SegmentFileInvalid)
@@ -236,7 +235,6 @@ impl Segment {
             "Corrupt file, message end offset {} is past file offset {}", message_end_offset, self.file_offset);
         assert!(header.id == id,
             "Corrupt file, ids don't match {} {} at offset {}", header.id, id, message_offset);
-        let mmap_ptr = unsafe { self.file_mmap.offset(message_offset as isize + size_of::<MessageHeader>() as isize) };
 
         let message = InnerMessage {
             mmap_ptr: header,
@@ -388,7 +386,7 @@ impl Drop for Segment {
 }
 
 impl QueueBackend {
-    pub fn new(config: Rc<QueueConfig>, recover: bool) -> QueueBackend {
+    pub fn new(config: QueueConfig, recover: bool) -> QueueBackend {
         let mut backend = QueueBackend {
             config: config,
             segments: SpinRwLock::new(Vec::new()),
@@ -654,7 +652,6 @@ mod tests {
     use config::*;
     use std::fs;
     use std::thread;
-    use std::rc::Rc;
     use utils;
 
     fn get_backend_opt(name: &str, recover: bool) -> QueueBackend {
@@ -666,7 +663,7 @@ mod tests {
         let mut queue_config = server_config.new_queue_config(name);
         queue_config.message_timeout = 1;
         utils::create_dir_if_not_exist(&queue_config.data_directory).unwrap();
-        QueueBackend::new(Rc::new(queue_config), recover)
+        QueueBackend::new(queue_config, recover)
     }
 
     fn get_backend() -> QueueBackend {

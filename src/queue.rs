@@ -4,7 +4,6 @@ use std::collections::hash_map::Entry;
 use std::io::{Read, Write};
 use std::fs::{self, File};
 use std::mem;
-use std::rc::Rc;
 use rustc_serialize::json;
 
 use config::*;
@@ -48,7 +47,8 @@ pub struct ChannelInfo {
 pub struct QueueInfo {
     pub head: u64,
     pub tail: u64,
-    pub channels: BTreeMap<String, ChannelInfo>
+    pub channels: BTreeMap<String, ChannelInfo>,
+    pub segments_count: u32,
 }
 
 #[derive(Debug, Eq, PartialEq, RustcDecodable, RustcEncodable)]
@@ -72,7 +72,7 @@ struct InFlightState {
 }
 
 #[derive(Debug)]
-pub struct Channel {
+struct Channel {
     last_touched: u32,
     expired_count: u32,
     tail: u64,
@@ -83,12 +83,94 @@ pub struct Channel {
 }
 
 #[derive(Debug)]
-pub struct Queue {
-    config: Rc<QueueConfig>,
-    lock: TristateLock<()>,
+struct InnerQueue {
+    config: QueueConfig,
     backend: QueueBackend,
     channels: RwLock<HashMap<String, Mutex<Channel>>>,
     state: QueueState,
+}
+
+pub struct Queue {
+    name: String,
+    inner: TristateLock<InnerQueue>,
+    maintenance_mutex: Mutex<()>,
+}
+
+unsafe impl Send for Queue {}
+unsafe impl Sync for Queue {}
+
+impl Queue {
+    pub fn new(config: QueueConfig, recover: bool) -> Queue {
+        Queue{
+            name: config.name.clone(),
+            inner: TristateLock::new(InnerQueue::new(config, recover)),
+            maintenance_mutex: Mutex::new(()),
+        }
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn create_channel(&self, channel_name: &str, clock: u32) -> QueueResult<()> {
+        self.inner.read().create_channel(channel_name, clock)
+    }
+
+    pub fn delete_channel(&self, channel_name: &str) -> QueueResult<()> {
+        self.inner.read().delete_channel(channel_name)
+    }
+
+    pub fn purge_channel(&self, channel_name: &str) -> QueueResult<()> {
+        self.inner.read().purge_channel(channel_name)
+    }
+
+    /// get access is suposed to be thread-safe, even while writing
+    pub fn get(&self, channel_name: &str, clock: u32) -> QueueResult<(u64, Message)> {
+        self.inner.read().get(channel_name, clock)
+    }
+
+    /// all calls are serialized internally
+    pub fn push(&self, message: &[u8], clock: u32) -> QueueResult<u64> {
+        self.inner.write().push(message, clock)
+    }
+
+    /// all calls are serialized internally
+    pub fn push_many(&self, messages: &[&[u8]], clock: u32) -> QueueResult<u64> {
+        self.inner.write().push_many(messages, clock)
+    }
+
+    /// ack access is suposed to be thread-safe, even while writing
+    pub fn ack(&self, channel_name: &str, ticket: u64, clock: u32) -> QueueResult<()> {
+        self.inner.read().ack(channel_name, ticket, clock)
+    }
+
+    pub fn purge(&self) {
+        self.inner.lock().purge()
+    }
+
+    pub fn info(&self, clock: u32) -> QueueInfo {
+        self.inner.read().info(clock)
+    }
+
+    pub fn delete(&self) {
+        self.inner.lock().delete()
+    }
+
+    #[allow(mutable_transmutes)]
+    pub fn checkpoint(&self, full: bool) {
+        let maintenance_lock = self.maintenance_mutex.lock().unwrap();
+        let inner: &mut InnerQueue = unsafe { mem::transmute(&*self.inner.read()) };
+        inner.checkpoint(full);
+        drop(maintenance_lock)
+    }
+
+    #[allow(mutable_transmutes)]
+    pub fn maintenance(&self, clock: u32) {
+        let maintenance_lock = self.maintenance_mutex.lock().unwrap();
+        let inner: &mut InnerQueue = unsafe { mem::transmute(&*self.inner.read()) };
+        inner.maintenance(clock);
+        drop(maintenance_lock);
+    }
 }
 
 impl Channel {
@@ -124,21 +206,16 @@ impl Channel {
     }
 }
 
-unsafe impl Sync for Queue {}
-unsafe impl Send for Queue {}
-
-impl Queue {
-    pub fn new(config: QueueConfig, recover: bool) -> Queue {
+impl InnerQueue {
+    pub fn new(config: QueueConfig, recover: bool) -> InnerQueue {
         if ! recover {
             remove_dir_if_exist(&config.data_directory).unwrap();
         }
         create_dir_if_not_exist(&config.data_directory).unwrap();
 
-        let rc_config = Rc::new(config);
-        let mut queue = Queue {
-            config: rc_config.clone(),
-            lock: TristateLock::new(()),
-            backend: QueueBackend::new(rc_config.clone(), recover),
+        let mut queue = InnerQueue {
+            config: config.clone(),
+            backend: QueueBackend::new(config, recover),
             channels: RwLock::new(Default::default()),
             state: QueueState::Ready,
         };
@@ -148,10 +225,6 @@ impl Queue {
            queue.checkpoint(false);
         }
         queue
-    }
-
-    pub fn name(&self) -> &str {
-        &self.config.name
     }
 
     fn set_state(&mut self, new_state: QueueState) {
@@ -165,8 +238,7 @@ impl Queue {
         self.state = new_state;
     }
 
-    pub fn create_channel(&mut self, channel_name: &str, clock: u32) -> QueueResult<()> {
-        let r_lock = self.lock.read();
+    pub fn create_channel(&self, channel_name: &str, clock: u32) -> QueueResult<()> {
         let mut locked_channels = self.channels.write().unwrap();
         if let Entry::Vacant(vacant_entry) = locked_channels.entry(channel_name.into()) {
             let channel = Channel {
@@ -184,7 +256,7 @@ impl Queue {
         }
     }
 
-    pub fn delete_channel(&mut self, channel_name: &str) -> QueueResult<()> {
+    pub fn delete_channel(&self, channel_name: &str) -> QueueResult<()> {
         let mut locked_channels = self.channels.write().unwrap();
         if locked_channels.remove(channel_name).is_some() {
             Ok(())
@@ -193,10 +265,9 @@ impl Queue {
         }
     }
 
-    pub fn purge_channel(&mut self, channel_name: &str) -> QueueResult<()> {
+    pub fn purge_channel(&self, channel_name: &str) -> QueueResult<()> {
         let locked_channels = self.channels.write().unwrap();
         if let Some(channel) = locked_channels.get(channel_name) {
-            let r_lock = self.lock.read();
             channel.lock().unwrap().purge(self.backend.head());
             Ok(())
         } else {
@@ -205,8 +276,7 @@ impl Queue {
     }
 
     /// get access is suposed to be thread-safe, even while writing
-    pub fn get(&mut self, channel_name: &str, clock: u32) -> QueueResult<(u64, Message)> {
-        let r_lock = self.lock.read();
+    pub fn get(&self, channel_name: &str, clock: u32) -> QueueResult<(u64, Message)> {
         let locked_channels = self.channels.read().unwrap();
         if let Some(channel) = locked_channels.get(channel_name) {
             let mut locked_channel = channel.lock().unwrap();
@@ -257,14 +327,12 @@ impl Queue {
 
     /// all calls are serialized internally
     pub fn push(&mut self, message: &[u8], clock: u32) -> QueueResult<u64> {
-        let w_lock = self.lock.write();
         trace!("[{}] putting message w/ clock {}", self.config.name, clock);
         Ok(try!(self.backend.push(message, clock)))
     }
 
     /// all calls are serialized internally
     pub fn push_many(&mut self, messages: &[&[u8]], clock: u32) -> QueueResult<u64> {
-        let w_lock = self.lock.write();
         trace!("[{}] putting {} messages w/ clock {}", self.config.name, messages.len(), clock);
         assert!(messages.len() > 0);
         for message in &messages[..messages.len() - 1] {
@@ -274,7 +342,7 @@ impl Queue {
     }
 
     /// ack access is suposed to be thread-safe, even while writing
-    pub fn ack(&mut self, channel_name: &str, ticket: u64, clock: u32) -> QueueResult<()> {
+    pub fn ack(&self, channel_name: &str, ticket: u64, clock: u32) -> QueueResult<()> {
         let locked_channels = self.channels.read().unwrap();
         if let Some(channel) = locked_channels.get(channel_name) {
             let mut locked_channel = channel.lock().unwrap();
@@ -304,7 +372,6 @@ impl Queue {
 
     pub fn purge(&mut self) {
         info!("[{}] purging", self.config.name);
-        let x_lock = self.lock.lock();
         self.backend.purge();
         for (_, channel) in self.channels.write().unwrap().iter_mut() {
             let mut locked_channel = channel.lock().unwrap();
@@ -316,11 +383,11 @@ impl Queue {
     }
 
     pub fn info(&self, clock: u32) -> QueueInfo {
-        let r_lock = self.lock.read();
         let mut q_info = QueueInfo {
             tail: self.backend.tail(),
             head: self.backend.head(),
-            channels: Default::default()
+            channels: Default::default(),
+            segments_count: self.backend.segments_count() as u32,
         };
         for (channel_name, channel) in self.channels.write().unwrap().iter() {
             let mut locked_channel = channel.lock().unwrap();
@@ -336,7 +403,6 @@ impl Queue {
 
     pub fn delete(&mut self) {
         info!("[{}] deleting", self.config.name);
-        let x_lock = self.lock.lock();
         self.as_mut().set_state(QueueState::Deleting);
         self.as_mut().checkpoint(false);
         self.backend.delete();
@@ -442,7 +508,6 @@ impl Queue {
 
         debug!("[{}] smallest_tail is {}", self.config.name, smallest_tail);
 
-        let r_lock = self.lock.read();
         self.backend.gc(smallest_tail, clock);
         self.as_mut().checkpoint(false);
     }
@@ -453,7 +518,7 @@ impl Queue {
     }
 }
 
-impl Drop for Queue {
+impl Drop for InnerQueue {
     fn drop(&mut self) {
         if self.state != QueueState::Deleting {
             self.checkpoint(true)
@@ -493,18 +558,18 @@ mod tests {
 
     #[test]
     fn test_fill() {
-        let mut q = get_queue();
-        for i in 0..100_000 {
+        let q = get_queue();
+        for _ in 0..100_000 {
             q.push(gen_message(), 0).unwrap();
         }
     }
 
     #[test]
     fn test_put_get() {
-        let mut q = get_queue();
+        let q = get_queue();
         let message = gen_message();
         q.create_channel("test", 0).unwrap();
-        for i in 0..100_000 {
+        for _ in 0..100_000 {
             q.push(&message, 0).unwrap();
             let r = q.get("test", 0);
             assert!(r.unwrap().1.body() == message);
@@ -513,7 +578,7 @@ mod tests {
 
     #[test]
     fn test_create_channel() {
-        let mut q = get_queue();
+        let q = get_queue();
         q.get("test", 0).unwrap_err();
         q.push(gen_message(), 0).unwrap();
         q.create_channel("test", 0).unwrap();
@@ -525,7 +590,7 @@ mod tests {
 
     #[test]
     fn test_in_flight() {
-        let mut q = get_queue();
+        let q = get_queue();
         q.create_channel("test", 0).unwrap();
         q.push(gen_message(), 1).unwrap();
         q.get("test", 1).unwrap();
@@ -536,7 +601,7 @@ mod tests {
 
     #[test]
     fn test_in_flight_timeout() {
-        let mut q = get_queue();
+        let q = get_queue();
         q.create_channel("test", 0).unwrap();
         q.push(gen_message(), 0).unwrap();
         q.get("test", 0).unwrap();
@@ -549,7 +614,7 @@ mod tests {
         let mut q = get_queue();
         q.create_channel("test", 0).unwrap();
         let mut put_msg_count = 0;
-        while q.backend.segments_count() < 3 {
+        while q.info(0).segments_count < 3 {
             q.push(gen_message(), 0).unwrap();
             put_msg_count += 1;
         }
@@ -557,7 +622,7 @@ mod tests {
 
         q = get_queue_recover();
         assert_eq_repr!(q.create_channel("test", 1).unwrap_err(), QueueError::ChannelAlreadyExists);
-        assert_eq!(q.backend.segments_count(), 3);
+        assert_eq!(q.info(0).segments_count, 3);
         let mut get_msg_count = 0;
         while let Ok(_) = q.get("test", 0) {
             get_msg_count += 1;
@@ -585,10 +650,10 @@ mod tests {
 
     #[test]
     fn test_maintenance() {
-        let mut q = get_queue();
+        let q = get_queue();
         q.create_channel("test", 1).unwrap();
 
-        while q.backend.segments_count() < 3 {
+        while q.info(1).segments_count < 3 {
             q.push(gen_message(), 1).unwrap();
             let (ticket, _) = q.get("test", 1).unwrap();
             q.ack("test", ticket, 1).unwrap();
@@ -596,15 +661,15 @@ mod tests {
 
         // retention period will keep segments from beeing deleted
         q.maintenance(2);
-        assert_eq!(q.backend.segments_count(), 3);
+        assert_eq!(q.info(2).segments_count, 3);
         // retention period expired, gc should get rid of the first two segment
         q.maintenance(3);
-        assert_eq!(q.backend.segments_count(), 1);
+        assert_eq!(q.info(3).segments_count, 1);
     }
 
     #[bench]
     fn put_like_crazy(b: &mut test::Bencher) {
-        let mut q = get_queue();
+        let q = get_queue();
         let m = gen_message();
         let n = 10000;
         b.bytes = (m.len() * n) as u64;
@@ -617,7 +682,7 @@ mod tests {
 
     #[bench]
     fn put_get_like_crazy(b: &mut test::Bencher) {
-        let mut q = get_queue();
+        let q = get_queue();
         let m = &gen_message();
         let n = 10000;
         q.create_channel("test", 0).unwrap();

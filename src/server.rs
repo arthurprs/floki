@@ -171,36 +171,39 @@ impl Dispatch {
     fn delete_queue(&self, q: Arc<Queue>) {
         debug!("deleting queue {:?}", q.name());
         let meta_lock = self.meta_lock.lock().unwrap();
-        let q = self.queues.write().remove(q.name()).unwrap();
+        let q = self.queues.write().remove(&*q.name()).unwrap();
         self.notify_server(NotifyMessage::QueueDelete{
             queue: q.name().into(),
         });
-        q.as_mut().delete();
+        drop(meta_lock);
+        q.delete();
     }
 
     fn delete_channel(&self, q: &Queue, channel_name: &str) -> QueueResult<()> {
         debug!("deleting queue {:?} channel {:?}", q.name(), channel_name);
         let meta_lock = self.meta_lock.lock().unwrap();
-        let result = q.as_mut().delete_channel(channel_name);
+        let result = q.delete_channel(channel_name);
         if result.is_ok() {
             self.notify_server(NotifyMessage::ChannelDelete{
                 queue: q.name().into(),
                 channel: channel_name.into(),
             });
         }
+        drop(meta_lock);
         result
     }
 
     fn create_channel(&self, q: &Queue, channel_name: &str) -> QueueResult<()> {
         info!("creating queue {:?} channel {:?}", q.name(), channel_name);
         let meta_lock = self.meta_lock.lock().unwrap();
-        let result = q.as_mut().create_channel(channel_name, self.clock);
+        let result = q.create_channel(channel_name, self.clock);
         if result.is_ok() {
             self.notify_server(NotifyMessage::ChannelCreate{
                 queue: q.name().into(),
                 channel: channel_name.into(),
             });
         }
+        drop(meta_lock);
         result
     }
 
@@ -210,7 +213,7 @@ impl Dispatch {
         }
 
         let meta_lock = self.meta_lock.lock().unwrap();
-        self.queues.write().entry(name.into()).or_insert_with(|| {
+        let queue = self.queues.write().entry(name.into()).or_insert_with(|| {
             info!("Creating queue {:?}", name);
             let inner_queue = Queue::new(self.config.new_queue_config(name), false);
             debug!("Done creating queue {:?}", name);
@@ -220,7 +223,9 @@ impl Dispatch {
             });
 
             Arc::new(inner_queue)
-        }).clone()
+        }).clone();
+        drop(meta_lock);
+        queue
     }
 
     fn notify_server(&self, notification: NotifyMessage) {
@@ -248,7 +253,7 @@ impl Dispatch {
 
         let mut results = Vec::with_capacity(count);
         for _ in 0..count {
-            match q.as_mut().get(channel_name, self.clock) {
+            match q.get(channel_name, self.clock) {
                 Ok(ticket_message) => {
                     results.push(Value::Message(ticket_message));
                 },
@@ -285,7 +290,7 @@ impl Dispatch {
         let q = try_or_error!(self.get_queue(queue_name).ok_or(()), "QNF Queue Not Found");
 
         // get one by one, this contributes for fairness avoiding starving consumers
-        match q.as_mut().get(channel_name, self.clock) {
+        match q.get(channel_name, self.clock) {
             Ok(ticket_message) => {
                 NotifyMessage::with_value(Value::Message(ticket_message))
             },
@@ -325,7 +330,7 @@ impl Dispatch {
 
         debug!("inserting {} msgs into {:?}",
             messages.len(), queue_name);
-        let last_id = try_or_error!(q.as_mut().push_many(messages, self.clock));
+        let last_id = try_or_error!(q.push_many(messages, self.clock));
         trace!("inserted {} messages into {:?} with last id {:?}",
             messages.len(), queue_name, last_id);
 
@@ -347,7 +352,7 @@ impl Dispatch {
         let mut successfully = 0;
         for ticket_arg in &args[3..] {
             let ticket = try_or_error!(assume_str(ticket_arg).parse::<u64>(), "IPA Invalid Ticket");
-            if q.as_mut().ack(channel_name, ticket, self.clock).is_ok() {
+            if q.ack(channel_name, ticket, self.clock).is_ok() {
                 successfully += 1
             }
         }
@@ -385,10 +390,10 @@ impl Dispatch {
 
         match channel_name {
             "*" => {
-                q.as_mut().purge();
+                q.purge();
             },
             channel_name => {
-                try_or_int!(q.as_mut().purge_channel(channel_name), 0);
+                try_or_int!(q.purge_channel(channel_name), 0);
             },
         }
 
@@ -848,7 +853,7 @@ impl Server {
                 // get the shared lock for a brief moment
                 let q_opt = queues.read().get(&queue_name).cloned();
                 if let Some(q) = q_opt {
-                    q.as_mut().maintenance(clock);
+                    q.maintenance(clock);
                 }
             }
             channel.send((Cookie::new(SERVER, 0), NotifyMessage::MaintenanceDone)).unwrap();

@@ -21,7 +21,7 @@ pub struct ServerConfig {
     pub default_queue_config: QueueConfig,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct QueueConfig {
     pub name: String,
     pub data_directory: PathBuf,
