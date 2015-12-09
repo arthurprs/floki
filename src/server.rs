@@ -437,7 +437,7 @@ impl Dispatch {
 
 impl Connection {
 
-    fn new(token: Token, nonce: u64, stream: TcpStream) -> Connection {
+    fn new(token: Token, stream: TcpStream) -> Connection {
         Connection {
             token: token,
             stream: stream,
@@ -451,7 +451,7 @@ impl Connection {
         }
     }
 
-    fn send_response(&mut self, value: Value, server: &mut Server, event_loop: &mut EventLoop<ServerHandler>) {
+    fn send_response(&mut self, value: Value, event_loop: &mut EventLoop<ServerHandler>) {
         self.response.push_value(value);
         self.interest = EventSet::all() - EventSet::readable();
         event_loop.reregister(&self.stream, self.token, self.interest, PollOpt::level()).unwrap();
@@ -483,15 +483,13 @@ impl Connection {
         }
 
         if events.is_readable() {
-            let is_complete = {
-                while let Ok(bytes_read) = self.stream.read(self.request.mut_bytes()) {
-                    if bytes_read == 0 {
-                        break
-                    }
-                    self.request.advance(bytes_read);
-                    trace!("filled request with {} bytes, remaining: {}", bytes_read, self.request.remaining());
+            while let Ok(bytes_read) = self.stream.read(self.request.mut_bytes()) {
+                if bytes_read == 0 {
+                    break
                 }
-            };
+                self.request.advance(bytes_read);
+                trace!("filled request with {} bytes, remaining: {}", bytes_read, self.request.remaining());
+            }
             if self.try_parse_request(server, event_loop).is_err() {
                 return false
             }
@@ -531,7 +529,7 @@ impl Connection {
                 let deadline = self.request_clock_ms + (timeout as u64 * 1000);
                 let clock = server.clock_ms();
                 if clock >= deadline {
-                    self.send_response(Value::Nil, server, event_loop);
+                    self.send_response(Value::Nil, event_loop);
                 } else {
                     let timeout_msg = TimeoutMessage::Timeout{
                         queue: queue.clone(),
@@ -544,11 +542,11 @@ impl Connection {
                 }
             },
             NotifyMessage::PutResponse{response, queue, head} => {
-                self.send_response(response, server, event_loop);
+                self.send_response(response, event_loop);
                 server.notify_queue(queue, head);
             },
             NotifyMessage::Response{response} => {
-                self.send_response(response, server, event_loop);
+                self.send_response(response, event_loop);
             },
             msg => panic!("can't handle msg {:?}", msg)
         }
@@ -562,9 +560,9 @@ impl Connection {
                 assert!(self.processing.is_none());
                 assert!(self.timeout.take().is_some());
                 server.notify_timeout(queue, channel, self.token);
-                self.send_response(Value::Nil, server, event_loop);
+                self.send_response(Value::Nil, event_loop);
             },
-            to => panic!("can't handle to {:?}", to)
+            _ => panic!("can't handle timeout {:?}", timeout)
         }
         true
     }
@@ -784,8 +782,7 @@ impl Server {
             let connection_addr = stream.peer_addr().unwrap();
             trace!("incomming connection from {:?}", connection_addr);
 
-            let token_opt = connections.insert_with(
-                |token| Connection::new(token, 0, stream));
+            let token_opt = connections.insert_with(|token| Connection::new(token, stream));
 
             if let Some(token) = token_opt {
                 info!("assigned token {:?} to client {:?}", token, connection_addr);
@@ -815,7 +812,7 @@ impl Server {
         self.internal_clock_ms = 0;
     }
 
-    fn notify(&mut self, connections: &mut Slab<Connection>, event_loop: &mut EventLoop<ServerHandler>, notification: NotifyType) -> bool {
+    fn notify(&mut self, event_loop: &mut EventLoop<ServerHandler>, notification: NotifyType) -> bool {
         match notification.1 {
             NotifyMessage::MaintenanceDone => {
                 self.schedule_maintenance(event_loop);
@@ -860,12 +857,12 @@ impl Server {
         });
     }
 
-    fn timeout(&mut self, connections: &mut Slab<Connection>, event_loop: &mut EventLoop<ServerHandler>, timeout: TimeoutMessage) -> bool {
+    fn timeout(&mut self, event_loop: &mut EventLoop<ServerHandler>, timeout: TimeoutMessage) -> bool {
         match timeout {
             TimeoutMessage::Maintenance => {
                 self.maintenance(event_loop)
             },
-            to => panic!("can't handle to {:?}", to)
+            _ => panic!("can't handle timeout {:?}", timeout)
         }
         true
     }
@@ -917,7 +914,7 @@ impl Handler for ServerHandler {
         let token = notification.0.token();
         trace!("notify event for token {:?} with {:?}", token, notification.1);
         let is_ok = match token {
-            SERVER => self.server.notify(&mut self.connections, event_loop, notification),
+            SERVER => self.server.notify(event_loop, notification),
             token => if let Some(connection) = self.connections.get_mut(token) {
                 connection.notify(&mut self.server, event_loop, notification)
             } else {
@@ -941,7 +938,7 @@ impl Handler for ServerHandler {
         let token = timeout.0;
         trace!("timeout event for token {:?} with {:?}", token, timeout.1);
         let is_ok = match token {
-            SERVER => self.server.timeout(&mut self.connections, event_loop, timeout.1),
+            SERVER => self.server.timeout(event_loop, timeout.1),
             token => if let Some(connection) = self.connections.get_mut(token) {
                 connection.timeout(&mut self.server, event_loop, timeout.1)
             } else {
@@ -956,7 +953,7 @@ impl Handler for ServerHandler {
     }
 
     #[inline]
-    fn interrupted(&mut self, event_loop: &mut EventLoop<Self>) {
+    fn interrupted(&mut self, _: &mut EventLoop<Self>) {
         panic!("interrupted");
     }
 }
