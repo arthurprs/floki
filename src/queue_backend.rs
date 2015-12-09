@@ -499,8 +499,13 @@ impl QueueBackend {
     }
 
     fn wait_delete_segment(segment: Arc<Segment>) {
+        let mut wait_count = 0;
         while Arc::strong_count(&segment) > 1 {
             thread::sleep(Duration::from_millis(100));
+            wait_count += 1;
+            if wait_count % 10 == 0 {
+                warn!("Still waiting for Segment {:?} to be freed {}", segment, wait_count);
+            }
         }
         segment.as_mut().purge()
     }
