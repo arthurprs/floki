@@ -284,7 +284,11 @@ impl Segment {
     }
 
     fn sync(&mut self, full: bool) {
-        let sync_offset = if full { self.file_offset } else { self.file_offset.saturating_sub(1024 * 1024) };
+        let sync_offset = if full || self.closed {
+            self.file_offset
+        } else {
+            self.file_offset.saturating_sub(1024 * 1024)
+        };
         if sync_offset > 0 && sync_offset > self.sync_offset {
             mman::msync(self.file_mmap as *mut c_void, sync_offset as u64, mman::MS_SYNC).unwrap();
             self.sync_offset = sync_offset;
