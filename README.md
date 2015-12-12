@@ -5,21 +5,31 @@
 
 **Atention, this is a work in progress and completely unusable at this point**
 
-Floki borrows concepts from both Kafka and Amazon SQS into an easy to use package. Queues have independent channels and are fully persisted to disk. Clients talk to it using Redis protocol and commands, so all Redis exiting clients can be used.
+Floki borrows concepts from both Kafka and Amazon SQS into an easy to use package. Queues have independent channels which allow efficient fanout and are persisted to disk. Clients talk to it using Redis protocol and commands, so all Redis exiting clients can be used. Althought there's no replication or clustering support and it might never have.
+
+The design is based in a single thread to handle all networking using an async io and the actual commands are dispatched to a thread pool for execution. State is kept in-memory and checkpointed to disk periodically, queue storage is based on a whrite ahead log splited into segments.
+
+I started this project in order to evaluate Rust capabilities in a real world project which I thought it could shine and once you get used to the rust way it indeed does.
 
 ## Goals
 - [x] Redis protocol
 - [x] Multiple Queues
-- [x] Multiple Channels per Queue (efficient fanout)
+- [x] Multiple Channels per Queue (for efficient fanout)
 - [x] Disk Backed
 - [x] Runs on most Unix systems
 - [x] Crash resistant
-- [ ] Hardened internals
+- [x] Soft and Hard retention periods
+- [x] Soft and Hard retention sizes
+- [ ] Channel seek, with either ID or timestamp
 
 ## TODO
 - [x] Ticket based Acknowledgement
-- [ ] Map commands to Redis commands in a sensible way
-- [ ] Better error handling (wip)
+- [ ] Map Floki commands to Redis commands in a sensible way
+- [x] Better error handling
 - [ ] Lots of documentation
 - [ ] Opt-in persistency guarantee (needs group commit-ish implementation)
 - [ ] Make internal data structures size-bounded, based on configurations
+
+# Copyright and License
+
+Code released under the [MIT license](LICENSE).
