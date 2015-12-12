@@ -251,6 +251,7 @@ impl Dispatch {
         };
         let q = try_or_error!(self.get_queue(queue_name).ok_or(()), "QNF Queue Not Found");
 
+        // get one by one, this contributes for fairness avoiding starving consumers
         let mut results = Vec::with_capacity(count);
         for _ in 0..count {
             match q.get(channel_name, self.clock) {
@@ -258,8 +259,8 @@ impl Dispatch {
                     results.push(Value::Message(ticket_message));
                 },
                 Err(QueueError::EndOfQueue(required_head)) => {
-                    // block only if we have no results
-                    if results.is_empty() {
+                    // block only if timeout is set and we have no results
+                    if timeout != 0 && results.is_empty() {
                         return NotifyMessage::GetWouldBlock{
                             request: self.request.clone(),
                             queue: q.name().into(),
@@ -274,38 +275,6 @@ impl Dispatch {
             }
         }
         NotifyMessage::with_value(Value::Array(results))
-    }
-
-    fn hget(&self, args: &[&[u8]]) -> NotifyMessage {
-        if args.len() < 3 {
-            return NotifyMessage::with_error("MPA Queue or Channel Missing")
-        }
-        let queue_name = assume_str(args[1]);
-        let channel_name = assume_str(args[2]);
-        let timeout = if let Some(arg) = args.get(3) {
-            try_or_error!(assume_str(arg).parse::<u32>(), "IPA Invalid timeout value")
-        } else {
-            0
-        };
-        let q = try_or_error!(self.get_queue(queue_name).ok_or(()), "QNF Queue Not Found");
-
-        // get one by one, this contributes for fairness avoiding starving consumers
-        match q.get(channel_name, self.clock) {
-            Ok(ticket_message) => {
-                NotifyMessage::with_value(Value::Message(ticket_message))
-            },
-            Err(QueueError::EndOfQueue(required_head)) => {
-                debug!("queue {:?} channel {:?} has no messages", queue_name, channel_name);
-                NotifyMessage::GetWouldBlock{
-                    request: self.request.clone(),
-                    queue: q.name().into(),
-                    channel: channel_name.into(),
-                    required_head: required_head,
-                    timeout: timeout,
-                }
-            },
-            Err(error) => return error.into()
-        }
     }
 
     fn mset(&self, args: &[&[u8]]) -> NotifyMessage {
@@ -421,13 +390,12 @@ impl Dispatch {
 
         let args_slice = &args[..argc];
         let notification = match assume_str(args[0]) {
-            "RPUSH" => self.rpush(args_slice),
-            "HGET" => self.hget(args_slice),
-            "HMGET" => self.hmget(args_slice),
-            "HDEL" => self.hdel(args_slice),
-            "MSET" => self.mset(args_slice),
-            "DEL" => self.del(args_slice),
-            "SREM" => self.srem(args_slice),
+            "RPUSH" => self.rpush(args_slice), // push one or more messages
+            "HMGET" => self.hmget(args_slice), // get one or more messages
+            "HDEL" => self.hdel(args_slice), // ack messages
+            "MSET" => self.mset(args_slice), // create queue/channel
+            "DEL" => self.del(args_slice), // delete queue/channel
+            "SREM" => self.srem(args_slice), // purge queue/channel
             _ => NotifyMessage::with_error("UCOM Unknown Command")
         };
 
