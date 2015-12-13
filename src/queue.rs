@@ -156,6 +156,16 @@ impl Queue {
         self.inner.lock().delete()
     }
 
+    /// Set the channel tail to the specified id
+    pub fn seek_channel_to_id(&self, channel_name: &str, id: u64, clock: u32) -> QueueResult<()> {
+        self.inner.read().seek_channel_to_id(channel_name, id, clock)
+    }
+
+    /// Set the channel tail to the specified timestamp
+    pub fn seek_channel_to_timestamp(&self, channel_name: &str, timestamp: u32, clock: u32) -> QueueResult<()> {
+        self.inner.read().seek_channel_to_timestamp(channel_name, timestamp, clock)
+    }
+
     #[allow(mutable_transmutes)]
     pub fn checkpoint(&self, full: bool) {
         let maintenance_lock = self.maintenance_mutex.lock().unwrap();
@@ -359,6 +369,28 @@ impl InnerQueue {
                     .map_or(false, |&(_, ticket)| !locked_channel.in_flight_map.contains_key(&ticket)) {
                 locked_channel.in_flight_heap.pop();
             }
+            Ok(())
+        } else {
+            Err(QueueError::ChannelNotFound)
+        }
+    }
+
+    /// Set the channel tail to the specified id
+    pub fn seek_channel_to_id(&self, channel_name: &str, id: u64, clock: u32) -> QueueResult<()> {
+        if let Some(channel) = self.channels.get(channel_name) {
+            let mut locked_channel = channel.lock().unwrap();
+            locked_channel.tail = id;
+            Ok(())
+        } else {
+            Err(QueueError::ChannelNotFound)
+        }
+    }
+
+    /// Set the channel tail to the specified timestamp
+    pub fn seek_channel_to_timestamp(&self, channel_name: &str, timestamp: u32, clock: u32) -> QueueResult<()> {
+        if let Some(channel) = self.channels.get(channel_name) {
+            let mut locked_channel = channel.lock().unwrap();
+            locked_channel.tail = self.backend.find_id_for_timestamp(timestamp);
             Ok(())
         } else {
             Err(QueueError::ChannelNotFound)

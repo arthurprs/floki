@@ -104,7 +104,7 @@ struct SegmentCheckpoint {
     closed: bool,
 }
 
-#[derive(Debug, Default, RustcDecodable, RustcEncodable)]
+#[derive(Debug, Default, Eq, PartialEq, RustcDecodable, RustcEncodable)]
 struct QueueBackendCheckpoint {
     segments: Vec<SegmentCheckpoint>
 }
@@ -426,7 +426,7 @@ impl QueueBackend {
 
     /// returns the smallest id that when requested will yield messages
     /// with timestamps >= the requested timestamp
-    fn find_id_for_timestamp(&self, timestamp: u32) -> u64 {
+    pub fn find_id_for_timestamp(&self, timestamp: u32) -> u64 {
         let mut tail = self.tail;
         let mut head = self.head;
         // narrow search window using segment info, it may same some IO in the next step

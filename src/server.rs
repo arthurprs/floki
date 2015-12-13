@@ -236,6 +236,28 @@ impl Dispatch {
         self.channel.send((self.cookie, notification)).unwrap();
     }
 
+    fn hmset(&self, args: &[&[u8]]) -> NotifyMessage {
+        if args.len() < 5 {
+            return NotifyMessage::with_error("MPA Queue or Channel or TS|ID or Value Missing")
+        }
+        let queue_name = assume_str(args[1]);
+        let channel_name = assume_str(args[2]);
+        let seek_type = assume_str(args[3]);
+        let seek_value_str = assume_str(args[4]);
+        let q = try_or_error!(self.get_queue(queue_name).ok_or(()), "QNF Queue Not Found");
+
+        match seek_type {
+            "ts" | "TS" => {
+                let timestamp = try_or_error!(seek_value_str.parse::<u32>(), "IPA Invalid Timestamp");
+                try_or_error!(q.seek_channel_to_timestamp(channel_name, timestamp, self.clock))
+            },
+            "id" | "ID" => {
+                let id = try_or_error!(seek_value_str.parse::<u64>(), "IPA Invalid ID");
+                try_or_error!(q.seek_channel_to_id(channel_name, id, self.clock))
+            },
+            _ => return NotifyMessage::with_error("IPA Invalid Seek Type Expected TS or ID")
+        }
+    }
 
     fn hmget(&self, args: &[&[u8]]) -> NotifyMessage {
         if args.len() < 4 {
@@ -391,6 +413,7 @@ impl Dispatch {
         let args_slice = &args[..argc];
         let notification = match assume_str(args[0]) {
             "RPUSH" => self.rpush(args_slice), // push one or more messages
+            "HMSET" => self.hmset(args_slice), // seek channel to the specified ts or id
             "HMGET" => self.hmget(args_slice), // get one or more messages
             "HDEL" => self.hdel(args_slice), // ack messages
             "MSET" => self.mset(args_slice), // create queue/channel
