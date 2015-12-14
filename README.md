@@ -3,11 +3,11 @@
 [![Build Status](https://travis-ci.org/arthurprs/floki.svg)](https://travis-ci.org/arthurprs/floki)
 [![Coverage Status](https://coveralls.io/repos/arthurprs/floki/badge.svg?branch=master&service=github)](https://coveralls.io/github/arthurprs/floki?branch=master)
 
-**Atention, this is a work in progress and completely unusable at this point**
+**Atention, this is a work in progress and probably unusable at this point**
 
 Floki borrows concepts from both Kafka and Amazon SQS into an easy to use package. Queues have independent channels which allow efficient fanout and are persisted to disk. Clients talk to it using Redis protocol and commands, so all Redis exiting clients can be used. Althought there's no replication or clustering support and it might never have.
 
-The design is based in a single thread to handle all networking using an async io and the actual commands are dispatched to a thread pool for execution. State is kept in-memory and checkpointed to disk periodically, queue storage is based on a whrite ahead log splited into segments.
+The design is based on a single thread to handle all networking using an async io but the actual commands are dispatched to a thread pool for execution. State is kept in-memory and checkpointed to disk periodically, queue storage is based on a Whrite Ahead Log splited into segments.
 
 I started this project in order to evaluate Rust capabilities in a real world project which I thought it could shine and once you get used to the rust way it indeed does.
 
