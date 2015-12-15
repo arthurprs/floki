@@ -20,7 +20,7 @@ I started this project in order to evaluate Rust capabilities in a real world pr
 - [x] Crash resistant
 - [x] Soft and Hard retention periods
 - [x] Soft and Hard retention sizes
-- [ ] Channel seek, with either ID or timestamp
+- [x] Channel seek, with either ID or timestamp
 
 ## TODO
 - [x] Ticket based Acknowledgement
