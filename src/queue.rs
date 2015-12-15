@@ -77,9 +77,9 @@ struct Channel {
     expired_count: u32,
     tail: u64,
     // keeps track of the messages in flight (possibly expired) by their ticket in LRU order
-    in_flight_map: LinkedHashMap<u64, InFlightState>,
+    in_flight_map: LinkedHashMap<i64, InFlightState>,
     // keeps track of the smallest in flight ids and their tickets (possibly expired)
-    in_flight_heap: BinaryHeap<(Rev<u64>, u64)>,
+    in_flight_heap: BinaryHeap<(Rev<u64>, i64)>,
 }
 
 #[derive(Debug)]
@@ -125,7 +125,7 @@ impl Queue {
     }
 
     /// get access is suposed to be thread-safe, even while writing
-    pub fn get(&self, channel_name: &str, clock: u32) -> QueueResult<(u64, Message)> {
+    pub fn get(&self, channel_name: &str, clock: u32) -> QueueResult<(i64, Message)> {
         self.inner.read().get(channel_name, clock)
     }
 
@@ -140,7 +140,7 @@ impl Queue {
     }
 
     /// ack access is suposed to be thread-safe, even while writing
-    pub fn ack(&self, channel_name: &str, ticket: u64, clock: u32) -> QueueResult<()> {
+    pub fn ack(&self, channel_name: &str, ticket: i64, clock: u32) -> QueueResult<()> {
         self.inner.read().ack(channel_name, ticket, clock)
     }
 
@@ -283,7 +283,7 @@ impl InnerQueue {
     }
 
     /// get access is suposed to be thread-safe, even while writing
-    pub fn get(&self, channel_name: &str, clock: u32) -> QueueResult<(u64, Message)> {
+    pub fn get(&self, channel_name: &str, clock: u32) -> QueueResult<(i64, Message)> {
         if let Some(channel) = self.channels.get(channel_name) {
             let mut locked_channel = channel.lock().unwrap();
 
@@ -297,7 +297,8 @@ impl InnerQueue {
                     }
                     let mut state = locked_channel.in_flight_map.remove(&ticket).unwrap();
                     let id = state.id;
-                    let ticket = rand::random::<u64>();
+                    // make sure ticket is in i64 range
+                    let ticket = rand::random::<i64>();
                     state.expiration = clock + self.config.message_timeout;
                     locked_channel.in_flight_map.insert(ticket, state);
                     locked_channel.in_flight_heap.push((Rev(id), ticket));
@@ -309,7 +310,7 @@ impl InnerQueue {
 
             // fetch from the backend
             return if let Some(message) = self.backend.get(locked_channel.tail) {
-                let ticket = rand::random::<u64>();
+                let ticket = rand::random::<i64>();
                 let id = message.id();
                 let state = InFlightState {
                     id: id,
@@ -348,7 +349,7 @@ impl InnerQueue {
     }
 
     /// ack access is suposed to be thread-safe, even while writing
-    pub fn ack(&self, channel_name: &str, ticket: u64, clock: u32) -> QueueResult<()> {
+    pub fn ack(&self, channel_name: &str, ticket: i64, clock: u32) -> QueueResult<()> {
         if let Some(channel) = self.channels.get(channel_name) {
             let mut locked_channel = channel.lock().unwrap();
             locked_channel.last_touched = clock;

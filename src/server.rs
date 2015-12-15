@@ -249,14 +249,15 @@ impl Dispatch {
         match seek_type {
             "ts" | "TS" => {
                 let timestamp = try_or_error!(seek_value_str.parse::<u32>(), "IPA Invalid Timestamp");
-                try_or_error!(q.seek_channel_to_timestamp(channel_name, timestamp, self.clock))
+                try_or_error!(q.seek_channel_to_timestamp(channel_name, timestamp, self.clock));
             },
             "id" | "ID" => {
                 let id = try_or_error!(seek_value_str.parse::<u64>(), "IPA Invalid ID");
-                try_or_error!(q.seek_channel_to_id(channel_name, id, self.clock))
+                try_or_error!(q.seek_channel_to_id(channel_name, id, self.clock));
             },
             _ => return NotifyMessage::with_error("IPA Invalid Seek Type Expected TS or ID")
         }
+        NotifyMessage::with_int(2)
     }
 
     fn hmget(&self, args: &[&[u8]]) -> NotifyMessage {
@@ -299,7 +300,7 @@ impl Dispatch {
         NotifyMessage::with_value(Value::Array(results))
     }
 
-    fn mset(&self, args: &[&[u8]]) -> NotifyMessage {
+    fn set(&self, args: &[&[u8]]) -> NotifyMessage {
         if args.len() < 3 {
             return NotifyMessage::with_error("MPA Queue or Channel Missing")
         }
@@ -342,7 +343,7 @@ impl Dispatch {
 
         let mut successfully = 0;
         for ticket_arg in &args[3..] {
-            let ticket = try_or_error!(assume_str(ticket_arg).parse::<u64>(), "IPA Invalid Ticket");
+            let ticket = try_or_error!(assume_str(ticket_arg).parse::<i64>(), "IPA Invalid Ticket");
             if q.ack(channel_name, ticket, self.clock).is_ok() {
                 successfully += 1
             }
@@ -416,7 +417,7 @@ impl Dispatch {
             "HMSET" => self.hmset(args_slice), // seek channel to the specified ts or id
             "HMGET" => self.hmget(args_slice), // get one or more messages
             "HDEL" => self.hdel(args_slice), // ack messages
-            "MSET" => self.mset(args_slice), // create queue/channel
+            "SET" => self.set(args_slice), // create queue/channel
             "DEL" => self.del(args_slice), // delete queue/channel
             "SREM" => self.srem(args_slice), // purge queue/channel
             _ => NotifyMessage::with_error("UCOM Unknown Command")

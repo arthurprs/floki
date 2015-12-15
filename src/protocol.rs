@@ -32,7 +32,7 @@ pub enum Value {
     Array(Vec<Value>),
     Status(StrTendril),
     Error(StrTendril),
-    Message((u64, Message)),
+    Message((i64, Message)),
 }
 
 impl Value {
@@ -379,5 +379,15 @@ mod tests {
         let r = req.pop_value();
         assert!(r.is_ok(), "{:?} not ok", r.unwrap_err());
         assert_eq_repr!(r.unwrap(), Value::Int(100));
+    }
+
+    #[test]
+    fn message_response() {
+        let mut parser = Parser::new(
+            b"*2\r\n*2\r\n:7270781675605147315\r\n$25\r\nmessage 1 from producer 0\r\n*2\r\n:4590316895040267280\r\n$25\r\nmessage 2 from producer 0\r\n".as_ref(),
+        );
+        let r = parser.parse();
+        assert!(r.is_ok(), "{:?} not ok", r.unwrap_err());
+        assert_eq!(parser.body.len(), 0);
     }
 }

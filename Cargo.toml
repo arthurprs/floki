@@ -27,6 +27,9 @@ git="https://github.com/carllerche/nix-rust.git"
 git="https://github.com/arthurprs/tendril.git"
 rev="11149061dac78e7dd73f19b5a02d521547d7a443"
 
+[dev-dependencies]
+redis = "0.5.2"
+
 [profile.dev]
 opt-level = 0
 debug = true

@@ -12,6 +12,7 @@ dependencies = [
  "nix 0.4.1 (git+https://github.com/carllerche/nix-rust.git)",
  "num_cpus 0.2.10 (registry+https://github.com/rust-lang/crates.io-index)",
  "rand 0.3.12 (registry+https://github.com/rust-lang/crates.io-index)",
+ "redis 0.5.2 (registry+https://github.com/rust-lang/crates.io-index)",
  "rustc-serialize 0.3.16 (registry+https://github.com/rust-lang/crates.io-index)",
  "spin 0.3.4 (registry+https://github.com/rust-lang/crates.io-index)",
  "tendril 0.1.6 (git+https://github.com/arthurprs/tendril.git?rev=11149061dac78e7dd73f19b5a02d521547d7a443)",
@@ -46,6 +47,11 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 [[package]]
 name = "bitflags"
 version = "0.3.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+
+[[package]]
+name = "byteorder"
+version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 
 [[package]]
@@ -189,6 +195,11 @@ version = "0.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 
 [[package]]
+name = "matches"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+
+[[package]]
 name = "memchr"
 version = "0.1.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -249,6 +260,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "redis"
+version = "0.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+dependencies = [
+ "rustc-serialize 0.3.16 (registry+https://github.com/rust-lang/crates.io-index)",
+ "sha1 0.1.1 (registry+https://github.com/rust-lang/crates.io-index)",
+ "url 0.5.0 (registry+https://github.com/rust-lang/crates.io-index)",
+]
+
+[[package]]
 name = "regex"
 version = "0.1.41"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -267,6 +288,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 name = "rustc-serialize"
 version = "0.3.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
+
+[[package]]
+name = "sha1"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+dependencies = [
+ "byteorder 0.4.2 (registry+https://github.com/rust-lang/crates.io-index)",
+]
 
 [[package]]
 name = "slab"
@@ -325,6 +354,25 @@ version = "0.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 dependencies = [
  "void 0.0.5 (registry+https://github.com/rust-lang/crates.io-index)",
+]
+
+[[package]]
+name = "url"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+dependencies = [
+ "matches 0.1.2 (registry+https://github.com/rust-lang/crates.io-index)",
+ "rustc-serialize 0.3.16 (registry+https://github.com/rust-lang/crates.io-index)",
+ "uuid 0.1.18 (registry+https://github.com/rust-lang/crates.io-index)",
+]
+
+[[package]]
+name = "uuid"
+version = "0.1.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+dependencies = [
+ "rand 0.3.12 (registry+https://github.com/rust-lang/crates.io-index)",
+ "rustc-serialize 0.3.16 (registry+https://github.com/rust-lang/crates.io-index)",
 ]
 
 [[package]]
