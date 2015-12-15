@@ -1,10 +1,10 @@
+use std::{mem, cmp, thread};
 use std::str::{self, FromStr};
 use std::net::SocketAddr;
 use std::io::{Read, Write};
-use std::mem;
-use std::cmp;
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use spin::RwLock as SpinRwLock;
 use mio::tcp::{TcpStream, TcpListener};
 use mio::util::Slab;
@@ -158,7 +158,7 @@ fn check_identifier_str(possibly_str: &[u8]) -> Result<&str, NotifyMessage> {
         Ok(assume_str(possibly_str))
     } else {
         // FIXME
-        Err(NotifyMessage::with_error("IPA Invalid Name"))
+        Err(NotifyMessage::with_error("IPA Invalid Identifier Name"))
     }
 }
 
@@ -172,6 +172,14 @@ impl Dispatch {
         debug!("deleting queue {:?}", q.name());
         let meta_lock = self.meta_lock.lock().unwrap();
         let q = self.queues.write().remove(&*q.name()).unwrap();
+        let mut wait_count = 0;
+        while Arc::strong_count(&q) > 1 {
+            thread::sleep(Duration::from_millis(100));
+            wait_count += 1;
+            if wait_count % 10 == 0 {
+                warn!("Still waiting for Queue {:?} to be freed {}", q.name(), wait_count);
+            }
+        }
         self.notify_server(NotifyMessage::QueueDelete{
             queue: q.name().into(),
         });
