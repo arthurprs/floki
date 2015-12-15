@@ -56,7 +56,8 @@ impl Value {
             Value::Error(v) =>
                 write!(f, "-{}\r\n", v.as_ref()),
             Value::Message((ticket, message)) => {
-                write!(f, "*2\r\n:{}\r\n${}\r\n", ticket, message.body().len()).unwrap();
+                write!(f, "*3\r\n:{}\r\n:{}\r\n${}\r\n",
+                    message.id(), ticket, message.body().len()).unwrap();
                 f.write_all(message.body()).unwrap();
                 write!(f, "\r\n")
             }
@@ -86,7 +87,7 @@ impl fmt::Debug for Value {
             Value::Error(ref v) =>
                 write!(f, "Error({:?})", v.as_ref()),
             Value::Message((ticket, ref message)) =>
-                write!(f, "Message(({:?}, {:?}))", ticket, message.id()),
+                write!(f, "Message(({:?}, {:?}))", message.id(), ticket),
         }
     }
 }
