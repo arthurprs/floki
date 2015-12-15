@@ -22,6 +22,7 @@ extern crate twox_hash;
 extern crate spin;
 extern crate rand;
 extern crate tendril;
+extern crate fs2;
 
 mod config;
 #[macro_use] mod utils;
@@ -34,7 +35,6 @@ mod atom;
 mod cookie;
 mod offset_index;
 mod tristate_lock;
-mod fallocate;
 
 #[cfg(not(test))]
 fn main() {

@@ -17,11 +17,11 @@ use rustc_serialize::json;
 use twox_hash::XxHash;
 use std::hash::Hasher;
 use nix;
+use fs2::FileExt;
 
 use config::*;
 use utils::*;
 use offset_index::*;
-use fallocate::*;
 
 const MAGIC_NUM: u32 = 0xF1031311u32;
 const INVALID_TIMESTAMP: u32 = 0;
@@ -162,7 +162,7 @@ impl Segment {
                 .create(true)
                 .truncate(true)
                 .open(&file_path));
-        try!(fallocate(&file, 0, config.segment_size));
+        try!(file.allocate(config.segment_size));
 
         let mut segment = try!(Self::new(config, file, file_path, start_id));
         unsafe {
