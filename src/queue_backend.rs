@@ -1,11 +1,8 @@
-use std::ptr;
-use std::slice;
-use std::thread;
-use std::cmp;
+use std::{ptr, slice, thread, cmp, io};
 use std::mem::{self, size_of};
-use std::io;
 use std::io::prelude::*;
 use std::time::Duration;
+use std::hash::Hasher;
 use std::os::unix::io::{RawFd, AsRawFd};
 use std::fs::{self, File, OpenOptions};
 use std::path::PathBuf;
@@ -15,7 +12,6 @@ use nix::sys::mman;
 use spin::{Mutex as SpinLock, RwLock as SpinRwLock};
 use rustc_serialize::json;
 use twox_hash::XxHash;
-use std::hash::Hasher;
 use nix;
 use fs2::FileExt;
 
@@ -381,8 +377,8 @@ impl Segment {
 impl Drop for Segment {
     fn drop(&mut self) {
         let mmap = self.file_mmap as *mut c_void;
-        mman::madvise(mmap, self.file_len as u64, mman::MADV_DONTNEED).unwrap();
-        mman::munmap(mmap, self.file_len as u64).unwrap();
+        mman::madvise(mmap, self.file_len.into(), mman::MADV_DONTNEED).unwrap();
+        mman::munmap(mmap, self.file_len.into()).unwrap();
         if self.deleted {
             remove_file_if_exist(&self.file_path).unwrap();
         }
@@ -627,7 +623,9 @@ impl QueueBackend {
                 let pass_retention_size = total_rem_size <= self.config.retention_size;
 
                 if pass_hard_retention_period && pass_hard_retention_size {
+                    // passes hard limits so it may be kept
                     if contains_channel_msg || pass_retention_period || pass_retention_size {
+                        // stop, it needs to be kept
                         break
                     }
                 }

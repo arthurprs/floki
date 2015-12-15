@@ -1,10 +1,7 @@
-use mio::{Buf, MutBuf};
-use std::mem;
+use std::{mem, cmp, str, fmt};
 use std::io::Write;
-use std::cmp;
-use std::str;
-use std::fmt;
 use tendril;
+use mio::{Buf, MutBuf};
 use queue_backend::Message;
 
 pub type ByteTendril = tendril::Tendril<tendril::fmt::Bytes, tendril::Atomic>;
