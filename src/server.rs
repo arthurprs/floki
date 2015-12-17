@@ -393,7 +393,7 @@ impl Dispatch {
                 q.purge();
             },
             channel_name => {
-                try_or_int!(q.purge_channel(channel_name), 0);
+                try_or_int!(q.purge_channel(channel_name, self.clock), 0);
             },
         }
 

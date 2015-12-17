@@ -120,8 +120,8 @@ impl Queue {
         self.inner.lock().delete_channel(channel_name)
     }
 
-    pub fn purge_channel(&self, channel_name: &str) -> QueueResult<()> {
-        self.inner.read().purge_channel(channel_name)
+    pub fn purge_channel(&self, channel_name: &str, clock: u32) -> QueueResult<()> {
+        self.inner.read().purge_channel(channel_name, clock)
     }
 
     /// get access is suposed to be thread-safe, even while writing
@@ -273,9 +273,11 @@ impl InnerQueue {
         }
     }
 
-    pub fn purge_channel(&self, channel_name: &str) -> QueueResult<()> {
+    pub fn purge_channel(&self, channel_name: &str, clock: u32) -> QueueResult<()> {
         if let Some(channel) = self.channels.get(channel_name) {
-            channel.lock().unwrap().purge(self.backend.head());
+            let mut locked_channel = channel.lock().unwrap();
+            locked_channel.purge(self.backend.head());
+            locked_channel.last_touched = clock;
             Ok(())
         } else {
             Err(QueueError::ChannelNotFound)
