@@ -180,17 +180,17 @@ impl Segment {
 
     fn new(_: &QueueConfig, file: File, file_path: PathBuf, start_id: u64) -> QueueBackendResult<Segment> {
         let file_len = try!(file.metadata()).len();
-        if file_len <= 4 {
+        if file_len <= 4 || file_len >= 1 << 31 {
             return Err(QueueBackendError::SegmentFileInvalid)
         }
 
         let file_mmap = try!(mman::mmap(
-            ptr::null_mut(), file_len,
+            ptr::null_mut(), (file_len as u32).into(),
             mman::PROT_READ | mman::PROT_WRITE, mman::MAP_SHARED,
             file.as_raw_fd(), 0)) as *mut u8;
         try!(mman::madvise(
             file_mmap as *mut c_void,
-            file_len,
+            (file_len as u32).into(),
             mman::MADV_SEQUENTIAL));
 
         Ok(Segment {
@@ -286,7 +286,7 @@ impl Segment {
             self.file_offset.saturating_sub(1024 * 1024)
         };
         if sync_offset > 0 && sync_offset > self.sync_offset {
-            mman::msync(self.file_mmap as *mut c_void, sync_offset as u64, mman::MS_SYNC).unwrap();
+            mman::msync(self.file_mmap as *mut c_void, sync_offset.into(), mman::MS_SYNC).unwrap();
             self.sync_offset = sync_offset;
         }
     }
@@ -301,7 +301,7 @@ impl Segment {
 
         try!(mman::madvise(
             self.file_mmap as *mut c_void,
-            self.sync_offset as u64,
+            self.sync_offset.into(),
             mman::MADV_WILLNEED));
 
         self.file_offset = size_of::<u32>() as u32;

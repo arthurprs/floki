@@ -381,6 +381,7 @@ impl InnerQueue {
         if let Some(channel) = self.channels.get(channel_name) {
             let mut locked_channel = channel.lock().unwrap();
             locked_channel.tail = id;
+            locked_channel.last_touched = clock;
             Ok(())
         } else {
             Err(QueueError::ChannelNotFound)
@@ -392,6 +393,7 @@ impl InnerQueue {
         if let Some(channel) = self.channels.get(channel_name) {
             let mut locked_channel = channel.lock().unwrap();
             locked_channel.tail = self.backend.find_id_for_timestamp(timestamp);
+            locked_channel.last_touched = clock;
             Ok(())
         } else {
             Err(QueueError::ChannelNotFound)

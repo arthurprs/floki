@@ -8,7 +8,7 @@ impl Cookie {
     #[inline(always)]
     pub fn new(token: Token, nonce: u64) -> Cookie {
         // TODO: panic on overflow?
-        Cookie((token.0 << 48) as u64 | (nonce & 0xFFFFFFFFFFFF))
+        Cookie(((token.0 as u64) << 48) | (nonce & 0xFFFFFFFFFFFF))
     }
 
     #[inline(always)]
