@@ -617,11 +617,21 @@ impl QueueBackend {
 
                 let contains_channel_msg = smallest_tail < segment.head;
                 let last_msg_age = clock - segment.last_timestamp;
-                let pass_hard_retention_period = last_msg_age <= self.config.hard_retention_period;
-                let pass_hard_retention_size = total_rem_size <= self.config.hard_retention_size;
-                let pass_retention_period = last_msg_age <= self.config.retention_period;
-                let pass_retention_size = total_rem_size <= self.config.retention_size;
+                let pass_hard_retention_period =
+                    self.config.hard_retention_period == 0 ||
+                    last_msg_age <= self.config.hard_retention_period;
+                let pass_hard_retention_size =
+                    self.config.hard_retention_size == 0 ||
+                    total_rem_size <= self.config.hard_retention_size;
+                let pass_retention_period =
+                    self.config.retention_period != 0 &&
+                    last_msg_age <= self.config.retention_period;
+                let pass_retention_size =
+                    self.config.retention_size != 0 &&
+                    total_rem_size <= self.config.retention_size;
 
+                println!("hrp={} hrs={} cc={} rp={} rs={}", pass_hard_retention_period, pass_hard_retention_size,
+                    contains_channel_msg, pass_retention_period, pass_retention_size);
                 if pass_hard_retention_period && pass_hard_retention_size {
                     // passes hard limits so it may be kept
                     if contains_channel_msg || pass_retention_period || pass_retention_size {
@@ -667,6 +677,8 @@ mod tests {
         server_config.default_queue_config.segment_size = 4 * 1024 * 1024;
         server_config.default_queue_config.retention_period = 1;
         server_config.default_queue_config.hard_retention_period = 2;
+        server_config.default_queue_config.retention_size = 0;
+        server_config.default_queue_config.hard_retention_size = 0;
         let mut queue_config = server_config.new_queue_config(name);
         queue_config.message_timeout = 1;
         utils::create_dir_if_not_exist(&queue_config.data_directory).unwrap();
@@ -774,18 +786,18 @@ mod tests {
         assert_eq!(backend.segments_count(), 1);
     }
 
-    // #[test]
-    // fn test_hard_retention_period() {
-    //     let mut backend = get_backend();
-    //     while backend.segments_count() < 3 {
-    //         backend.push(gen_message(), 1).unwrap();
-    //     }
-    //     let head = backend.head;
+    #[test]
+    fn test_hard_retention_period() {
+        let mut backend = get_backend();
+        while backend.segments_count() < 3 {
+            backend.push(gen_message(), 1).unwrap();
+        }
+        let head = backend.head;
 
-    //     // har retention period will purge old segments even if not cleared by the smallest tail
-    //     backend.gc(1, 4);
-    //     assert_eq!(backend.segments_count(), 1);
-    // }
+        // har retention period will purge old segments even if not cleared by the smallest tail
+        backend.gc(1, 4);
+        assert_eq!(backend.segments_count(), 1);
+    }
 
     #[test]
     fn test_corrupt_files() {
