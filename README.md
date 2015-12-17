@@ -61,9 +61,9 @@ Note: Floki won't error if the *id* or *timestamp* is either in the future or is
 
 Acknowledge messages using their tickets. Returns the number of successful acknowledges.
 
-**MSET** create queue/channel
+**SET** create queue/channel
 
-```MSET queue_name channel_name```
+```SET queue_name channel_name```
 
 Creates the specified queue and channels, will error if the queue already exists
 
@@ -81,7 +81,11 @@ Note: you can also use * as the channel name to purge all channels, effectively 
 
 # Configuration
 
-Nothing here for now
+See the configuration file [floki.toml](floki.toml)
+
+# Running
+
+```RUST_BACKTRACE=1 RUST_LOG=floki=info cargo run --release```
 
 # Copyright and License
 

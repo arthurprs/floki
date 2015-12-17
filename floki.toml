@@ -1,10 +1,64 @@
+# Main configuration file for Floki
+#
+# All settings are usually acompained by a short description and a sane default
+#
+# NOTE:
+# when a size is needed, it's possible to specify
+# it in bare bytes or with a case insensitive suffix 
+#
+# 1  | 1b => 1 byte
+# 1k | 1kb => 1024 bytes
+# 1m | 1mb => 1024*1024 bytes
+# 1g | 1gb => 1024*1024*1024 bytes
+#
+# when a duration is needed, it's also possible to specify
+# it as bare seconds or using a case insensitive suffix
+#
+# 1  => 1 second
+# 1s => 1 second
+# 1m => 60 seconds
+# 1h => 60 minutes
+# 1d => 24 hours
+#
+
+# ====== SERVER CONFIGURATION ======
+
+# Specify the ip and port which Floki should bind the socket to and listen for commands
 bind_address="127.0.0.1:9797"
-data_directory="./data/"
-segment_size="128mb"
-maintenance_interval="1s"
+
+# Maximum number of clients connected at the same time
 max_connections=1024
+
+# Location of Floki data directory in the file system
+data_directory="./data/"
+
+# Sleep period between maintenance thread runs to checkpoint the queue metadata to disk
+# There's little reason to change it
+maintenance_interval="1s"
+
+# ====== DEFAULT QUEUE CONFIGURATION ======
+
+# Floki queues are stored as a collection of smaller segments on disk.
+# Setting this value too small may limit the maximum size of a message and
+# also slow down writes due to increased number of files.
+# Segments are preallocated on creation so keep that in mind if you want to have lots of queues.
+segment_size="128mb"
+
+# Default queue message timeout period
+# after this timeout a non acknowledged message will be made available in the channel again
 message_timeout="30s"
-retention_period="0d"
-hard_retention_period="1d"
-retention_size="0b"
-hard_retention_size="1gb"
+
+# Soft retentions specify for how long (period) and how much data (size) is retained in a queue
+# even if all channels already read past it.
+# This might be usefull if you want to go back in time and reprocess some messages.
+# Note: A value of 0 disables the feature if neither are active
+# once all channels read past a segment it becomes eledgible for garbage collection
+retention_period="0"
+retention_size="0"
+
+# Hard retentions specify the maximum age and/or size of retained data
+# regardless of channel positions and soft retention period/size
+# Note: A value of 0 disables the feature so the constraint isn't enforced and
+# queue may grow unbounded(!)
+hard_retention_period="24h"
+hard_retention_size="0"
