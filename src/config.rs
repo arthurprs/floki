@@ -1,3 +1,4 @@
+use std::error::Error;
 use std::fs::{self, File};
 use std::path::PathBuf;
 use std::io;
@@ -34,17 +35,14 @@ pub struct QueueConfig {
 }
 
 
-fn split_number_suffix(s: &str) -> Result<(u64, &str), ()> {
+fn split_number_suffix(s: &str) -> Result<(u64, &str), Box<Error + Send + Sync>> {
     let digits_end = s.chars().position(|c| !c.is_digit(10)).unwrap_or(s.len());
     let (digits, suffix) = (&s[0..digits_end], &s[digits_end..]);
-    if let Ok(number) = digits.parse::<u64>() {
-        Ok((number, suffix))
-    } else {
-        Err(())
-    }
+    let number = try!(digits.parse::<u64>());
+    Ok((number, suffix))
 }
 
-pub fn parse_duration(duration_text: &str) -> Result<u64, ()> {
+pub fn parse_duration(duration_text: &str) -> Result<u64, Box<Error + Send + Sync>> {
     let (number, suffix) = try!(split_number_suffix(duration_text));
     let scale = match suffix.to_lowercase().as_ref() {
         "ms" => 1,
@@ -52,21 +50,21 @@ pub fn parse_duration(duration_text: &str) -> Result<u64, ()> {
         "m" => 1000 * 60,
         "h" => 1000 * 60 * 60,
         "d" => 1000 * 60 * 60 * 24,
-        _ => return Err(())
+        _ => return Err(format!("Unknown suffix `{}`", suffix).into())
     };
-    number.checked_mul(scale).ok_or(())
+    number.checked_mul(scale).ok_or("Overflow error".into())
 }
 
-pub fn parse_size(size_text: &str) -> Result<u64, ()> {
+pub fn parse_size(size_text: &str) -> Result<u64, Box<Error + Send + Sync>> {
     let (number, suffix) = try!(split_number_suffix(size_text));
     let scale = match suffix.to_lowercase().as_ref() {
         "" | "b" => 1,
         "k" | "kb" => 1024,
         "m" | "mb" => 1024 * 1024,
         "g" | "gb" => 1024 * 1024 * 1024,
-        _ => return Err(())
+        _ => return Err(format!("Unknown suffix `{}`", suffix).into())
     };
-    number.checked_mul(scale).ok_or(())
+    number.checked_mul(scale).ok_or("Overflow error".into())
 }
 
 macro_rules! read_config {
