@@ -792,7 +792,6 @@ mod tests {
         while backend.segments_count() < 3 {
             backend.push(gen_message(), 1).unwrap();
         }
-        let head = backend.head;
 
         // har retention period will purge old segments even if not cleared by the smallest tail
         backend.gc(1, 4);

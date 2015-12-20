@@ -31,6 +31,11 @@ pub fn remove_dir_if_exist<P: AsRef<Path>>(path: P) -> io::Result<()> {
 pub fn create_dir_if_not_exist<P: AsRef<Path>>(path: P) -> io::Result<()> {
     match fs::create_dir_all(path.as_ref()) {
         Err(ref err) if err.kind() == io::ErrorKind::AlreadyExists => {
+            // small hack to detect race conditions
+            // harmless on the real world but without it tests runing in parallel may fail
+            if !path.as_ref().is_dir() {
+                return create_dir_if_not_exist(path)
+            }
             Ok(())
         }
         result => result
