@@ -1,4 +1,5 @@
 #![allow(dead_code)]
+#![feature(slice_patterns)]
 #![feature(iter_arith)]
 #![feature(hashmap_hasher)]
 #![feature(arc_counts)]
@@ -22,6 +23,7 @@ extern crate spin;
 extern crate rand;
 extern crate tendril;
 extern crate fs2;
+extern crate promising_future;
 
 mod config;
 #[macro_use] mod utils;

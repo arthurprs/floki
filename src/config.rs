@@ -12,7 +12,7 @@ pub const BACKEND_CHECKPOINT_FILE: &'static str = "backend.checkpoint";
 pub const DATA_EXTENSION: &'static str = "data";
 pub const INDEX_EXTENSION: &'static str = "index";
 
-#[derive(Debug)]
+#[derive(Debug, Clone, RustcEncodable)]
 pub struct ServerConfig {
     pub data_directory: PathBuf,
     pub bind_address: String,
@@ -21,7 +21,7 @@ pub struct ServerConfig {
     pub default_queue_config: QueueConfig,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, RustcEncodable)]
 pub struct QueueConfig {
     pub name: String,
     pub data_directory: PathBuf,

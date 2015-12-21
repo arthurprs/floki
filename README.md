@@ -79,6 +79,20 @@ Deletes a channel, if specified, otherwise deletes the queue.
 
 Note: you can also use * as the channel name to purge all channels, effectively purging the entire queue and allowing all used disk space to be reclaimed.
 
+```INFO [queues|queues.queue_prefix|server]```
+
+All variants return an array with a single json encoded object. This is done to conform with what redis clients expect.
+
+`queues and queues. and queues.*` return information about all queues
+
+`queues.queue_prefix` return information about all queues matching the given prefix
+
+`queues.server` return information about the server
+
+# Example
+
+See example [helloworld.rs](examples/helloworld.rs)
+
 # Configuration
 
 See the configuration file [floki.toml](floki.toml)

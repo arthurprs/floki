@@ -8,8 +8,10 @@ use std::time::Duration;
 use spin::RwLock as SpinRwLock;
 use mio::tcp::{TcpStream, TcpListener};
 use mio::util::Slab;
-use mio::{Buf, MutBuf, Token, EventLoop, EventSet, PollOpt, Timeout, Handler, Sender};
+use mio::{self, Buf, MutBuf, Token, EventLoop, EventSet, PollOpt, Timeout, Handler};
 use threadpool::ThreadPool;
+use rustc_serialize::json;
+use promising_future::{future_promise, Promise};
 use num_cpus::get as get_num_cpus;
 use queue::*;
 use queue_backend::Message;
@@ -32,6 +34,7 @@ pub enum NotifyMessage {
     ChannelDelete{queue: Atom, channel: Atom},
     QueueCreate{queue: Atom},
     QueueDelete{queue: Atom},
+    ServerInfo{promise: Promise<ServerInfo>},
     MaintenanceDone,
 }
 
@@ -73,7 +76,7 @@ struct Dispatch {
     config: Arc<ServerConfig>,
     cookie: Cookie,
     request: Value,
-    channel: Sender<NotifyType>,
+    channel: mio::Sender<NotifyType>,
     meta_lock: Arc<Mutex<()>>,
     queues: Arc<SpinRwLock<HashMap<Atom, Arc<Queue>>>>,
     clock: u32,
@@ -85,6 +88,16 @@ struct WaitingClients {
     channels: HashMap<Atom, VecDeque<(Token, Value)>>,
 }
 
+#[derive(Debug, RustcEncodable)]
+struct ServerInfo {
+    client_count: u32,
+    blocked_client_count: u32,
+    queue_count: u32,
+    thread_count: u32,
+    clock: u32,
+    config: ServerConfig,
+}
+
 pub struct Server {
     config: Arc<ServerConfig>,
     meta_lock: Arc<Mutex<()>>,
@@ -93,6 +106,7 @@ pub struct Server {
     awaking_clients: Vec<(Token, Value)>,
     listener: TcpListener,
     thread_pool: ThreadPool,
+    thread_count: u32,
     maintenance_timeout: Timeout,
     nonce: u64,
     internal_clock_ms: u64,
@@ -136,8 +150,8 @@ impl NotifyMessage {
         Self::with_value(Value::Status("OK".into()))
     }
 
-    fn with_error(error: &str) -> NotifyMessage {
-        Self::with_value(Value::Error(error.into()))
+    fn with_error<T: AsRef<str>>(error: T) -> NotifyMessage {
+        Self::with_value(Value::Error(error.as_ref().into()))
     }
 
     fn with_nil() -> NotifyMessage {
@@ -255,11 +269,11 @@ impl Dispatch {
         let q = try_or_error!(self.get_queue(queue_name).ok_or(()), "QNF Queue Not Found");
 
         match seek_type {
-            "ts" | "TS" => {
+            "TS" => {
                 let timestamp = try_or_error!(seek_value_str.parse::<u32>(), "IPA Invalid Timestamp");
                 try_or_error!(q.seek_channel_to_timestamp(channel_name, timestamp, self.clock));
             },
-            "id" | "ID" => {
+            "ID" => {
                 let id = try_or_error!(seek_value_str.parse::<u64>(), "IPA Invalid ID");
                 try_or_error!(q.seek_channel_to_id(channel_name, id, self.clock));
             },
@@ -400,6 +414,43 @@ impl Dispatch {
         NotifyMessage::with_int(1)
     }
 
+    fn info_server(&self)-> ServerInfo {
+        let (fut, prom) = future_promise();
+        self.notify_server(NotifyMessage::ServerInfo{promise: prom});
+        fut.value().unwrap()
+    }
+
+    fn info_queue(&self, queue_prefix: &str) -> StdHashMap<String, QueueInfo> {
+        self.queues.read().values().filter_map(|queue| {
+            if queue_prefix == "*" || queue.name().starts_with(queue_prefix) {
+                Some((queue.name().into(), queue.info(self.clock)))
+            } else {
+                None
+            }
+        }).collect()
+    }
+
+    fn info(&self, args: &[&[u8]]) -> NotifyMessage {
+        if args.len() < 2 {
+            return NotifyMessage::with_error("MPA Missing INFO Parameter")
+        }
+
+        let info_args = assume_str(args[1]).splitn(2, ".").collect::<Vec<_>>();
+        let json_bytes: Vec<u8> = match &info_args[..] {
+            ["server"] =>
+                json::encode(&self.info_server()).unwrap(),
+            ["queues"] =>
+                json::encode(&self.info_queue("*")).unwrap(),
+            ["queues", queue_prefix] =>
+                json::encode(&self.info_queue(queue_prefix)).unwrap(),
+            _ =>
+                return NotifyMessage::with_error("IPA Invalid INFO parameter")
+        }.into();
+
+        let value = Value::Array(vec![Value::Data((&json_bytes[..]).into())]);
+        NotifyMessage::with_value(value)
+    }
+
     fn dispatch(&self) {
         debug!("dispatch {:?} {:?}", self.cookie.token(), self.request);
         let mut args: [&[u8]; 50] = [b""; 50];
@@ -422,9 +473,10 @@ impl Dispatch {
         let args_slice = &args[..argc];
         let notification = match assume_str(args[0]) {
             "RPUSH" => self.rpush(args_slice), // push one or more messages
-            "HMSET" => self.hmset(args_slice), // seek channel to the specified ts or id
             "HMGET" => self.hmget(args_slice), // get one or more messages
             "HDEL" => self.hdel(args_slice), // ack messages
+            "INFO" => self.info(args_slice), // info
+            "HMSET" => self.hmset(args_slice), // seek channel to the specified ts or id
             "SET" => self.set(args_slice), // create queue/channel
             "DEL" => self.del(args_slice), // delete queue/channel
             "SREM" => self.srem(args_slice), // purge queue/channel
@@ -599,8 +651,8 @@ impl Server {
         let listener = TcpListener::bind(&addr).unwrap();
 
         let num_cpus = get_num_cpus();
-        let num_threads = cmp::max(6, num_cpus * 2);
-        debug!("detected {} cpus, using {} threads", num_cpus, num_threads);
+        let thread_count = cmp::max(6, num_cpus * 2);
+        debug!("detected {} cpus, using {} threads", num_cpus, thread_count);
 
         let mut event_loop = EventLoop::new().unwrap();
         event_loop.register_opt(&listener, SERVER,
@@ -614,7 +666,8 @@ impl Server {
             config: Arc::new(config),
             meta_lock: Arc::new(Mutex::new(())),
             queues: Default::default(),
-            thread_pool: ThreadPool::new(num_threads),
+            thread_pool: ThreadPool::new(thread_count),
+            thread_count: thread_count as u32,
             waiting_clients: Default::default(),
             awaking_clients: Default::default(),
             maintenance_timeout: maintenance_timeout,
@@ -814,7 +867,7 @@ impl Server {
         self.internal_clock_ms = 0;
     }
 
-    fn notify(&mut self, event_loop: &mut EventLoop<ServerHandler>, notification: NotifyType) -> bool {
+    fn notify(&mut self, clients: &mut Slab<Client>, event_loop: &mut EventLoop<ServerHandler>, notification: NotifyType) -> bool {
         match notification.1 {
             NotifyMessage::MaintenanceDone => {
                 self.schedule_maintenance(event_loop);
@@ -831,10 +884,27 @@ impl Server {
             NotifyMessage::ChannelCreate{queue, channel} => {
                 self.notify_channel_created(queue, channel);
             },
+            NotifyMessage::ServerInfo{promise} => {
+                promise.set(self.info(clients));
+            }
             msg => panic!("can't handle msg {:?}", msg)
         }
 
         true
+    }
+
+    fn info(&self, clients: &mut Slab<Client>) -> ServerInfo {
+        ServerInfo {
+            client_count: clients.count() as u32,
+            blocked_client_count:
+                self.waiting_clients.values().map(|w|
+                    w.channels.values().map(|wc| wc.len() as u32).sum::<u32>()
+                ).sum(),
+            thread_count: self.thread_count,
+            queue_count: self.queues.read().len() as u32,
+            config: (*self.config).clone(),
+            clock: (Self::get_clock_ms() / 1000) as u32,
+        }
     }
 
     fn schedule_maintenance(&mut self, event_loop: &mut EventLoop<ServerHandler>) {
@@ -885,7 +955,7 @@ impl Server {
 	#[inline(never)]
     fn get_clock_ms() -> u64 {
         let time::Timespec{sec, nsec} = time::get_time();
-        sec as u64 + (nsec / 1000 / 1000) as u64
+        sec as u64 + (nsec / 1_000_000) as u64
     }
 }
 
@@ -916,7 +986,7 @@ impl Handler for ServerHandler {
         let token = notification.0.token();
         trace!("notify event for token {:?} with {:?}", token, notification.1);
         let is_ok = match token {
-            SERVER => self.server.notify(event_loop, notification),
+            SERVER => self.server.notify(&mut self.clients, event_loop, notification),
             token => if let Some(client) = self.clients.get_mut(token) {
                 client.notify(&mut self.server, event_loop, notification)
             } else {

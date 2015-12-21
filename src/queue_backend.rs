@@ -403,6 +403,10 @@ impl QueueBackend {
         self.segments.read().len()
     }
 
+    pub fn disk_usage(&self) -> u64 {
+        self.segments.read().iter().map(|s| s.file_len as u64).sum()
+    }
+
     pub fn tail(&self) -> u64 {
         self.tail
     }

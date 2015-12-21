@@ -18,6 +18,7 @@ fnv = "*"
 twox-hash = "*"
 spin = "*"
 rand = "*"
+promising-future = "*"
 fs2 = "0.2"
 
 [dependencies.nix]

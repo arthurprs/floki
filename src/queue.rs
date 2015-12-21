@@ -49,6 +49,7 @@ pub struct QueueInfo {
     pub tail: u64,
     pub channels: BTreeMap<String, ChannelInfo>,
     pub segments_count: u32,
+    pub disk_usage: u64,
 }
 
 #[derive(Debug, Eq, PartialEq, RustcDecodable, RustcEncodable)]
@@ -420,6 +421,7 @@ impl InnerQueue {
             head: self.backend.head(),
             channels: Default::default(),
             segments_count: self.backend.segments_count() as u32,
+            disk_usage: self.backend.disk_usage(),
         };
         for (channel_name, channel) in &self.channels {
             let mut locked_channel = channel.lock().unwrap();

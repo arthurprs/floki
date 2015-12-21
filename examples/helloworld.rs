@@ -76,4 +76,12 @@ fn main() {
     for thread_handle in thread_handles {
         thread_handle.join().unwrap();
     }
+
+    // print some info
+    {
+        let result: RedisResult<Vec<String>> = redis::cmd("INFO").arg("queues").query(&connection);
+        println!("queue info\n{}", result.unwrap()[0]);
+        let result: RedisResult<Vec<String>> = redis::cmd("INFO").arg("server").query(&connection);
+        println!("server info\n{}", result.unwrap()[0]);
+    }
 }

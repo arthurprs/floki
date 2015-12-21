@@ -2,7 +2,7 @@ use std::error::Error;
 use std::fs;
 use std::io;
 use std::path::Path;
-use std::collections::{HashMap as StdHashMap, HashSet as StdHashSet};
+pub use std::collections::{HashMap as StdHashMap, HashSet as StdHashSet};
 pub use linked_hash_map::LinkedHashMap as StdLinkedHashMap;
 pub use std::collections::hash_state::DefaultState;
 pub use fnv::FnvHasher;
