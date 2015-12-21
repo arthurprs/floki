@@ -623,7 +623,9 @@ impl Server {
         };
 
         info!("Opening queues...");
-        for queue_config in ServerConfig::read_queue_configs(&server.config) {
+        let queue_configs = ServerConfig::read_queue_configs(&server.config).
+            expect("Error reading queue configurations");
+        for queue_config in queue_configs {
             info!("Opening queue {:?}", queue_config.name);
 
             let q = Queue::new(queue_config, true);

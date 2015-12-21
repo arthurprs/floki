@@ -1,6 +1,5 @@
-use std::error::Error;
 use std::fs::{self, File};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::io;
 use std::io::prelude::*;
 use toml::Parser as TomlParser;
@@ -35,14 +34,13 @@ pub struct QueueConfig {
 }
 
 
-fn split_number_suffix(s: &str) -> Result<(u64, &str), Box<Error + Send + Sync>> {
+fn split_number_suffix(s: &str) -> Result<(u64, &str), GenericError> {
     let digits_end = s.chars().position(|c| !c.is_digit(10)).unwrap_or(s.len());
     let (digits, suffix) = (&s[0..digits_end], &s[digits_end..]);
-    let number = try!(digits.parse::<u64>());
-    Ok((number, suffix))
+    Ok((try!(digits.parse::<u64>()), suffix))
 }
 
-pub fn parse_duration(duration_text: &str) -> Result<u64, Box<Error + Send + Sync>> {
+pub fn parse_duration(duration_text: &str) -> Result<u64, GenericError> {
     let (number, suffix) = try!(split_number_suffix(duration_text));
     let scale = match suffix.to_lowercase().as_ref() {
         "ms" => 1,
@@ -55,7 +53,7 @@ pub fn parse_duration(duration_text: &str) -> Result<u64, Box<Error + Send + Syn
     number.checked_mul(scale).ok_or("Overflow error".into())
 }
 
-pub fn parse_size(size_text: &str) -> Result<u64, Box<Error + Send + Sync>> {
+pub fn parse_size(size_text: &str) -> Result<u64, GenericError> {
     let (number, suffix) = try!(split_number_suffix(size_text));
     let scale = match suffix.to_lowercase().as_ref() {
         "" | "b" => 1,
@@ -90,15 +88,14 @@ macro_rules! read_config {
 
 impl ServerConfig {
     pub fn read() -> ServerConfig {
-        debug!("reading config");
-
+        debug!("reading config file");
         let config = {
             let mut s = String::new();
             File::open("floki.toml").expect("Error opening config file").
                 read_to_string(&mut s).expect("Error reading config file");
             TomlParser::new(&s).parse().expect("Error parsing config file")
         };
-        info!("done reading config: {:?}", config);
+        debug!("done reading config file: {:?}", config);
 
         let bind_address = read_config!(config, "bind_address" => str);
         let data_directory = read_config!(config, "data_directory" => str);
@@ -133,22 +130,13 @@ impl ServerConfig {
         }
     }
 
-    pub fn read_queue_configs(self: &ServerConfig) -> Vec<QueueConfig> {
-        let read_dir = match fs::read_dir(&self.data_directory) {
-            Ok(read_dir) => read_dir,
-            Err(error) => {
-                warn!("Can't read server data_directory {}", error);
-                return Vec::new()
-            }
-        };
-
-        read_dir.filter_map(|entry_opt| {
-            let entry_path = entry_opt.unwrap().path();
-            if ! entry_path.is_dir() {
-                return None
-            }
-            Some(QueueConfig::read(self, entry_path))
-        }).collect()
+    pub fn read_queue_configs(self: &ServerConfig) -> Result<Vec<QueueConfig>, GenericError> {
+        debug!("reading queue configurations");
+        let mut queue_configs = Vec::new();
+        for maybe_entry in try!(fs::read_dir(&self.data_directory)) {
+            queue_configs.push(try!(QueueConfig::read(self, &try!(maybe_entry).path())))
+        }
+        Ok(queue_configs)
     }
 
     pub fn new_queue_config<S: Into<String>>(&self, queue_name: S) -> QueueConfig {
@@ -166,13 +154,13 @@ impl QueueConfig {
         }
     }
 
-    fn read(server_config: &ServerConfig, data_directory: PathBuf) -> QueueConfig {
+    fn read(server_config: &ServerConfig, data_directory: &Path) -> Result<QueueConfig, GenericError> {
         let name = data_directory.file_name().unwrap().to_string_lossy().into_owned();
-        Self::new(server_config, name)
+        Ok(Self::new(server_config, name))
         // TODO: load from a file instead
     }
 
-    fn write(&self) -> Result<(), io::Error> {
+    fn write(&self) -> io::Result<()> {
         Ok(())
     }
 }
