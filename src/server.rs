@@ -57,7 +57,7 @@ pub enum TimeoutMessage {
 
 pub type TimeoutType = (Token, TimeoutMessage);
 
-struct Connection {
+struct Client {
     token: Token,
     stream: TcpStream,
     interest: EventSet,
@@ -100,7 +100,7 @@ pub struct Server {
 
 pub struct ServerHandler {
     server: Server,
-    connections: Slab<Connection>,
+    clients: Slab<Client>,
 }
 
 macro_rules! try_or_error {
@@ -435,10 +435,10 @@ impl Dispatch {
     }
 }
 
-impl Connection {
+impl Client {
 
-    fn new(token: Token, stream: TcpStream) -> Connection {
-        Connection {
+    fn new(token: Token, stream: TcpStream) -> Client {
+        Client {
             token: token,
             stream: stream,
             interest: EventSet::all() - EventSet::writable(),
@@ -645,11 +645,11 @@ impl Server {
         }
         debug!("Opening complete!");
 
-        let connections = Slab::new_starting_at(FIRST_CLIENT, server.config.max_connections);
+        let clients = Slab::new_starting_at(FIRST_CLIENT, server.config.max_connections);
 
         let server_handler = ServerHandler {
             server: server,
-            connections: connections,
+            clients: clients,
         };
 
         (server_handler, event_loop)
@@ -751,18 +751,18 @@ impl Server {
         }
     }
 
-    fn notify_client_gone(&mut self, connection: &mut Connection,  event_loop: &mut EventLoop<ServerHandler>) {
-        debug!("notify_client_gone {:?}", connection.token);
-        if connection.timeout.is_none() {
+    fn notify_client_gone(&mut self, client: &mut Client,  event_loop: &mut EventLoop<ServerHandler>) {
+        debug!("notify_client_gone {:?}", client.token);
+        if client.timeout.is_none() {
             return
         }
-        let (timeout, queue, channel) = connection.timeout.take().unwrap();
+        let (timeout, queue, channel) = client.timeout.take().unwrap();
         assert!(event_loop.clear_timeout(timeout));
 
         if let Some(w) = self.waiting_clients.get_mut(&queue) {
             if let Some(cookies)  = w.channels.get_mut(&channel) {
                 // FIXME: only need to delete the first ocurrence
-                cookies.retain(|&(c, _)| c != connection.token);
+                cookies.retain(|&(c, _)| c != client.token);
             } else {
                 unreachable!();
             }
@@ -771,42 +771,42 @@ impl Server {
         }
     }
 
-    fn remove_client(&mut self, token: Token, connections: &mut Slab<Connection>, event_loop: &mut EventLoop<ServerHandler>) {
-        info!("closing token {:?} connection", token);
-        let mut connection = connections.remove(token).unwrap();
-        self.notify_client_gone(&mut connection, event_loop);
+    fn remove_client(&mut self, token: Token, clients: &mut Slab<Client>, event_loop: &mut EventLoop<ServerHandler>) {
+        info!("closing token {:?} client", token);
+        let mut client = clients.remove(token).unwrap();
+        self.notify_client_gone(&mut client, event_loop);
     }
 
-    fn ready(&mut self, connections: &mut Slab<Connection>, event_loop: &mut EventLoop<ServerHandler>, events: EventSet) -> bool {
+    fn ready(&mut self, clients: &mut Slab<Client>, event_loop: &mut EventLoop<ServerHandler>, events: EventSet) -> bool {
         assert_eq!(events, EventSet::readable());
 
         if let Some(stream) = self.listener.accept().unwrap() {
-            let connection_addr = stream.peer_addr().unwrap();
-            trace!("incomming connection from {:?}", connection_addr);
+            let client_addr = stream.peer_addr().unwrap();
+            trace!("incomming client from {:?}", client_addr);
 
-            let token_opt = connections.insert_with(|token| Connection::new(token, stream));
+            let token_opt = clients.insert_with(|token| Client::new(token, stream));
 
             if let Some(token) = token_opt {
-                info!("assigned token {:?} to client {:?}", token, connection_addr);
+                info!("assigned token {:?} to client {:?}", token, client_addr);
 
                 event_loop.register_opt(
-                    &connections[token].stream,
+                    &clients[token].stream,
                     token,
-                    connections[token].interest,
+                    clients[token].interest,
                     PollOpt::level()
                 ).unwrap();
             } else {
-                warn!("dropping incomming connection from {:?}, max_connections reached", connection_addr);
+                warn!("dropping incomming client from {:?}, max_clients reached", client_addr);
             }
         }
         true
     }
 
-    fn tick(&mut self, connections: &mut Slab<Connection>, event_loop: &mut EventLoop<ServerHandler>) {
+    fn tick(&mut self, clients: &mut Slab<Client>, event_loop: &mut EventLoop<ServerHandler>) {
         if !self.awaking_clients.is_empty() {
             let mut awaking_clients = mem::replace(&mut self.awaking_clients, Vec::new());
             for (token, request) in awaking_clients.drain(..) {
-                connections[token].retry(request, self, event_loop);
+                clients[token].retry(request, self, event_loop);
             }
             self.awaking_clients = awaking_clients;
         }
@@ -897,16 +897,16 @@ impl Handler for ServerHandler {
     fn ready(&mut self, event_loop: &mut EventLoop<Self>, token: Token, events: EventSet) {
         trace!("events {:?} for token {:?}", events, token);
         let is_ok = match token {
-            SERVER => self.server.ready(&mut self.connections, event_loop, events),
-            token => if let Some(connection) = self.connections.get_mut(token) {
-                connection.ready(&mut self.server, event_loop, events)
+            SERVER => self.server.ready(&mut self.clients, event_loop, events),
+            token => if let Some(client) = self.clients.get_mut(token) {
+                client.ready(&mut self.server, event_loop, events)
             } else {
                 warn!("ready token {:?} not found", token);
                 false
             }
         };
         if !is_ok {
-            self.server.remove_client(token, &mut self.connections, event_loop);
+            self.server.remove_client(token, &mut self.clients, event_loop);
         }
         trace!("done events {:?} for token {:?}", events, token);
     }
@@ -917,22 +917,22 @@ impl Handler for ServerHandler {
         trace!("notify event for token {:?} with {:?}", token, notification.1);
         let is_ok = match token {
             SERVER => self.server.notify(event_loop, notification),
-            token => if let Some(connection) = self.connections.get_mut(token) {
-                connection.notify(&mut self.server, event_loop, notification)
+            token => if let Some(client) = self.clients.get_mut(token) {
+                client.notify(&mut self.server, event_loop, notification)
             } else {
                 warn!("notify token {:?} not found", token);
                 false
             }
         };
         if !is_ok {
-            self.server.remove_client(token, &mut self.connections, event_loop);
+            self.server.remove_client(token, &mut self.clients, event_loop);
         }
         trace!("end notify event for token {:?}", token);
     }
 
     #[inline]
     fn tick(&mut self, event_loop: &mut EventLoop<Self>) {
-        self.server.tick(&mut self.connections, event_loop);
+        self.server.tick(&mut self.clients, event_loop);
     }
 
     #[inline]
@@ -941,15 +941,15 @@ impl Handler for ServerHandler {
         trace!("timeout event for token {:?} with {:?}", token, timeout.1);
         let is_ok = match token {
             SERVER => self.server.timeout(event_loop, timeout.1),
-            token => if let Some(connection) = self.connections.get_mut(token) {
-                connection.timeout(&mut self.server, event_loop, timeout.1)
+            token => if let Some(client) = self.clients.get_mut(token) {
+                client.timeout(&mut self.server, event_loop, timeout.1)
             } else {
                 warn!("timeout token {:?} not found", token);
                 false
             }
         };
         if !is_ok {
-            self.server.remove_client(token, &mut self.connections, event_loop);
+            self.server.remove_client(token, &mut self.clients, event_loop);
         }
         trace!("end timeout event for token {:?}", token);
     }
