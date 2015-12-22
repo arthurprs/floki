@@ -113,6 +113,10 @@ impl Queue {
         &self.name
     }
 
+    pub fn config_cloned(&self) -> QueueConfig {
+        self.inner.read().config.clone()
+    }
+
     pub fn create_channel(&self, channel_name: &str, clock: u32) -> QueueResult<()> {
         self.inner.lock().create_channel(channel_name, clock)
     }

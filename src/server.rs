@@ -95,7 +95,6 @@ struct ServerInfo {
     queue_count: u32,
     thread_count: u32,
     clock: u32,
-    config: ServerConfig,
 }
 
 pub struct Server {
@@ -414,6 +413,44 @@ impl Dispatch {
         NotifyMessage::with_int(1)
     }
 
+    fn config_queue(&self, queue_prefix: &str) -> StdHashMap<String, QueueConfig> {
+        self.queues.read().values().filter_map(|queue| {
+            if queue_prefix == "*" || queue.name().starts_with(queue_prefix) {
+                Some((queue.name().into(), queue.config_cloned()))
+            } else {
+                None
+            }
+        }).collect()
+    }
+
+    fn config_get(&self, args: &[&[u8]]) -> NotifyMessage {
+        let config_args = assume_str(args[2]).splitn(2, ".").collect::<Vec<_>>();
+        let json_bytes: Vec<u8> = match &config_args[..] {
+            ["server"] =>
+                json::encode(&self.config).unwrap(),
+            ["queues"] =>
+                json::encode(&self.config_queue("*")).unwrap(),
+            ["queues", queue_prefix] =>
+                json::encode(&self.config_queue(queue_prefix)).unwrap(),
+            _ =>
+                return NotifyMessage::with_error("IPA Invalid CONFIG parameter")
+        }.into();
+
+        let value = Value::Array(vec![Value::Data((&json_bytes[..]).into())]);
+        NotifyMessage::with_value(value)
+    }
+
+    fn config(&self, args: &[&[u8]]) -> NotifyMessage {
+        if args.len() < 3 || (assume_str(args[1]) == "SET" && args.len() < 4) {
+            return NotifyMessage::with_error("MPA Missing CONFIG Parameter")
+        }
+        match assume_str(args[1]) {
+            "GET" => self.config_get(args),
+            "SET" => NotifyMessage::with_error("IPA CONFIG SET Not Implemented"),
+            _ => NotifyMessage::with_error("IPA Invalid CONFIG Parameter")
+        }
+    }
+
     fn info_server(&self)-> ServerInfo {
         let (fut, prom) = future_promise();
         self.notify_server(NotifyMessage::ServerInfo{promise: prom});
@@ -480,6 +517,7 @@ impl Dispatch {
             "SET" => self.set(args_slice), // create queue/channel
             "DEL" => self.del(args_slice), // delete queue/channel
             "SREM" => self.srem(args_slice), // purge queue/channel
+            "CONFIG" => self.config(args_slice), // config
             _ => NotifyMessage::with_error("UCOM Unknown Command")
         };
 
@@ -902,7 +940,6 @@ impl Server {
                 ).sum(),
             thread_count: self.thread_count,
             queue_count: self.queues.read().len() as u32,
-            config: (*self.config).clone(),
             clock: (Self::get_clock_ms() / 1000) as u32,
         }
     }

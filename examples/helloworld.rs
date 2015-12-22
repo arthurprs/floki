@@ -83,5 +83,7 @@ fn main() {
         println!("queue info\n{}", result.unwrap()[0]);
         let result: RedisResult<Vec<String>> = redis::cmd("INFO").arg("server").query(&connection);
         println!("server info\n{}", result.unwrap()[0]);
+        let result: RedisResult<Vec<String>> = redis::cmd("CONFIG").arg("GET").arg("server").query(&connection);
+        println!("server config\n{}", result.unwrap()[0]);
     }
 }
