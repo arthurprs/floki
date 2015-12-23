@@ -8,7 +8,7 @@ use std::time::Duration;
 use spin::RwLock as SpinRwLock;
 use mio::tcp::{TcpStream, TcpListener};
 use mio::util::Slab;
-use mio::{self, Buf, MutBuf, Token, EventLoop, EventSet, PollOpt, Timeout, Handler};
+use mio::{self, Token, EventLoop, EventSet, PollOpt, Timeout, Handler};
 use threadpool::ThreadPool;
 use rustc_serialize::json;
 use promising_future::{future_promise, Promise};
@@ -691,7 +691,7 @@ impl Server {
         debug!("detected {} cpus, using {} threads", num_cpus, thread_count);
 
         let mut event_loop = EventLoop::new().unwrap();
-        event_loop.register_opt(&listener, SERVER,
+        event_loop.register(&listener, SERVER,
             EventSet::all() - EventSet::writable(), PollOpt::level()).unwrap();
 
         let mut server = Server {
@@ -882,8 +882,7 @@ impl Server {
     fn ready(&mut self, clients: &mut Slab<Client>, event_loop: &mut EventLoop<ServerHandler>, events: EventSet) -> bool {
         assert_eq!(events, EventSet::readable());
 
-        if let Some(stream) = self.listener.accept().unwrap() {
-            let client_addr = stream.peer_addr().unwrap();
+        if let Some((stream, client_addr)) = self.listener.accept().unwrap() {
             trace!("incomming client from {:?}", client_addr);
 
             let token_opt = clients.insert_with(|token| Client::new(token, stream));
@@ -891,7 +890,7 @@ impl Server {
             if let Some(token) = token_opt {
                 info!("assigned token {:?} to client {:?}", token, client_addr);
 
-                event_loop.register_opt(
+                event_loop.register(
                     &clients[token].stream,
                     token,
                     clients[token].interest,
