@@ -8,7 +8,6 @@
 #[cfg(test)] extern crate test;
 extern crate env_logger;
 #[macro_use] extern crate log;
-extern crate libc;
 extern crate nix;
 extern crate mio;
 extern crate num_cpus;
