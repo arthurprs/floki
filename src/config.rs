@@ -18,6 +18,7 @@ pub struct ServerConfig {
     pub bind_address: String,
     pub max_connections: usize,
     pub maintenance_interval: u64,
+    pub monitor_interval: u64,
     pub default_queue_config: QueueConfig,
 }
 
@@ -102,6 +103,7 @@ impl ServerConfig {
         let max_connections = read_config!(config, "max_connections" => int);
         let segment_size = read_config!(config, "segment_size" => size);
         let maintenance_interval = read_config!(config, "maintenance_interval" => duration);
+        let monitor_interval = read_config!(config, "monitor_interval" => duration);
         let message_timeout = read_config!(config, "message_timeout" => duration);
         let retention_period = read_config!(config, "retention_period" => duration);
         let hard_retention_period = read_config!(config, "hard_retention_period" => duration);
@@ -117,6 +119,7 @@ impl ServerConfig {
             bind_address: bind_address.into(),
             max_connections: max_connections as usize,
             maintenance_interval: maintenance_interval,
+            monitor_interval: monitor_interval,
             default_queue_config: QueueConfig {
                 name: "".into(),
                 data_directory: "".into(),

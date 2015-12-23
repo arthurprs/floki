@@ -129,6 +129,10 @@ impl Queue {
         self.inner.read().purge_channel(channel_name, clock)
     }
 
+    pub fn iter_channels<F: Fn(&str, &Channel)>(&self, clock: u32, cb: F) {
+        self.inner.read().iter_channels(clock, cb)
+    }
+
     /// get access is suposed to be thread-safe, even while writing
     pub fn get(&self, channel_name: &str, clock: u32) -> QueueResult<(i64, Message)> {
         self.inner.read().get(channel_name, clock)
@@ -198,7 +202,7 @@ impl Channel {
         }
     }
 
-    fn in_flight_count(&mut self, clock: u32) -> u32 {
+    fn update_state(&mut self, clock: u32) {
         // first, adjust expired_count accordingly
         // FIXME: may be expensive
         for (_, state) in self.in_flight_map.iter_mut().skip(self.expired_count as usize) {
@@ -209,7 +213,10 @@ impl Channel {
                 break
             }
         }
+    }
 
+    fn in_flight_count(&mut self, clock: u32) -> u32 {
+        self.update_state(clock);
         self.in_flight_map.len() as u32 - self.expired_count
     }
 
@@ -218,6 +225,10 @@ impl Channel {
         self.in_flight_map.clear();
         self.expired_count = 0;
         self.tail = new_tail;
+    }
+
+    pub fn messages_available(&self) -> u32 {
+        self.expired_count
     }
 }
 
@@ -286,6 +297,14 @@ impl InnerQueue {
             Ok(())
         } else {
             Err(QueueError::ChannelNotFound)
+        }
+    }
+
+    pub fn iter_channels<F: Fn(&str, &Channel)>(&self, clock: u32, cb: F) {
+        for (channel_name, channel) in &self.channels {
+            let mut locked_channel = channel.lock().unwrap();
+            locked_channel.update_state(clock);
+            cb(channel_name, &*locked_channel)
         }
     }
 

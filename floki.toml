@@ -32,6 +32,10 @@ max_connections=1024
 # Location of Floki data directory in the file system
 data_directory="./data/"
 
+# Sleep period between monitor thread runs to notify blocked clients of new expired messages
+# Unless you have lots of queues and/or channels There's little reason to change it
+monitor_interval="1s"
+
 # Sleep period between maintenance thread runs to checkpoint the queue metadata to disk
 # There's little reason to change it
 maintenance_interval="1s"

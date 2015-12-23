@@ -29,13 +29,13 @@ const FIRST_CLIENT: Token = Token(1);
 pub enum NotifyMessage {
     Response{response: Value},
     PutResponse{response: Value, queue: Atom, head: u64},
+    MessagesAvailable{queue: Atom, channel: Atom, available: usize},
     GetWouldBlock{request: Value, queue: Atom, channel: Atom, required_head: u64, timeout: u32},
     ChannelCreate{queue: Atom, channel: Atom},
     ChannelDelete{queue: Atom, channel: Atom},
     QueueCreate{queue: Atom},
     QueueDelete{queue: Atom},
     ServerInfo{promise: Promise<ServerInfo>},
-    MaintenanceDone,
 }
 
 pub type NotifyType = (Cookie, NotifyMessage);
@@ -55,7 +55,6 @@ impl From<QueueError> for NotifyMessage {
 #[derive(Debug)]
 pub enum TimeoutMessage {
     Timeout{queue: Atom, channel: Atom},
-    Maintenance,
 }
 
 pub type TimeoutType = (Token, TimeoutMessage);
@@ -106,7 +105,6 @@ pub struct Server {
     listener: TcpListener,
     thread_pool: ThreadPool,
     thread_count: u32,
-    maintenance_timeout: Timeout,
     nonce: u64,
     internal_clock_ms: u64,
 }
@@ -652,7 +650,7 @@ impl Client {
                 server.notify_timeout(queue, channel, self.token);
                 self.send_response(Value::Nil, event_loop);
             },
-            _ => panic!("can't handle timeout {:?}", timeout)
+            // _ => panic!("can't handle timeout {:?}", timeout)
         }
         true
     }
@@ -689,15 +687,12 @@ impl Server {
         let listener = TcpListener::bind(&addr).unwrap();
 
         let num_cpus = get_num_cpus();
-        let thread_count = cmp::max(6, num_cpus * 2);
+        let thread_count = cmp::max(6, num_cpus * 2) + 2;
         debug!("detected {} cpus, using {} threads", num_cpus, thread_count);
 
         let mut event_loop = EventLoop::new().unwrap();
         event_loop.register_opt(&listener, SERVER,
             EventSet::all() - EventSet::writable(), PollOpt::level()).unwrap();
-
-        let maintenance_timeout = event_loop.timeout_ms(
-            (SERVER, TimeoutMessage::Maintenance), config.maintenance_interval as u64).unwrap();
 
         let mut server = Server {
             listener: listener,
@@ -708,7 +703,6 @@ impl Server {
             thread_count: thread_count as u32,
             waiting_clients: Default::default(),
             awaking_clients: Default::default(),
-            maintenance_timeout: maintenance_timeout,
             nonce: 0,
             internal_clock_ms: 0,
         };
@@ -735,6 +729,9 @@ impl Server {
             server.queues.write().insert(q.name().into(), Arc::new(q));
         }
         debug!("Opening complete!");
+
+        server.start_maintenance(&mut event_loop);
+        server.start_monitor(&mut event_loop);
 
         let clients = Slab::new_starting_at(FIRST_CLIENT, server.config.max_connections);
 
@@ -782,6 +779,20 @@ impl Server {
                 }
             } else {
                 debug!("Race condition, queue {:?} tail already advanced", queue);
+            }
+        } else {
+            debug!("Race condition, queue {:?} is gone", queue);
+        }
+    }
+
+    fn notify_channel(&mut self, queue: Atom, channel: Atom, available: usize) {
+        debug!("notify_channel {:?} {:?} {:?}", queue, channel, available);
+        if let Some(w) = self.waiting_clients.get_mut(&queue) {
+            if let Some(tokens) = w.channels.get_mut(&channel) {
+                let drain_len = cmp::min(available, tokens.len());
+                self.awaking_clients.extend(tokens.drain(..drain_len));
+            } else {
+                debug!("Race condition, queue {:?} channel {:?} is gone", queue, channel);
             }
         } else {
             debug!("Race condition, queue {:?} is gone", queue);
@@ -905,10 +916,10 @@ impl Server {
         self.internal_clock_ms = 0;
     }
 
-    fn notify(&mut self, clients: &mut Slab<Client>, event_loop: &mut EventLoop<ServerHandler>, notification: NotifyType) -> bool {
+    fn notify(&mut self, clients: &mut Slab<Client>, _: &mut EventLoop<ServerHandler>, notification: NotifyType) -> bool {
         match notification.1 {
-            NotifyMessage::MaintenanceDone => {
-                self.schedule_maintenance(event_loop);
+            NotifyMessage::MessagesAvailable{queue, channel, available} => {
+                self.notify_channel(queue, channel, available);
             }
             NotifyMessage::QueueDelete{queue} => {
                 self.notify_queue_deleted(queue);
@@ -940,37 +951,60 @@ impl Server {
                 ).sum(),
             thread_count: self.thread_count,
             queue_count: self.queues.read().len() as u32,
-            clock: (Self::get_clock_ms() / 1000) as u32,
+            clock: Self::get_clock_s(),
         }
     }
 
-    fn schedule_maintenance(&mut self, event_loop: &mut EventLoop<ServerHandler>) {
-        self.maintenance_timeout = event_loop.timeout_ms(
-            (SERVER, TimeoutMessage::Maintenance), self.config.maintenance_interval as u64).unwrap();
-    }
-
-    fn maintenance(&mut self, event_loop: &mut EventLoop<ServerHandler>) {
+    fn start_maintenance(&mut self, _: &mut EventLoop<ServerHandler>) {
+        let config = self.config.clone();
         let queues = self.queues.clone();
-        let channel = event_loop.channel();
-        let clock = self.clock_s();
         self.thread_pool.execute(move || {
-            let queue_names: Vec<_> = queues.read().keys().cloned().collect();
-            for queue_name in queue_names {
-                // get the shared lock for a brief moment
-                let q_opt = queues.read().get(&queue_name).cloned();
-                if let Some(q) = q_opt {
-                    q.maintenance(clock);
+            let mut queue_names = Vec::new();
+            loop {
+                // maintenance incurs heavy IO, so avoid holding the queues lock
+                queue_names.clear();
+                queue_names.extend(queues.read().keys().cloned());
+                for queue_name in &queue_names {
+                    // get the shared lock for a brief moment
+                    let q_opt = queues.read().get(queue_name).cloned();
+                    if let Some(q) = q_opt {
+                        q.maintenance(Self::get_clock_s());
+                    }
                 }
+                thread::sleep(Duration::from_millis(config.maintenance_interval));
             }
-            channel.send((Cookie::new(SERVER, 0), NotifyMessage::MaintenanceDone)).unwrap();
         });
     }
 
-    fn timeout(&mut self, event_loop: &mut EventLoop<ServerHandler>, timeout: TimeoutMessage) -> bool {
+    fn start_monitor(&mut self, event_loop: &mut EventLoop<ServerHandler>) {
+        let config = self.config.clone();
+        let queues = self.queues.clone();
+        let evloop_channel = event_loop.channel();
+        self.thread_pool.execute(move || {
+            loop {
+                let clock = Self::get_clock_s();
+                for (queue_name, queue) in queues.read().iter() {
+                    queue.iter_channels(clock, |channel_name, channel| {
+                        let available = channel.messages_available();
+                        if available > 0 {
+                            evloop_channel.send((
+                                Cookie::new(SERVER, 0),
+                                NotifyMessage::MessagesAvailable{
+                                    queue: queue_name.clone(),
+                                    channel: channel_name.into(),
+                                    available: available as usize,
+                                }
+                            )).unwrap();
+                        }
+                    });
+                }
+                thread::sleep(Duration::from_millis(config.monitor_interval));
+            }
+        });
+    }
+
+    fn timeout(&mut self, _: &mut EventLoop<ServerHandler>, timeout: TimeoutMessage) -> bool {
         match timeout {
-            TimeoutMessage::Maintenance => {
-                self.maintenance(event_loop)
-            },
             _ => panic!("can't handle timeout {:?}", timeout)
         }
         true
@@ -989,10 +1023,13 @@ impl Server {
         (self.clock_ms() / 1000) as u32
     }
 
-	#[inline(never)]
     fn get_clock_ms() -> u64 {
         let time::Timespec{sec, nsec} = time::get_time();
-        sec as u64 + (nsec / 1_000_000) as u64
+        (sec as u64) * 1000 + (nsec / 1_000_000) as u64
+    }
+
+    fn get_clock_s() -> u32 {
+        time::get_time().sec as u32
     }
 }
 
