@@ -991,7 +991,7 @@ impl Server {
                                 Cookie::new(SERVER, 0),
                                 NotifyMessage::MessagesAvailable{
                                     queue: queue_name.clone(),
-                                    channel: channel_name.into(),
+                                    channel: channel_name.clone(),
                                     available: available as usize,
                                 }
                             )).unwrap();

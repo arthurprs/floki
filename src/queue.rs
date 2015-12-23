@@ -6,6 +6,7 @@ use std::fs::{self, File};
 use std::mem;
 use rustc_serialize::json;
 
+use atom::*;
 use config::*;
 use queue_backend::*;
 use utils::*;
@@ -87,7 +88,7 @@ struct Channel {
 struct InnerQueue {
     config: QueueConfig,
     backend: QueueBackend,
-    channels: HashMap<String, Mutex<Channel>>,
+    channels: HashMap<Atom, Mutex<Channel>>,
     state: QueueState,
 }
 
@@ -129,7 +130,7 @@ impl Queue {
         self.inner.read().purge_channel(channel_name, clock)
     }
 
-    pub fn iter_channels<F: Fn(&str, &Channel)>(&self, clock: u32, cb: F) {
+    pub fn iter_channels<F: Fn(&Atom, &Channel)>(&self, clock: u32, cb: F) {
         self.inner.read().iter_channels(clock, cb)
     }
 
@@ -300,7 +301,7 @@ impl InnerQueue {
         }
     }
 
-    pub fn iter_channels<F: Fn(&str, &Channel)>(&self, clock: u32, cb: F) {
+    pub fn iter_channels<F: Fn(&Atom, &Channel)>(&self, clock: u32, cb: F) {
         for (channel_name, channel) in &self.channels {
             let mut locked_channel = channel.lock().unwrap();
             locked_channel.update_state(clock);
@@ -448,7 +449,7 @@ impl InnerQueue {
         };
         for (channel_name, channel) in &self.channels {
             let mut locked_channel = channel.lock().unwrap();
-            q_info.channels.insert(channel_name.clone(), ChannelInfo{
+            q_info.channels.insert(String::from(&channel_name[..]), ChannelInfo{
                 last_touched: locked_channel.last_touched,
                 in_flight_count: locked_channel.in_flight_count(clock),
                 tail: locked_channel.tail,
@@ -497,7 +498,7 @@ impl InnerQueue {
             QueueState::Ready => {
                 for (channel_name, channel_checkpoint) in queue_checkpoint.channels {
                     self.channels.insert(
-                        channel_name,
+                        channel_name.into(),
                         Mutex::new(Channel {
                             last_touched: channel_checkpoint.last_touched,
                             expired_count: 0,
@@ -525,7 +526,7 @@ impl InnerQueue {
             for (channel_name, channel) in &self.channels {
                 let locked_channel = channel.lock().unwrap();
                 checkpoint.channels.insert(
-                    channel_name.clone(),
+                    String::from(&channel_name[..]),
                     ChannelCheckpoint {
                         last_touched: locked_channel.last_touched,
                         tail: locked_channel.real_tail(),
