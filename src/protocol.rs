@@ -1,7 +1,6 @@
 use std::{mem, cmp, str, fmt};
 use std::io::Write;
 use tendril;
-use mio::{Buf, MutBuf};
 use queue_backend::Message;
 
 pub type ByteTendril = tendril::Tendril<tendril::fmt::Bytes, tendril::Atomic>;
@@ -109,14 +108,12 @@ impl ResponseBuffer {
     pub fn push_value(&mut self, value: Value) {
         value.serialize_to(&mut self.body);
     }
-}
 
-impl Buf for ResponseBuffer {
-    fn remaining(&self) -> usize {
+    pub fn remaining(&self) -> usize {
         self.body.len() - self.bytes_written
     }
 
-    fn advance(&mut self, cnt: usize) {
+    pub fn advance(&mut self, cnt: usize) {
         self.bytes_written += cnt;
         // FIXME: poor mans vecdeque
         if self.bytes_written == self.body.len() {
@@ -125,7 +122,7 @@ impl Buf for ResponseBuffer {
         }
     }
 
-    fn bytes(&self) -> &[u8] {
+    pub fn bytes(&self) -> &[u8] {
         &self.body[self.bytes_written..]
     }
 }
@@ -136,7 +133,10 @@ pub struct RequestBuffer {
     bytes_read: u32,
 }
 
+const MIN_REQUESTBUFFER_SIZE: u32 = 4 * 1024;
+
 impl RequestBuffer {
+
     pub fn new() -> RequestBuffer {
         RequestBuffer {
             body: ByteTendril::new(),
@@ -153,19 +153,16 @@ impl RequestBuffer {
         }
         parsed
     }
-}
 
-const MIN_REQUESTBUFFER_SIZE: u32 = 4 * 1024;
-impl MutBuf for RequestBuffer {
-    fn remaining(&self) -> usize {
+    pub fn remaining(&self) -> usize {
         cmp::max(MIN_REQUESTBUFFER_SIZE, self.body.len32() - self.bytes_read) as usize
     }
 
-    fn advance(&mut self, cnt: usize) {
+    pub fn advance(&mut self, cnt: usize) {
         self.bytes_read += cnt as u32
     }
 
-    fn mut_bytes(&mut self) -> &mut [u8] {
+    pub fn mut_bytes(&mut self) -> &mut [u8] {
         let cur_len = self.body.len32();
         if cur_len - self.bytes_read < MIN_REQUESTBUFFER_SIZE {
             self.body.reserve(MIN_REQUESTBUFFER_SIZE);
@@ -308,7 +305,6 @@ impl Parser {
 mod tests {
     use super::{RequestBuffer, ProtocolResult, ProtocolError, Parser, Value};
     use std::io::Write;
-    use mio::MutBuf;
 
     fn parse(slice: &[u8]) -> ProtocolResult<Value> {
         Parser::new(slice).parse()

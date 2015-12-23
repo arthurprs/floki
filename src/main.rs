@@ -37,7 +37,7 @@ mod offset_index;
 mod tristate_lock;
 
 #[cfg(not(test))]
-fn main() {
+pub fn main() {
     use config::ServerConfig;
     use server::Server;
 
