@@ -5,10 +5,11 @@ dependencies = [
  "env_logger 0.3.2 (registry+https://github.com/rust-lang/crates.io-index)",
  "fnv 1.0.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "fs2 0.2.2 (registry+https://github.com/rust-lang/crates.io-index)",
+ "libc 0.2.4 (registry+https://github.com/rust-lang/crates.io-index)",
  "linked-hash-map 0.0.7 (registry+https://github.com/rust-lang/crates.io-index)",
  "log 0.3.4 (registry+https://github.com/rust-lang/crates.io-index)",
  "mio 0.5.0 (registry+https://github.com/rust-lang/crates.io-index)",
- "nix 0.4.2 (git+https://github.com/carllerche/nix-rust.git)",
+ "nix 0.5.0-pre (git+https://github.com/arthurprs/nix-rust.git?branch=libc_024)",
  "num_cpus 0.2.10 (registry+https://github.com/rust-lang/crates.io-index)",
  "promising-future 0.1.6 (registry+https://github.com/rust-lang/crates.io-index)",
  "rand 0.3.12 (registry+https://github.com/rust-lang/crates.io-index)",
@@ -250,7 +251,7 @@ dependencies = [
 [[package]]
 name = "nix"
 version = "0.4.2"
-source = "git+https://github.com/carllerche/nix-rust.git#b4b76d0a28fce34a33ab0a8bc3ab6e9ccd7b3d9c"
+source = "registry+https://github.com/rust-lang/crates.io-index"
 dependencies = [
  "bitflags 0.3.3 (registry+https://github.com/rust-lang/crates.io-index)",
  "libc 0.1.12 (registry+https://github.com/rust-lang/crates.io-index)",
@@ -258,11 +259,11 @@ dependencies = [
 
 [[package]]
 name = "nix"
-version = "0.4.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
+version = "0.5.0-pre"
+source = "git+https://github.com/arthurprs/nix-rust.git?branch=libc_024#70f2b80510088e1566761e7b647c10505453dfb3"
 dependencies = [
  "bitflags 0.3.3 (registry+https://github.com/rust-lang/crates.io-index)",
- "libc 0.1.12 (registry+https://github.com/rust-lang/crates.io-index)",
+ "libc 0.2.4 (registry+https://github.com/rust-lang/crates.io-index)",
 ]
 
 [[package]]

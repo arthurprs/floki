@@ -7,12 +7,12 @@ use std::os::unix::io::{RawFd, AsRawFd};
 use std::fs::{self, File, OpenOptions};
 use std::path::PathBuf;
 use std::sync::Arc;
-use nix::c_void;
+use nix::{self, c_void};
+use libc::size_t;
 use nix::sys::mman;
 use spin::{Mutex as SpinLock, RwLock as SpinRwLock};
 use rustc_serialize::json;
 use twox_hash::XxHash;
-use nix;
 use fs2::FileExt;
 
 use config::*;
@@ -185,12 +185,12 @@ impl Segment {
         }
 
         let file_mmap = try!(mman::mmap(
-            ptr::null_mut(), (file_len as u32).into(),
+            ptr::null_mut(), file_len as size_t,
             mman::PROT_READ | mman::PROT_WRITE, mman::MAP_SHARED,
             file.as_raw_fd(), 0)) as *mut u8;
         try!(mman::madvise(
             file_mmap as *mut c_void,
-            (file_len as u32).into(),
+            file_len as size_t,
             mman::MADV_SEQUENTIAL));
 
         Ok(Segment {
@@ -286,7 +286,7 @@ impl Segment {
             self.file_offset.saturating_sub(1024 * 1024)
         };
         if sync_offset > 0 && sync_offset > self.sync_offset {
-            mman::msync(self.file_mmap as *mut c_void, sync_offset.into(), mman::MS_SYNC).unwrap();
+            mman::msync(self.file_mmap as *mut c_void, sync_offset as size_t, mman::MS_SYNC).unwrap();
             self.sync_offset = sync_offset;
         }
     }
@@ -301,7 +301,7 @@ impl Segment {
 
         try!(mman::madvise(
             self.file_mmap as *mut c_void,
-            self.sync_offset.into(),
+            self.sync_offset as size_t,
             mman::MADV_WILLNEED));
 
         self.file_offset = size_of::<u32>() as u32;
@@ -377,8 +377,8 @@ impl Segment {
 impl Drop for Segment {
     fn drop(&mut self) {
         let mmap = self.file_mmap as *mut c_void;
-        mman::madvise(mmap, self.file_len.into(), mman::MADV_DONTNEED).unwrap();
-        mman::munmap(mmap, self.file_len.into()).unwrap();
+        mman::madvise(mmap, self.file_len as size_t, mman::MADV_DONTNEED).unwrap();
+        mman::munmap(mmap, self.file_len as size_t).unwrap();
         if self.deleted {
             remove_file_if_exist(&self.file_path).unwrap();
         }
