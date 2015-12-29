@@ -6,6 +6,8 @@
 #![cfg_attr(test, feature(test))]
 
 #[cfg(test)] extern crate test;
+#[cfg(test)] extern crate redis;
+
 extern crate env_logger;
 #[macro_use] extern crate log;
 extern crate nix;
@@ -25,10 +27,10 @@ extern crate tendril;
 extern crate fs2;
 extern crate promising_future;
 
-mod config;
 #[macro_use] mod utils;
+mod config;
 mod queue;
-#[cfg(not(test))] mod server;
+mod server;
 mod protocol;
 mod queue_backend;
 mod rev;
@@ -36,6 +38,7 @@ mod atom;
 mod cookie;
 mod offset_index;
 mod tristate_lock;
+#[cfg(test)] mod tests;
 
 #[cfg(not(test))]
 pub fn main() {

@@ -634,8 +634,6 @@ impl QueueBackend {
                     self.config.retention_size != 0 &&
                     total_rem_size <= self.config.retention_size;
 
-                println!("hrp={} hrs={} cc={} rp={} rs={}", pass_hard_retention_period, pass_hard_retention_size,
-                    contains_channel_msg, pass_retention_period, pass_retention_size);
                 if pass_hard_retention_period && pass_hard_retention_size {
                     // passes hard limits so it may be kept
                     if contains_channel_msg || pass_retention_period || pass_retention_size {
