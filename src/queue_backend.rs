@@ -280,10 +280,14 @@ impl Segment {
     }
 
     fn sync(&mut self, full: bool) {
+        let page_size = 4 * 1024;
+        let slack_size = 1024 * 1024;
         let sync_offset = if full || self.closed {
-            self.file_offset
+            (self.file_offset + page_size - 1) & !(page_size - 1)
         } else {
-            self.file_offset.saturating_sub(1024 * 1024)
+            // don't sync last 1MB to avoid neighbor page flushing and other side effects
+            // like blocking writes to the page beeing flushed
+            self.file_offset.saturating_sub(slack_size) & !(page_size - 1)
         };
         if sync_offset > 0 && sync_offset > self.sync_offset {
             mman::msync(self.file_mmap as *mut c_void, sync_offset as size_t, mman::MS_SYNC).unwrap();
