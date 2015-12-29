@@ -74,7 +74,7 @@ struct InFlightState {
 }
 
 #[derive(Debug)]
-struct Channel {
+pub struct Channel {
     last_touched: u32,
     expired_count: u32,
     tail: u64,

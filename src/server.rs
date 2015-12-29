@@ -14,7 +14,6 @@ use rustc_serialize::json;
 use promising_future::{future_promise, Promise};
 use num_cpus::get as get_num_cpus;
 use queue::*;
-use queue_backend::Message;
 use config::*;
 use protocol::{Value, ProtocolError, RequestBuffer, ResponseBuffer};
 use utils::*;
@@ -88,7 +87,7 @@ struct WaitingClients {
 }
 
 #[derive(Debug, RustcEncodable)]
-struct ServerInfo {
+pub struct ServerInfo {
     client_count: u32,
     blocked_client_count: u32,
     queue_count: u32,
