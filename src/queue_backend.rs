@@ -607,7 +607,7 @@ impl QueueBackend {
                 info!("[{}] checkpointed: {:?}", self.config.name, checkpoint.segments);
             }
             Err(error) => {
-                warn!("[{}] error writing checkpoint information: {}",
+                panic!("[{}] error writing checkpoint information: {}",
                     self.config.name, error);
             }
         }
