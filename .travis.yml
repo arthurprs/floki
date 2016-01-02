@@ -10,6 +10,7 @@ rust:
 env:
   global:
     - RUST_BACKTRACE=1
+    - RUST_TEST_THREADS=1
     - TRAVIS_CARGO_NIGHTLY_FEATURE=""
 
 addons:
@@ -28,4 +29,4 @@ after_success:
     - travis-cargo coveralls --no-sudo
 
 after_failure:
-    - tree -h
+    - tree -h && head -n 1000 */*/*.checkpoint

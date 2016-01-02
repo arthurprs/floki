@@ -538,7 +538,7 @@ impl InnerQueue {
         let tmp_path = self.config.data_directory.join(TMP_QUEUE_CHECKPOINT_FILE);
         let result = File::create(&tmp_path)
             .and_then(|mut file| {
-                write!(file, "{}", json::as_pretty_json(&checkpoint)).unwrap();
+                try!(write!(file, "{}", json::as_pretty_json(&checkpoint)));
                 file.sync_data()
             })
             .and_then(|_| {
@@ -549,7 +549,7 @@ impl InnerQueue {
         match result {
             Ok(_) => info!("[{}] checkpointed: {:?}", self.config.name, checkpoint.state),
             Err(error) =>
-                warn!("[{}] error writing checkpoint information: {}",
+                panic!("[{}] error writing checkpoint information: {}",
                     self.config.name, error)
         }
     }
