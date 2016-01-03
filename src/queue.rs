@@ -118,6 +118,12 @@ impl Queue {
         self.inner.read().config.clone()
     }
 
+    pub fn set_config(&self, config: QueueConfig) {
+        let mut locked_queue = self.inner.lock();
+        locked_queue.config = config.clone();
+        locked_queue.backend.set_config(config);
+    }
+
     pub fn create_channel(&self, channel_name: &str, clock: u32) -> QueueResult<()> {
         self.inner.lock().create_channel(channel_name, clock)
     }

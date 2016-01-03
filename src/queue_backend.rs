@@ -403,6 +403,10 @@ impl QueueBackend {
         backend
     }
 
+    pub fn set_config(&mut self, config: QueueConfig) {
+        self.config = config;
+    }
+
     pub fn segments_count(&self) -> usize {
         self.segments.read().len()
     }

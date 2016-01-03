@@ -79,15 +79,35 @@ Deletes a channel, if specified, otherwise deletes the queue.
 
 Note: you can also use * as the channel name to purge all channels, effectively purging the entire queue and allowing all used disk space to be reclaimed.
 
-```INFO [queues|queues.queue_prefix|server]```
+**INFO** get information
 
-All variants return an array with a single json encoded object. This is done to conform with what redis clients expect.
+```INFO [server|queues|queues.queue_prefix]```
 
-`queues and queues. and queues.*` return information about all queues
+All variants return an array with a single json encoded object.
+
+`queues.server` return information about the server
+
+`queues and queues.` return information about all queues
 
 `queues.queue_prefix` return information about all queues matching the given prefix
 
-`queues.server` return information about the server
+**CONFIG GET** get configuration
+
+```CONFIG GET [queues.queue_name|server]```
+
+All variants return an array with a single json encoded object.
+
+`queues.queue_name` return the specified queue configuration
+
+`queues.server` return the server configuration
+
+**CONFIG SET** set configuration
+
+```CONFIG SET [queues.queue_name|server] new_value```
+
+Like the previous but to change configuration values.
+
+`new_value` accepts the same format as the corresponding entry in the [floki.toml](floki.toml) file, check it's contents for documentation about which values can be changed at runtime.
 
 # Example
 

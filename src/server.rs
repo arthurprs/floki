@@ -35,6 +35,7 @@ pub enum NotifyMessage {
     QueueCreate{queue: Atom},
     QueueDelete{queue: Atom},
     ServerInfo{promise: Promise<ServerInfo>},
+    ServerSetConfig{key: Atom, value: Atom, promise: Promise<NotifyMessage>},
 }
 
 pub type NotifyType = (Cookie, NotifyMessage);
@@ -137,6 +138,26 @@ macro_rules! try_or_int {
     )
 }
 
+macro_rules! queue_config_set {
+    ($c: expr, $k: expr, $v: expr) => (
+        match $k {
+            "message_timeout" =>
+                $c.message_timeout = (try_or_error!(parse_duration($v), "IPA Invalid Duration Value")  / 1000) as u32,
+            "segment_size" =>
+                $c.segment_size = try_or_error!(parse_size($v), "IPA Invalid Size Value"),
+            "retention_size" =>
+                $c.retention_size = try_or_error!(parse_size($v), "IPA Invalid Size Value"),
+            "hard_retention_size" =>
+                $c.hard_retention_size = try_or_error!(parse_size($v), "IPA Invalid Size Value"),
+            "retention_period" =>
+                $c.retention_period = (try_or_error!(parse_duration($v), "IPA Invalid Duration Value")  / 1000) as u32,
+            "hard_retention_period" =>
+                $c.hard_retention_period = (try_or_error!(parse_duration($v), "IPA Invalid Duration Value")  / 1000) as u32,
+            _ => return NotifyMessage::with_error("IPA Invalid CONFIG SET parameter")
+        }
+    )
+}
+
 impl NotifyMessage {
     fn with_value(value: Value) -> NotifyMessage {
         NotifyMessage::Response{response: value}
@@ -180,7 +201,7 @@ impl Dispatch {
 
     fn delete_queue(&self, q: Arc<Queue>) {
         debug!("deleting queue {:?}", q.name());
-        let meta_lock = self.meta_lock.lock().unwrap();
+        let _meta_lock = self.meta_lock.lock().unwrap();
         let q = self.queues.write().remove(&*q.name()).unwrap();
         let mut wait_count = 0;
         while Arc::strong_count(&q) > 1 {
@@ -193,13 +214,12 @@ impl Dispatch {
         self.notify_server(NotifyMessage::QueueDelete{
             queue: q.name().into(),
         });
-        drop(meta_lock);
         q.delete();
     }
 
     fn delete_channel(&self, q: &Queue, channel_name: &str) -> QueueResult<()> {
         debug!("deleting queue {:?} channel {:?}", q.name(), channel_name);
-        let meta_lock = self.meta_lock.lock().unwrap();
+        let _meta_lock = self.meta_lock.lock().unwrap();
         let result = q.delete_channel(channel_name);
         if result.is_ok() {
             self.notify_server(NotifyMessage::ChannelDelete{
@@ -207,7 +227,6 @@ impl Dispatch {
                 channel: channel_name.into(),
             });
         }
-        drop(meta_lock);
         result
     }
 
@@ -362,8 +381,12 @@ impl Dispatch {
         let mut successfully = 0;
         for ticket_arg in &args[3..] {
             let ticket = try_or_error!(assume_str(ticket_arg).parse::<i64>(), "IPA Invalid Ticket");
-            if q.ack(channel_name, ticket, self.clock).is_ok() {
-                successfully += 1
+            match q.ack(channel_name, ticket, self.clock) {
+                Ok(_) => successfully += 1,
+                Err(error) => {
+                    info!("Can't ack {:?} {:?} ticket {:?}: {:?}",
+                        queue_name, channel_name, ticket, error);
+                }
             }
         }
 
@@ -379,12 +402,8 @@ impl Dispatch {
         let q = try_or_int!(self.get_queue(queue_name).ok_or(()), 0);
 
         match channel_name_opt {
-            None => {
-                self.delete_queue(q);
-            },
-            Some(channel_name) => {
-                try_or_int!(self.delete_channel(&q, channel_name), 0);
-            },
+            None => self.delete_queue(q),
+            Some(channel_name) => try_or_int!(self.delete_channel(&q, channel_name), 0),
         }
 
         NotifyMessage::with_int(1)
@@ -399,18 +418,14 @@ impl Dispatch {
         let q = try_or_int!(self.get_queue(queue_name).ok_or(()), 0);
 
         match channel_name {
-            "*" => {
-                q.purge();
-            },
-            channel_name => {
-                try_or_int!(q.purge_channel(channel_name, self.clock), 0);
-            },
+            "*" => q.purge(),
+            channel_name => try_or_int!(q.purge_channel(channel_name, self.clock), 0),
         }
 
         NotifyMessage::with_int(1)
     }
 
-    fn config_queue(&self, queue_prefix: &str) -> StdHashMap<String, QueueConfig> {
+    fn config_queue_get(&self, queue_prefix: &str) -> StdHashMap<String, QueueConfig> {
         self.queues.read().values().filter_map(|queue| {
             if queue_prefix == "*" || queue.name().starts_with(queue_prefix) {
                 Some((queue.name().into(), queue.config_cloned()))
@@ -426,15 +441,37 @@ impl Dispatch {
             ["server"] =>
                 json::encode(&self.config).unwrap(),
             ["queues"] =>
-                json::encode(&self.config_queue("*")).unwrap(),
+                json::encode(&self.config_queue_get("*")).unwrap(),
             ["queues", queue_prefix] =>
-                json::encode(&self.config_queue(queue_prefix)).unwrap(),
-            _ =>
-                return NotifyMessage::with_error("IPA Invalid CONFIG parameter")
+                json::encode(&self.config_queue_get(queue_prefix)).unwrap(),
+            _ => return NotifyMessage::with_error("IPA Invalid CONFIG parameter")
         }.into();
 
         let value = Value::Array(vec![Value::Data((&json_bytes[..]).into())]);
         NotifyMessage::with_value(value)
+    }
+
+    fn config_set(&self, args: &[&[u8]]) -> NotifyMessage {
+        let config_args = assume_str(args[2]).splitn(3, ".").collect::<Vec<_>>();
+        let config_value = assume_str(args[3]);
+        match &config_args[..] {
+            ["server", config_name] => {
+                let (fut, prom) = future_promise();
+                self.notify_server(NotifyMessage::ServerSetConfig{
+                    key: config_name.into(),
+                    value: config_value.into(),
+                    promise: prom,
+                });
+                return fut.value().unwrap()
+            },
+            ["queues", queue_name, config_name] => {
+                let q = try_or_error!(self.get_queue(queue_name).ok_or(()), "QNF Queue Not Found");
+                let mut c = q.config_cloned();
+                queue_config_set!(c, config_name, config_value);
+            },
+            _ => return NotifyMessage::with_error("IPA Invalid CONFIG SET parameter")
+        }
+        NotifyMessage::with_ok()
     }
 
     fn config(&self, args: &[&[u8]]) -> NotifyMessage {
@@ -443,7 +480,7 @@ impl Dispatch {
         }
         match assume_str(args[1]) {
             "GET" => self.config_get(args),
-            "SET" => NotifyMessage::with_error("IPA CONFIG SET Not Implemented"),
+            "SET" => self.config_set(args),
             _ => NotifyMessage::with_error("IPA Invalid CONFIG Parameter")
         }
     }
@@ -456,7 +493,7 @@ impl Dispatch {
 
     fn info_queue(&self, queue_prefix: &str) -> StdHashMap<String, QueueInfo> {
         self.queues.read().values().filter_map(|queue| {
-            if queue_prefix == "*" || queue.name().starts_with(queue_prefix) {
+            if queue.name().starts_with(queue_prefix) {
                 Some((queue.name().into(), queue.info(self.clock)))
             } else {
                 None
@@ -474,7 +511,7 @@ impl Dispatch {
             ["server"] =>
                 json::encode(&self.info_server()).unwrap(),
             ["queues"] =>
-                json::encode(&self.info_queue("*")).unwrap(),
+                json::encode(&self.info_queue("")).unwrap(),
             ["queues", queue_prefix] =>
                 json::encode(&self.info_queue(queue_prefix)).unwrap(),
             _ =>
@@ -934,10 +971,20 @@ impl Server {
             NotifyMessage::ServerInfo{promise} => {
                 promise.set(self.info(clients));
             }
+            NotifyMessage::ServerSetConfig{key, value, promise} => {
+                promise.set(self.config_set(&key, &value));
+            }
             msg => panic!("can't handle msg {:?}", msg)
         }
 
         true
+    }
+
+    fn config_set(&mut self, key: &str, value: &str) -> NotifyMessage {
+        let mut new_config = (*self.config).clone();
+        queue_config_set!(new_config.default_queue_config, key, value);
+        self.config = Arc::new(new_config);
+        NotifyMessage::with_ok()
     }
 
     fn info(&self, clients: &mut Slab<Client>) -> ServerInfo {

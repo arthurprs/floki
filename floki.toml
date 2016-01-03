@@ -46,10 +46,12 @@ maintenance_interval="1s"
 # Setting this value too small may limit the maximum size of a message and
 # also slow down writes due to increased number of files.
 # Segments are preallocated on creation so keep that in mind if you want to have lots of queues.
+# Note: Can be changed at runtime but will only affect newly created segments.
 segment_size="128mb"
 
 # Default queue message timeout period
 # after this timeout a non acknowledged message will be made available in the channel again
+# Note: Can be changed at runtime but will only affect new gets.
 message_timeout="30s"
 
 # Soft retentions specify for how long (period) and how much data (size) is retained in a queue
@@ -57,6 +59,7 @@ message_timeout="30s"
 # This might be usefull if you want to go back in time and reprocess some messages.
 # Note: A value of 0 disables the feature if neither are active
 # once all channels read past a segment it becomes eledgible for garbage collection
+# Note: Can be changed at runtime.
 retention_period="0"
 retention_size="0"
 
@@ -64,5 +67,6 @@ retention_size="0"
 # regardless of channel positions and soft retention period/size
 # Note: A value of 0 disables the feature so the constraint isn't enforced and
 # queue may grow unbounded(!)
+# Note: Can be changed at runtime.
 hard_retention_period="24h"
 hard_retention_size="0"

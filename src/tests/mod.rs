@@ -54,3 +54,25 @@ fn test_roundtrip() {
     }).collect();
     assert_eq!(msg_bodies, test_bodies);
 }
+
+#[test]
+fn test_config() {
+    START.call_once(|| start_test_server());
+    let client = redis::Client::open("redis://127.0.0.1:9797/").unwrap();
+    let connection = client.get_connection().expect("Couldn't open connection");
+
+    // get config
+    let msgs: Vec<String> =
+        redis::cmd("CONFIG").arg("GET").arg("server")
+        .query(&connection).unwrap();
+
+    assert_eq!(msgs.len(), 1);
+
+    // set config
+    let result: RedisValue =
+        redis::cmd("CONFIG").arg("SET").arg("server.message_timeout").arg("30s")
+        .query(&connection).unwrap();
+
+    assert_eq!(result, RedisValue::Okay);
+
+}
