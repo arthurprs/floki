@@ -3,6 +3,7 @@ use std::str::{self, FromStr};
 use std::net::SocketAddr;
 use std::io::{Read, Write};
 use std::collections::VecDeque;
+use std::collections::hash_map::Entry;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use spin::RwLock as SpinRwLock;
@@ -43,8 +44,12 @@ pub type NotifyType = (Cookie, NotifyMessage);
 impl From<QueueError> for NotifyMessage {
     fn from(from: QueueError) -> Self {
         match from {
+            QueueError::QueueNotFound =>
+                NotifyMessage::with_error("QNF Queue Not Found"),
             QueueError::ChannelNotFound =>
                 NotifyMessage::with_error("CNF Channel Not Found"),
+            QueueError::QueueAlreadyExists =>
+                NotifyMessage::with_error("QAE Queue Already Exists"),
             QueueError::ChannelAlreadyExists =>
                 NotifyMessage::with_error("CAE Channel Already Exists"),
             _ => NotifyMessage::with_error(&format!("Unexpected error {:?}", from))
@@ -195,14 +200,40 @@ fn check_identifier_str(possibly_str: &[u8]) -> Result<&str, NotifyMessage> {
 
 impl Dispatch {
     #[inline]
-    fn get_queue(&self, name: &str) -> Option<Arc<Queue>> {
-        self.queues.read().get(name).map(|sq| sq.clone())
+    fn get_queue(&self, name: &str) -> QueueResult<Arc<Queue>> {
+        self.queues.read().get(name).cloned().ok_or(QueueError::QueueNotFound)
+    }
+
+    fn create_queue(&self, name: &str, use_existing: bool) -> QueueResult<Arc<Queue>> {
+        let _meta_lock = self.meta_lock.lock().unwrap();
+        match self.queues.write().entry(name.into()) {
+            Entry::Occupied(queue) => {
+                if use_existing {
+                    Ok(queue.get().clone())
+                } else {
+                    Err(QueueError::QueueAlreadyExists)
+                }
+            },
+            Entry::Vacant(v) => {
+                info!("Creating queue {:?}", name);
+                let queue = Arc::new(Queue::new(self.config.new_queue_config(name), false));
+                self.notify_server(NotifyMessage::QueueCreate{
+                    queue: queue.name().into(),
+                });
+
+                v.insert(queue.clone());
+                Ok(queue)
+            }
+        }
     }
 
     fn delete_queue(&self, q: Arc<Queue>) {
         debug!("deleting queue {:?}", q.name());
         let _meta_lock = self.meta_lock.lock().unwrap();
-        let q = self.queues.write().remove(&*q.name()).unwrap();
+        if self.queues.write().remove(&*q.name()).is_none() {
+            // someone else already took it from the list so let them delete it
+            return
+        }
         let mut wait_count = 0;
         while Arc::strong_count(&q) > 1 {
             thread::sleep(Duration::from_millis(100));
@@ -230,39 +261,19 @@ impl Dispatch {
         result
     }
 
-    fn create_channel(&self, q: &Queue, channel_name: &str) -> QueueResult<()> {
+    fn create_channel(&self, q: &Queue, channel_name: &str, use_existing: bool) -> QueueResult<()> {
         info!("creating queue {:?} channel {:?}", q.name(), channel_name);
-        let meta_lock = self.meta_lock.lock().unwrap();
+        let _meta_lock = self.meta_lock.lock().unwrap();
         let result = q.create_channel(channel_name, self.clock);
         if result.is_ok() {
             self.notify_server(NotifyMessage::ChannelCreate{
                 queue: q.name().into(),
                 channel: channel_name.into(),
             });
+        } else if use_existing {
+            return Ok(())
         }
-        drop(meta_lock);
         result
-    }
-
-    fn get_or_create_queue(&self, name: &str) -> Arc<Queue> {
-        if let Some(sq) = self.queues.read().get(name) {
-            return sq.clone()
-        }
-
-        let meta_lock = self.meta_lock.lock().unwrap();
-        let queue = self.queues.write().entry(name.into()).or_insert_with(|| {
-            info!("Creating queue {:?}", name);
-            let inner_queue = Queue::new(self.config.new_queue_config(name), false);
-            debug!("Done creating queue {:?}", name);
-
-            self.notify_server(NotifyMessage::QueueCreate{
-                queue: inner_queue.name().into(),
-            });
-
-            Arc::new(inner_queue)
-        }).clone();
-        drop(meta_lock);
-        queue
     }
 
     fn notify_server(&self, notification: NotifyMessage) {
@@ -281,7 +292,7 @@ impl Dispatch {
         let channel_name = assume_str(args[2]);
         let seek_type = assume_str(args[3]);
         let seek_value_str = assume_str(args[4]);
-        let q = try_or_error!(self.get_queue(queue_name).ok_or(()), "QNF Queue Not Found");
+        let q = try_or_error!(self.get_queue(queue_name));
 
         match seek_type {
             "TS" => {
@@ -309,7 +320,7 @@ impl Dispatch {
         } else {
             0
         };
-        let q = try_or_error!(self.get_queue(queue_name).ok_or(()), "QNF Queue Not Found");
+        let q = try_or_error!(self.get_queue(queue_name));;
 
         // get one by one, this contributes for fairness avoiding starving consumers
         let mut results = Vec::with_capacity(count);
@@ -341,11 +352,14 @@ impl Dispatch {
         if args.len() < 3 {
             return NotifyMessage::with_error("MPA Queue or Channel Missing")
         }
+        let nx_flag =
+            (assume_str(args[0]) == "SETNX") ||
+            (args.len() > 3 && assume_str(args.last().unwrap()) == "NX");
         let queue_name = try_or_error!(check_identifier_str(args[1]));
         let channel_name = try_or_error!(check_identifier_str(args[2]));
-        let q = self.get_or_create_queue(queue_name);
+        let q = try_or_error!(self.create_queue(queue_name, nx_flag));
 
-        try_or_error!(self.create_channel(&q, channel_name));
+        try_or_error!(self.create_channel(&q, channel_name, nx_flag));
         NotifyMessage::with_ok()
     }
 
@@ -355,7 +369,7 @@ impl Dispatch {
         }
         let queue_name = assume_str(args[1]);
         let messages = &args[2..];
-        let q = try_or_error!(self.get_queue(queue_name).ok_or(()), "QNF Queue Not Found");
+        let q = try_or_error!(self.get_queue(queue_name));
 
         debug!("inserting {} msgs into {:?}",
             messages.len(), queue_name);
@@ -376,7 +390,7 @@ impl Dispatch {
         }
         let queue_name = assume_str(args[1]);
         let channel_name = assume_str(args[2]);
-        let q = try_or_error!(self.get_queue(queue_name).ok_or(()), "QNF Queue Not Found");
+        let q = try_or_error!(self.get_queue(queue_name));
 
         let mut successfully = 0;
         for ticket_arg in &args[3..] {
@@ -399,7 +413,7 @@ impl Dispatch {
         }
         let queue_name = assume_str(args[1]);
         let channel_name_opt = args.get(2).map(|s| assume_str(s));
-        let q = try_or_int!(self.get_queue(queue_name).ok_or(()), 0);
+        let q = try_or_int!(self.get_queue(queue_name), 0);
 
         match channel_name_opt {
             None => self.delete_queue(q),
@@ -415,7 +429,7 @@ impl Dispatch {
         }
         let queue_name = assume_str(args[1]);
         let channel_name = assume_str(args[2]);
-        let q = try_or_int!(self.get_queue(queue_name).ok_or(()), 0);
+        let q = try_or_int!(self.get_queue(queue_name), 0);
 
         match channel_name {
             "*" => q.purge(),
@@ -465,7 +479,7 @@ impl Dispatch {
                 return fut.value().unwrap()
             },
             ["queues", queue_name, config_name] => {
-                let q = try_or_error!(self.get_queue(queue_name).ok_or(()), "QNF Queue Not Found");
+                let q = try_or_error!(self.get_queue(queue_name));
                 let mut c = q.config_cloned();
                 queue_config_set!(c, config_name, config_value);
             },
@@ -548,7 +562,7 @@ impl Dispatch {
             "HDEL" => self.hdel(args_slice), // ack messages
             "INFO" => self.info(args_slice), // info
             "HMSET" => self.hmset(args_slice), // seek channel to the specified ts or id
-            "SET" => self.set(args_slice), // create queue/channel
+            "SET" | "SETNX" => self.set(args_slice), // create queue/channel
             "DEL" => self.del(args_slice), // delete queue/channel
             "SREM" => self.srem(args_slice), // purge queue/channel
             "CONFIG" => self.config(args_slice), // config
@@ -1006,7 +1020,7 @@ impl Server {
         self.thread_pool.execute(move || {
             let mut queue_names = Vec::new();
             loop {
-                // maintenance incurs heavy IO, so avoid holding the queues lock
+                // maintenance may block on IO, so avoid holding the queues lock
                 queue_names.clear();
                 queue_names.extend(queues.read().keys().cloned());
                 for queue_name in &queue_names {

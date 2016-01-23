@@ -24,7 +24,7 @@ I started this project in order to evaluate Rust capabilities in a real world pr
 
 ## TODO
 - [x] Ticket based Acknowledgement
-- [ ] Map Floki commands to Redis commands in a sensible way
+- [x] Map Floki commands to Redis commands in a sensible way
 - [x] Better error handling
 - [ ] Lots of documentation
 - [ ] Opt-in persistency guarantee (needs group commit-ish implementation)
@@ -63,9 +63,11 @@ Acknowledge messages using their tickets. Returns the number of successful ackno
 
 **SET** create queue/channel
 
-```SET queue_name channel_name```
+```SET queue_name channel_name [NX]```
 
-Creates the specified queue and channels, will error if the queue already exists
+```SETNX queue_name channel_name```
+
+Creates the specified queue and channel, will error if the queue or channel already exists unless the nx flag or the setnx commands is used.
 
 **DEL** delete queue/channel
 
@@ -85,29 +87,29 @@ Note: you can also use * as the channel name to purge all channels, effectively 
 
 All variants return an array with a single json encoded object.
 
-`queues.server` return information about the server
+`server` return information about the server
 
-`queues and queues.` return information about all queues
+`queues` return information about all queues
 
 `queues.queue_prefix` return information about all queues matching the given prefix
 
 **CONFIG GET** get configuration
 
-```CONFIG GET [queues.queue_name|server]```
+```CONFIG GET [server|queues.queue_name]```
 
 All variants return an array with a single json encoded object.
 
-`queues.queue_name` return the specified queue configuration
+`server` return the server configuration
 
-`queues.server` return the server configuration
+`queues.queue_name` return the specified queue configuration
 
 **CONFIG SET** set configuration
 
-```CONFIG SET [queues.queue_name|server] new_value```
+```CONFIG SET [|serverqueues.queue_name].config_name config_value```
 
 Like the previous but to change configuration values.
 
-`new_value` accepts the same format as the corresponding entry in the [floki.toml](floki.toml) file, check it's contents for documentation about which values can be changed at runtime.
+`config_name` and `config_value` accept the same format as their corresponding entry in the [floki.toml](floki.toml) file, check it's contents for documentation about which values can be changed at runtime.
 
 # Example
 
@@ -119,7 +121,13 @@ See the configuration file [floki.toml](floki.toml)
 
 # Running
 
+You'll need a recent version of rust nightly and cargo installed.
+
+On the root of the repostory type:
+
 ```RUST_BACKTRACE=1 RUST_LOG=floki=info cargo run --release```
+
+You can also cargo install it using `cargo install --path .` then `RUST_BACKTRACE=1 RUST_LOG=floki=info floki`
 
 # Copyright and License
 

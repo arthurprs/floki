@@ -18,6 +18,8 @@ pub type QueueResult<T> = Result<T, QueueError>;
 
 #[derive(Debug)]
 pub enum QueueError {
+    QueueAlreadyExists,
+    QueueNotFound,
     ChannelAlreadyExists,
     ChannelNotFound,
     TicketNotFound,

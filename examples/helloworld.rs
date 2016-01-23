@@ -12,10 +12,13 @@ fn main() {
     let mut thread_handles = Vec::new();
     let connection = client.get_connection().expect("Couldn't open connection");
 
+    // delete any previous the queue
+    let result: RedisResult<bool> = connection.del(queue_name);
+    assert_eq!(result, Ok(true));
     // create the queue and two channels
     for &channel_name in &["channel_1", "channel_2"] {
-        let _: RedisResult<bool> = connection.set(queue_name, channel_name);
-        // assert_eq!(result, Ok(true));
+        let result: RedisResult<bool> = connection.set_nx(queue_name, channel_name);
+        assert_eq!(result, Ok(true));
     }
 
     // start two producer threads
@@ -45,7 +48,7 @@ fn main() {
                     .query(&connection);
 
                 let result = match maybe_result {
-                    Err(_) => maybe_result.unwrap(), 
+                    Err(_) => maybe_result.unwrap(),
                     Ok(ref result) if result.is_empty() => {
                         println!("{} received no messages after {} seconds, will exit",
                             channel_name, get_timeout);

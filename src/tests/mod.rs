@@ -31,7 +31,7 @@ fn test_roundtrip() {
     let connection = client.get_connection().expect("Couldn't open connection");
 
     // create the queue
-    let _: RedisResult<bool> = connection.set(queue_name, channel_name);
+    let _: RedisResult<bool> = connection.set_nx(queue_name, channel_name);
     // purge
     let _: RedisResult<u32> = connection.del(&[queue_name, "*"]);
 
