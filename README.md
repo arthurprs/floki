@@ -105,7 +105,7 @@ All variants return an array with a single json encoded object.
 
 **CONFIG SET** set configuration
 
-```CONFIG SET [|serverqueues.queue_name].config_name config_value```
+```CONFIG SET [server|queues.queue_name].config_name config_value```
 
 Like the previous but to change configuration values.
 
