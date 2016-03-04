@@ -1,7 +1,6 @@
 #![allow(dead_code)]
 #![feature(slice_patterns)]
 #![feature(iter_arith)]
-#![feature(hashmap_hasher)]
 #![feature(arc_counts)]
 #![cfg_attr(test, feature(test))]
 
