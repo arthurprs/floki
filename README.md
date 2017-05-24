@@ -3,7 +3,7 @@
 [![Build Status](https://travis-ci.org/arthurprs/floki.svg)](https://travis-ci.org/arthurprs/floki)
 [![Coverage Status](https://coveralls.io/repos/arthurprs/floki/badge.svg?branch=master&service=github)](https://coveralls.io/github/arthurprs/floki?branch=master)
 
-**Atention, this is a work in progress and probably unusable at this point**
+*Although it works fairly well please do not trust it for any kind of production data*
 
 Floki borrows concepts from both Kafka and Amazon SQS into an easy to use package. Queues have independent channels which allow efficient fanout and are persisted to disk. Clients talk to it using Redis protocol and commands, so all Redis existing clients can be used. Although there's no replication or clustering support and it might never have.
 
