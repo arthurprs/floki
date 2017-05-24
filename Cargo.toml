@@ -20,10 +20,7 @@ rand = "*"
 promising-future = "*"
 fs2 = "0.2"
 libc = "0.2.4"
-
-[dependencies.nix]
-git="https://github.com/arthurprs/nix-rust.git"
-branch="libc_024"
+nix = "0.8"
 
 [dependencies.tendril]
 git="https://github.com/arthurprs/tendril.git"

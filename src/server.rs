@@ -452,11 +452,11 @@ impl Dispatch {
     fn config_get(&self, args: &[&[u8]]) -> NotifyMessage {
         let config_args = assume_str(args[2]).splitn(2, ".").collect::<Vec<_>>();
         let json_bytes: Vec<u8> = match &config_args[..] {
-            ["server"] =>
+            &["server"] =>
                 json::encode(&self.config).unwrap(),
-            ["queues"] =>
+            &["queues"] =>
                 json::encode(&self.config_queue_get("*")).unwrap(),
-            ["queues", queue_prefix] =>
+            &["queues", queue_prefix] =>
                 json::encode(&self.config_queue_get(queue_prefix)).unwrap(),
             _ => return NotifyMessage::with_error("IPA Invalid CONFIG parameter")
         }.into();
@@ -469,7 +469,7 @@ impl Dispatch {
         let config_args = assume_str(args[2]).splitn(3, ".").collect::<Vec<_>>();
         let config_value = assume_str(args[3]);
         match &config_args[..] {
-            ["server", config_name] => {
+            &["server", config_name] => {
                 let (fut, prom) = future_promise();
                 self.notify_server(NotifyMessage::ServerSetConfig{
                     key: config_name.into(),
@@ -478,7 +478,7 @@ impl Dispatch {
                 });
                 return fut.value().unwrap()
             },
-            ["queues", queue_name, config_name] => {
+            &["queues", queue_name, config_name] => {
                 let q = try_or_error!(self.get_queue(queue_name));
                 let mut c = q.config_cloned();
                 queue_config_set!(c, config_name, config_value);
@@ -522,11 +522,11 @@ impl Dispatch {
 
         let info_args = assume_str(args[1]).splitn(2, ".").collect::<Vec<_>>();
         let json_bytes: Vec<u8> = match &info_args[..] {
-            ["server"] =>
+            &["server"] =>
                 json::encode(&self.info_server()).unwrap(),
-            ["queues"] =>
+            &["queues"] =>
                 json::encode(&self.info_queue("")).unwrap(),
-            ["queues", queue_prefix] =>
+            &["queues", queue_prefix] =>
                 json::encode(&self.info_queue(queue_prefix)).unwrap(),
             _ =>
                 return NotifyMessage::with_error("IPA Invalid INFO parameter")
@@ -1066,7 +1066,6 @@ impl Server {
         match timeout {
             _ => panic!("can't handle timeout {:?}", timeout)
         }
-        true
     }
 
     #[inline]

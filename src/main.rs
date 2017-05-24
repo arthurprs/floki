@@ -1,7 +1,5 @@
 #![allow(dead_code)]
 #![feature(slice_patterns)]
-#![feature(iter_arith)]
-#![feature(arc_counts)]
 #![cfg_attr(test, feature(test))]
 
 #[cfg(test)] extern crate test;

@@ -2,7 +2,7 @@ use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use std::io;
 use std::io::prelude::*;
-use toml::Parser as TomlParser;
+use toml;
 use utils::*;
 
 pub const TMP_QUEUE_CHECKPOINT_FILE: &'static str = "queue.checkpoint.tmp";
@@ -94,7 +94,7 @@ impl ServerConfig {
             let mut s = String::new();
             File::open("floki.toml").expect("Error opening config file").
                 read_to_string(&mut s).expect("Error reading config file");
-            TomlParser::new(&s).parse().expect("Error parsing config file")
+            s.parse::<toml::Value>().expect("Error parsing config file")
         };
         debug!("done reading config file: {:?}", config);
 
